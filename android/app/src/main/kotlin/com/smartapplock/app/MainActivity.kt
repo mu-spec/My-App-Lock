@@ -4,7 +4,6 @@ import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
-import android.util.Log
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import java.lang.ref.WeakReference
@@ -189,10 +188,9 @@ class MainActivity : FlutterFragmentActivity() {
         val generation = intent.getLongExtra(EXTRA_GENERATION, -1L)
         val pending = ProtectionStateStore.pendingChallenge(this)
         val exact = RecoveryIntentPolicy.matches(pending, packageName, generation)
-        Log.d(
-            TAG,
-            "$callback recovery package=$packageName generation=$generation exact=$exact",
-        )
+        DiagLog.d(this, TAG) {
+            "$callback recovery package=$packageName generation=$generation exact=$exact"
+        }
         if (exact) {
             WatcherService.onChallengeActivityAvailable(this)
         }
@@ -250,15 +248,14 @@ class MainActivity : FlutterFragmentActivity() {
                         activity.taskId,
                         ActivityManager.MOVE_TASK_WITH_HOME,
                     )
-                    Log.d(
-                        TAG,
+                    DiagLog.d(context, TAG) {
                         "moveTaskToFront taskId=${activity.taskId} " +
                             "package=${challenge.packageName} " +
-                            "generation=${challenge.generation}",
-                    )
+                            "generation=${challenge.generation}"
+                    }
                     true
                 } catch (e: Exception) {
-                    Log.w(TAG, "Existing task promotion failed", e)
+                    DiagLog.w(context, TAG, e) { "Existing task promotion failed" }
                     launchCold(context, recoveryIntent, challenge)
                 }
             }
@@ -271,14 +268,13 @@ class MainActivity : FlutterFragmentActivity() {
             challenge: ProtectionStateStore.PendingChallenge,
         ): Boolean = try {
             context.startActivity(intent)
-            Log.d(
-                TAG,
+            DiagLog.d(context, TAG) {
                 "startActivity package=${challenge.packageName} " +
-                    "generation=${challenge.generation}",
-            )
+                    "generation=${challenge.generation}"
+            }
             true
         } catch (e: Exception) {
-            Log.w(TAG, "Recovery Activity launch failed", e)
+            DiagLog.w(context, TAG, e) { "Recovery Activity launch failed" }
             false
         }
     }

@@ -3,7 +3,6 @@ package com.smartapplock.app
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.util.Log
 
 /** Restarts only previously configured protection after an unlocked boot. */
 class ProtectionBootReceiver : BroadcastReceiver() {
@@ -15,7 +14,7 @@ class ProtectionBootReceiver : BroadcastReceiver() {
                 context,
                 "Protection service could not restart after boot.",
             )
-            Log.w(TAG, "Boot recovery could not start WatcherService")
+            DiagLog.w(context, TAG) { "Boot recovery could not start WatcherService" }
         }
     }
 

@@ -18,7 +18,6 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
-import android.util.Log
 
 enum class ForegroundSource { ACCESSIBILITY, USAGE_EVENTS }
 
@@ -74,10 +73,9 @@ class WatcherService : Service() {
                         observedPackage = observed,
                         rememberedPackage = ProtectionStateStore.wakeReauthPackage(context),
                     ) { ProtectionStateStore.isProtected(context, it) }
-                    Log.d(
-                        TAG,
-                        "SCREEN_OFF observed=$observed wakePackage=$wakePackage",
-                    )
+                    DiagLog.d(context, TAG) {
+                        "SCREEN_OFF observed=$observed wakePackage=$wakePackage"
+                    }
                     if (wakePackage != null) {
                         ProtectionStateStore.rememberWakeReauthPackage(
                             context,
@@ -95,7 +93,7 @@ class WatcherService : Service() {
                 }
                 Intent.ACTION_SCREEN_ON -> {
                     val pending = ProtectionStateStore.restoreWakeReauthChallenge(context)
-                    Log.d(TAG, "SCREEN_ON pending=$pending")
+                    DiagLog.d(context, TAG) { "SCREEN_ON pending=$pending" }
                     if (pending != null &&
                         ProtectionStateStore.isProtected(context, pending.packageName)
                     ) {
@@ -108,7 +106,7 @@ class WatcherService : Service() {
                 }
                 Intent.ACTION_USER_PRESENT -> {
                     val pending = ProtectionStateStore.restoreWakeReauthChallenge(context)
-                    Log.d(TAG, "USER_PRESENT pending=$pending")
+                    DiagLog.d(context, TAG) { "USER_PRESENT pending=$pending" }
                     if (pending != null &&
                         ProtectionStateStore.isProtected(context, pending.packageName)
                     ) {
@@ -160,7 +158,7 @@ class WatcherService : Service() {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(screenReceiver, filter)
         }
-        Log.d(TAG, "WatcherService.onCreate")
+        DiagLog.d(this, TAG) { "WatcherService.onCreate" }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -195,7 +193,7 @@ class WatcherService : Service() {
         restoreAfterProcessRestartIfNeeded(this)
         handler.removeCallbacks(poll)
         handler.post(poll)
-        Log.d(TAG, "Native protection watcher started")
+        DiagLog.d(this, TAG) { "Native protection watcher started" }
         return START_STICKY
     }
 
@@ -223,7 +221,7 @@ class WatcherService : Service() {
         if (action.disarmsOverlay) {
             ProtectionOverlayController.disarm()
         }
-        Log.d(TAG, "WatcherService destroyed")
+        DiagLog.d(this, TAG) { "WatcherService destroyed" }
         super.onDestroy()
     }
 
@@ -366,7 +364,7 @@ class WatcherService : Service() {
                     ),
                 ) { ProtectionStateStore.isProtected(context, it) }
                 // Diagnostics: the decision only, never package names.
-                Log.d(TAG, "Restart recovery decision=${result.decision}")
+                DiagLog.d(context, TAG) { "Restart recovery decision=${result.decision}" }
                 val target = result.targetPackage ?: return
                 val ticket = ProtectionStateStore.createRestartRecoveryChallenge(
                     context,
@@ -376,7 +374,7 @@ class WatcherService : Service() {
                 ProtectionOverlayController.show(context)
                 recoverProtected(context, ticket.packageName, WakeRecoverySignal.RETRY)
             } catch (e: Exception) {
-                Log.w(TAG, "Restart recovery failed: ${e.javaClass.simpleName}")
+                DiagLog.w(context, TAG) { "Restart recovery failed: ${e.javaClass.simpleName}" }
                 try {
                     // Fail closed: a persisted ticket keeps the shield and
                     // the bounded recovery retry.
@@ -385,7 +383,9 @@ class WatcherService : Service() {
                         activeInstance?.scheduleRecoveryRetry()
                     }
                 } catch (inner: Exception) {
-                    Log.w(TAG, "Restart recovery fallback failed: ${inner.javaClass.simpleName}")
+                    DiagLog.w(context, TAG) {
+                        "Restart recovery fallback failed: ${inner.javaClass.simpleName}"
+                    }
                 }
             }
         }
@@ -400,7 +400,7 @@ class WatcherService : Service() {
             true
         } catch (e: Exception) {
             ProtectionStateStore.setLastError(context, "Watcher start failed: ${e.message}")
-            Log.w(TAG, "Could not start watcher", e)
+            DiagLog.w(context, TAG, e) { "Could not start watcher" }
             false
         }
 
@@ -414,7 +414,7 @@ class WatcherService : Service() {
             context.stopService(Intent(context, WatcherService::class.java))
             true
         } catch (e: Exception) {
-            Log.w(TAG, "Could not stop watcher", e)
+            DiagLog.w(context, TAG, e) { "Could not stop watcher" }
             false
         }
 
@@ -874,7 +874,7 @@ class WatcherService : Service() {
                     ResolvedActivity(info.packageName, info.name)
                 },
             )
-            Log.d(TAG, "window kind=$kind for $packageName")
+            DiagLog.d(context, TAG) { "window kind=$kind for $packageName" }
             return kind
         }
 
