@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Phase 13 / M3 (Q-P13-6): legacy Auto Backup rules (Android 6-11, API 23-30).
+  android:allowBackup="false" already disables backup there; this exclude-all
+  file keeps the result unchanged if allowBackup is ever flipped. No include
+  rules. Verified by test/regression/p13_m3_backup_rules_test.dart.
+-->
+<full-backup-content>
+    <exclude domain="root" path="." />
+    <exclude domain="file" path="." />
+    <exclude domain="database" path="." />
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="external" path="." />
+    <exclude domain="device_root" path="." />
+    <exclude domain="device_file" path="." />
+    <exclude domain="device_database" path="." />
+    <exclude domain="device_sharedpref" path="." />
+</full-backup-content>
