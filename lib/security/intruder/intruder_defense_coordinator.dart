@@ -17,6 +17,15 @@
 // Work started under an older epoch can never persist an image (checked
 // after every await and, finally, inside the store's serialized write) and
 // an alarm whose start was still pending is stopped as soon as it reports.
+//
+// Phase 13 / M2 — outcome observer. After each capture / alarm decision the
+// coordinator reports ONE immutable [IntruderOutcome] (ints and enums only,
+// never a platform string) to an optional [outcomeObserver]. The call is
+// synchronous, made after the branch's counters and awaits, never awaited,
+// and wrapped in try/catch: an observer can neither block nor change any
+// capture, alarm, counter or epoch decision. No control flow reads the
+// observer state except the `finally` fallback, which only decides whether
+// to report.
 
 import 'dart:async';
 import 'dart:collection';
@@ -27,6 +36,76 @@ import 'intruder_defense_settings.dart';
 import 'intruder_evidence_service.dart';
 import 'intruder_evidence_store.dart';
 import 'intruder_monitor.dart';
+
+/// Why no photo was saved for a trigger (closed set; Phase 13 / M2).
+enum IntruderCaptureWhy {
+  permission,
+  camera,
+  timeout,
+  busy,
+  cancelled,
+  duplicate,
+  storage,
+  encryption,
+  image,
+  superseded,
+  unsupported,
+  error,
+}
+
+/// Why the alarm did not start for a trigger (closed set; Phase 13 / M2).
+enum IntruderAlarmWhy {
+  alreadyPlaying,
+  dnd,
+  ringer,
+  focusDenied,
+  notForeground,
+  cancelled,
+  error,
+}
+
+/// One terminal capture / alarm outcome (Phase 13 / M2). Immutable; holds
+/// the failed-attempt seq ([trig]) and closed enums only.
+sealed class IntruderOutcome {
+  const IntruderOutcome();
+}
+
+final class CaptureSavedOutcome extends IntruderOutcome {
+  const CaptureSavedOutcome(this.trig);
+
+  final int trig;
+}
+
+final class CaptureNotSavedOutcome extends IntruderOutcome {
+  const CaptureNotSavedOutcome(this.trig, this.why);
+
+  final int trig;
+  final IntruderCaptureWhy why;
+}
+
+final class AlarmStartedOutcome extends IntruderOutcome {
+  const AlarmStartedOutcome(this.trig);
+
+  final int trig;
+}
+
+final class AlarmNotStartedOutcome extends IntruderOutcome {
+  const AlarmNotStartedOutcome(this.trig, this.why);
+
+  final int trig;
+  final IntruderAlarmWhy why;
+}
+
+/// A stop of an alarm that was reported playing was requested.
+final class AlarmStoppedOutcome extends IntruderOutcome {
+  const AlarmStoppedOutcome();
+}
+
+/// Receives outcomes synchronously. Must return quickly; exceptions are
+/// swallowed by the coordinator.
+abstract interface class IntruderOutcomeObserver {
+  void onIntruderOutcome(IntruderOutcome o);
+}
 
 /// Counters only — no image data, no credential material.
 final class IntruderDefenseStatus {
@@ -84,6 +163,15 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
   int _alarmEpoch = 0;
   bool _alarmPlaying = false;
   int _alarmStartsPending = 0;
+
+  /// Phase 13 / M2: optional outcome observer (read at call time).
+  IntruderOutcomeObserver? outcomeObserver;
+
+  /// Trigger seq of the capture holding the single slot, and whether its
+  /// terminal outcome was already reported. Read only by the reporting
+  /// helpers and the `finally` fallback.
+  int _captureTrig = -1;
+  bool _captureReported = true;
 
   /// Completes when every started operation has finished (tests).
   Future<void> idle() async {
@@ -146,9 +234,11 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
 
   void _invalidateAlarm({bool force = false}) {
     _alarmEpoch++;
+    final bool wasPlaying = _alarmPlaying;
     if (force || _alarmPlaying || _alarmStartsPending > 0) {
       _alarmPlaying = false;
       _track(_quiet(_service.stopAlarm));
+      if (wasPlaying) _notify(const AlarmStoppedOutcome());
     }
   }
 
@@ -173,7 +263,7 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
       if (!alarm && !photo) return;
       status.triggers++;
       await Future.wait(<Future<void>>[
-        if (alarm) _alarm(alarmEpoch),
+        if (alarm) _alarm(alarmEpoch, event.seq),
         if (photo) _capture(event, captureEpoch),
       ]);
     } catch (_) {
@@ -181,13 +271,14 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
     }
   }
 
-  Future<void> _alarm(int epoch) async {
+  Future<void> _alarm(int epoch, int trig) async {
     _alarmStartsPending++;
     AlarmStartResult r;
     try {
       r = await _service.startAlarm(duration: alarmDuration);
     } catch (_) {
       status.errors++;
+      _notify(AlarmNotStartedOutcome(trig, IntruderAlarmWhy.error));
       return;
     } finally {
       _alarmStartsPending--;
@@ -195,28 +286,35 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
     if (r != AlarmStartResult.started) {
       status.alarmsSuppressed++;
       status.lastFailure = 'alarm:${r.name}';
+      _notify(AlarmNotStartedOutcome(trig, _alarmWhy(r)));
       return;
     }
     if (epoch != _alarmEpoch) {
       // Owner success / revocation arrived while the start was pending.
       status.alarmsCancelled++;
       await _quiet(_service.stopAlarm);
+      _notify(AlarmNotStartedOutcome(trig, IntruderAlarmWhy.cancelled));
       return;
     }
     status.alarmsStarted++;
     _alarmPlaying = true;
+    _notify(AlarmStartedOutcome(trig));
   }
 
   Future<void> _capture(FailedAttemptEvent event, int epoch) async {
     if (_capturing) {
       status.captureSkipped++; // single capture slot; never queued
+      _notify(CaptureNotSavedOutcome(event.seq, IntruderCaptureWhy.busy));
       return;
     }
     _capturing = true;
+    _captureTrig = event.seq;
+    _captureReported = false;
     try {
       if (await _service.cameraPermission() != CameraPermissionState.granted) {
         status.captureSkipped++;
         status.lastFailure = 'capture:permission';
+        _captureNotSaved(IntruderCaptureWhy.permission);
         return;
       }
       if (epoch != _captureEpoch) {
@@ -241,6 +339,10 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
         case CaptureFailed(:final String reason):
           status.captureFailed++;
           status.lastFailure = 'capture:$reason';
+          // The platform reason string is never forwarded.
+          _captureNotSaved(reason == 'timeout'
+              ? IntruderCaptureWhy.timeout
+              : IntruderCaptureWhy.camera);
         case CaptureSucceeded(:final jpeg):
           // Authoritative consent re-check (corrupt/unreadable = disabled).
           final IntruderDefenseSettings now = (await _settings.read()).settings;
@@ -258,17 +360,24 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
           );
           if (saved == EvidenceSaveResult.saved) {
             status.captured++;
+            _notifyCapture(CaptureSavedOutcome(_captureTrig));
           } else if (saved == EvidenceSaveResult.cancelled ||
               saved == EvidenceSaveResult.superseded) {
+            if (saved == EvidenceSaveResult.superseded) {
+              _captureNotSaved(IntruderCaptureWhy.superseded);
+            }
             _cancelled();
           } else {
             status.saveFailed++;
             status.lastFailure = 'save:${saved.name}';
+            _captureNotSaved(_saveWhy(saved));
           }
       }
     } catch (_) {
       status.errors++;
     } finally {
+      // Exactly one capture outcome per slot entry (any missed path).
+      if (!_captureReported) _captureNotSaved(IntruderCaptureWhy.error);
       _capturing = false;
     }
   }
@@ -276,5 +385,55 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
   void _cancelled() {
     status.captureCancelled++;
     status.lastFailure = 'capture:cancelled';
+    if (!_captureReported) _captureNotSaved(IntruderCaptureWhy.cancelled);
   }
+
+  // -- Phase 13 / M2 outcome reporting (never affects a decision) ----------
+
+  /// Synchronous; an observer exception is swallowed here, so it can never
+  /// reach the coordinator's own error handling or counters.
+  void _notify(IntruderOutcome o) {
+    try {
+      outcomeObserver?.onIntruderOutcome(o);
+    } catch (_) {
+      // Observer failures never affect capture, alarm or counters.
+    }
+  }
+
+  /// Reports the slot's terminal capture outcome (marks it reported first,
+  /// so a throwing observer can never cause a second outcome).
+  void _notifyCapture(IntruderOutcome o) {
+    _captureReported = true;
+    _notify(o);
+  }
+
+  void _captureNotSaved(IntruderCaptureWhy why) =>
+      _notifyCapture(CaptureNotSavedOutcome(_captureTrig, why));
+
+  static IntruderCaptureWhy _saveWhy(EvidenceSaveResult r) => switch (r) {
+        EvidenceSaveResult.duplicate => IntruderCaptureWhy.duplicate,
+        EvidenceSaveResult.storageFailed => IntruderCaptureWhy.storage,
+        EvidenceSaveResult.encryptionFailed => IntruderCaptureWhy.encryption,
+        EvidenceSaveResult.invalidImage ||
+        EvidenceSaveResult.oversized =>
+          IntruderCaptureWhy.image,
+        EvidenceSaveResult.unsupportedSchema => IntruderCaptureWhy.unsupported,
+        // Handled by the caller's other branches (never reached here).
+        EvidenceSaveResult.saved ||
+        EvidenceSaveResult.cancelled ||
+        EvidenceSaveResult.superseded =>
+          IntruderCaptureWhy.error,
+      };
+
+  static IntruderAlarmWhy _alarmWhy(AlarmStartResult r) => switch (r) {
+        AlarmStartResult.alreadyPlaying => IntruderAlarmWhy.alreadyPlaying,
+        AlarmStartResult.suppressedByDnd => IntruderAlarmWhy.dnd,
+        AlarmStartResult.suppressedByRinger => IntruderAlarmWhy.ringer,
+        AlarmStartResult.focusDenied => IntruderAlarmWhy.focusDenied,
+        AlarmStartResult.notForeground => IntruderAlarmWhy.notForeground,
+        // `started` is handled by the caller (never reached here).
+        AlarmStartResult.started ||
+        AlarmStartResult.error =>
+          IntruderAlarmWhy.error,
+      };
 }

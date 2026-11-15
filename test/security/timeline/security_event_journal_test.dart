@@ -326,7 +326,7 @@ void main() {
     });
 
     test('newer schema is read-only and NEVER overwritten (A1-3)', () async {
-      final String newer = '{"schema":"sal.security_journal","v":2,'
+      final String newer = '{"schema":"sal.security_journal","v":3,'
           '"nextSeq":9,"events":[{"seq":1,"futureField":true}]}';
       await db.setSetting(_key, newer);
       final SecurityEventJournal j = journal(plaintext: true);

@@ -65,6 +65,9 @@ Route<Object?>? _topRoute(NavigatorState navigator) {
 
 abstract final class IntruderEvidenceText {
   static const String title = 'Intruder photos';
+
+  /// Phase 13 / M2: a timeline-linked photo is no longer listed.
+  static const String noLongerAvailable = 'Photo no longer available.';
   static const String empty = 'No intruder photos are stored.';
   static const String notVerified =
       'Not opened. Verify with your app PIN or pattern to view intruder '
@@ -95,10 +98,14 @@ abstract final class IntruderEvidenceText {
 /// Fresh verification -> session -> viewer. Returns false when the owner
 /// could not be verified (nothing was shown). The session is invalidated
 /// when the viewer closes, whatever the reason.
+///
+/// Phase 13 / M2: [focusSeq] (optional) asks the verified list to open that
+/// photo's detail once, only if it is listed (see `_openFocus`).
 Future<bool> openIntruderEvidence(
   BuildContext context,
-  AppContainer container,
-) async {
+  AppContainer container, {
+  int? focusSeq,
+}) async {
   final NavigatorState navigator = Navigator.of(context);
   final AuthType? method = await verifyIntruderOwner(navigator, container.auth);
   if (method == null) return false;
@@ -107,13 +114,28 @@ Future<bool> openIntruderEvidence(
   try {
     await navigator.push<void>(MaterialPageRoute<void>(
       settings: const RouteSettings(name: intruderEvidenceRouteName),
-      builder: (_) =>
-          IntruderEvidenceScreen(container: container, session: session),
+      builder: (_) => IntruderEvidenceScreen(
+        container: container,
+        session: session,
+        focusSeq: focusSeq,
+      ),
     ));
   } finally {
     session.invalidate('closed');
   }
   return true;
+}
+
+/// Phase 13 / M2 timeline link: pure delegation to [openIntruderEvidence]
+/// (same fresh verification, same new evidence session, same list guards).
+/// A negative seq opens nothing and asks for nothing.
+Future<bool> openIntruderEvidenceForSeq(
+  BuildContext context,
+  AppContainer container,
+  int seq,
+) {
+  if (seq < 0) return Future<bool>.value(false);
+  return openIntruderEvidence(context, container, focusSeq: seq);
 }
 
 /// Owner clear-all (shared by the settings screen and the viewer).
@@ -199,10 +221,14 @@ class IntruderEvidenceScreen extends StatefulWidget {
     super.key,
     required this.container,
     required this.session,
+    this.focusSeq,
   });
 
   final AppContainer container;
   final IntruderOwnerSession session;
+
+  /// Phase 13 / M2: photo seq to open once after the first verified load.
+  final int? focusSeq;
 
   @override
   State<IntruderEvidenceScreen> createState() => _IntruderEvidenceScreenState();
@@ -213,6 +239,9 @@ class _IntruderEvidenceScreenState extends State<IntruderEvidenceScreen>
   List<EvidenceItem>? _items;
   EvidenceIndexHealth _health = EvidenceIndexHealth.ok;
   bool _busy = false;
+
+  /// Phase 13 / M2: one-shot focus request (never set again once cleared).
+  bool _focusPending = false;
   bool _closing = false;
   Timer? _expiry;
   StreamSubscription<Result<ScreenStateEvent>>? _screen;
@@ -232,6 +261,7 @@ class _IntruderEvidenceScreenState extends State<IntruderEvidenceScreen>
   @override
   void initState() {
     super.initState();
+    _focusPending = widget.focusSeq != null;
     WidgetsBinding.instance.addObserver(this);
     session.addListener(_onInvalidated);
     if (!session.isValid) _onInvalidated('expired');
@@ -245,6 +275,9 @@ class _IntruderEvidenceScreenState extends State<IntruderEvidenceScreen>
         }
       },
       onError: (Object _) => session.invalidate('screenStateError'),
+      // W-03: an unexpected end of the screen-state stream means screen-off
+      // can no longer arrive: fail closed (the session ends, pixels drop).
+      onDone: () => session.invalidate('screenStateClosed'),
     );
     unawaited(_load());
   }
@@ -304,6 +337,40 @@ class _IntruderEvidenceScreenState extends State<IntruderEvidenceScreen>
       _items = items.reversed.toList(); // newest first
       _health = health;
     });
+    if (_focusPending) {
+      _focusPending = false;
+      _openFocus(op);
+    }
+  }
+
+  /// Phase 13 / M2: opens the focused photo only from this verified,
+  /// current list, only for a LISTED item (the seq is a lookup key, never
+  /// used to build an item), in the same synchronous block as the push.
+  void _openFocus(int op) {
+    if (!mounted ||
+        !session.isValid ||
+        op != _loadOp ||
+        _busy ||
+        _health != EvidenceIndexHealth.ok ||
+        ModalRoute.of(context)?.isCurrent != true) {
+      return;
+    }
+    final int? seq = widget.focusSeq;
+    EvidenceItem? found;
+    for (final EvidenceItem item in _items ?? const <EvidenceItem>[]) {
+      if (item.seq == seq) {
+        found = item;
+        break;
+      }
+    }
+    if (found == null) {
+      _snack(
+        context,
+        const SnackBar(content: Text(IntruderEvidenceText.noLongerAvailable)),
+      );
+      return;
+    }
+    unawaited(_openDetail(found));
   }
 
   Future<void> _openDetail(EvidenceItem item) async {

@@ -13,6 +13,14 @@
 // the timeline closes itself (immediately if it is on top, otherwise when
 // it surfaces again — a foreign route is never popped).
 //
+// M2: failed attempts are shown in presentation-only groups (P10) with
+// up to 3 inline attempt rows (M1 keys); a group or an M2 row opens the
+// details route, which is the ONLY own child route. While the details
+// route covers the timeline the loaded history is dropped (not the
+// session); on surfacing the timeline re-runs FLAG_SECURE -> credential
+// re-check -> load before anything renders. Any other covering route is
+// foreign and ends the session.
+//
 // Metadata only. No share, export, clipboard, selection, file or log
 // output. FLAG_SECURE is intentionally NOT cleared on exit (same as the
 // Phase 12 evidence viewer; the lock host clears it at its own loop end).
@@ -26,13 +34,23 @@ import '../../../design_system/design_system.dart';
 import '../../../security/credentials/auth_type.dart';
 import '../../../security/credentials/verified_attempt.dart';
 import '../../../security/intruder/failed_attempt_event.dart';
+import '../../../security/intruder/intruder_defense_coordinator.dart';
 import '../../../security/intruder/intruder_owner_session.dart';
+import '../../../security/timeline/security_journal_event.dart';
 import '../../../security/timeline/security_timeline.dart';
+import '../../../security/timeline/security_timeline_grouping.dart';
 import '../../../services/screen_state_service.dart';
 import '../../../utilities/result.dart';
 import 'intruder_owner_verification.dart';
+import 'security_timeline_detail_screen.dart';
 
 const String securityTimelineRouteName = '/security/timeline';
+
+/// Routes that belong to the timeline flow (Q-M2-8 A: the verification
+/// route is NOT own-flow).
+bool isSecurityTimelineFlowRoute(Route<dynamic> r) =>
+    r.settings.name == securityTimelineRouteName ||
+    r.settings.name == securityTimelineDetailRouteName;
 
 abstract final class SecurityTimelineText {
   static const String title = 'Security timeline';
@@ -56,11 +74,172 @@ abstract final class SecurityTimelineText {
       };
 
   static String unavailable(TimelineSource s, TimelineSourceState st) =>
-      st == TimelineSourceState.unavailableNewerVersion
-          ? '${sourceName(s)} was saved by a newer version of the app and '
-              'can\'t be shown here.'
-          : '${sourceName(s)} couldn\'t be read. This does not mean there '
-              'are no events.';
+      switch (st) {
+        TimelineSourceState.unavailableNewerVersion =>
+          '${sourceName(s)} was saved by a newer version of the app and '
+              'can\'t be shown here.',
+        TimelineSourceState.unavailableBusy =>
+          '${sourceName(s)} was busy and couldn\'t be read just now. This '
+              'does not mean there are no events.',
+        TimelineSourceState.available ||
+        TimelineSourceState.unavailableUnreadable =>
+          '${sourceName(s)} couldn\'t be read. This does not mean there '
+              'are no events.',
+      };
+
+  // -- M2 (gate R2 §4.3) ---------------------------------------------------
+
+  static const String resetPending =
+      'A recent successful unlock hasn\'t been saved to the attempt counter '
+      'yet. Consecutive-failure counters may be higher than the real number.';
+
+  static String resetFailures(int n) =>
+      '$n successful ${n == 1 ? 'unlock' : 'unlocks'} couldn\'t be saved to '
+      'the attempt counter.';
+
+  static const String healthCoverage =
+      'Protection status is checked only while Smart App Lock is open. '
+      'Problems may have started earlier, and short interruptions may be '
+      'missing.';
+
+  static const String photoLink =
+      'Photos are listed in Intruder photos. Photos taken before this update '
+      'aren\'t linked here.';
+
+  static const String footerProcessDeath =
+      'Events detected just before the app closed may be missing.';
+
+  static const String details = 'Details';
+
+  /// A-1: the lazily created marker is a FIRST-USE time.
+  static const String journalStartedNote =
+      'No journal events were recorded before this time.';
+
+  static const String detachedOutcome =
+      'This event could not be matched to a failed attempt in the available '
+      'history.';
+
+  static String moreInDetails(int n) => '+$n more in details';
+
+  static String attempts(int n) =>
+      '$n failed ${n == 1 ? 'attempt' : 'attempts'}';
+
+  static String appLabel(String? package, Map<String, String> labels) =>
+      package == null ? 'in Smart App Lock' : (labels[package] ?? package);
+
+  /// Gate R2 §1.2 reason wording (verbatim).
+  static String captureWhy(CaptureWhy w) => switch (w) {
+        CaptureWhy.permission => 'camera permission is off',
+        CaptureWhy.camera => 'camera error',
+        CaptureWhy.timeout => 'camera timed out',
+        CaptureWhy.busy => 'another photo was being taken',
+        CaptureWhy.cancelled => 'stopped',
+        CaptureWhy.duplicate => 'a photo for this attempt already exists',
+        CaptureWhy.storage => 'couldn\'t be stored',
+        CaptureWhy.encryption => 'couldn\'t be encrypted',
+        CaptureWhy.image => 'image was invalid or too large',
+        CaptureWhy.superseded => 'photos were deleted',
+        CaptureWhy.unsupported => 'photo storage is from a newer version',
+        CaptureWhy.error => 'unexpected error',
+      };
+
+  static String alarmWhy(AlarmWhy w) => switch (w) {
+        AlarmWhy.alreadyPlaying => 'already playing',
+        AlarmWhy.dnd => 'Do Not Disturb',
+        AlarmWhy.ringer => 'silent mode',
+        AlarmWhy.focusDenied => 'audio unavailable',
+        AlarmWhy.notForeground => 'app not in front',
+        AlarmWhy.cancelled => 'stopped',
+        AlarmWhy.error => 'unexpected error',
+      };
+
+  /// Configured alarm length shown on alarm rows ("plays up to …"); the
+  /// row never states an end time.
+  static final int alarmSeconds =
+      IntruderDefenseCoordinator.defaultAlarmDuration.inSeconds;
+
+  static String healthState(HState s) => switch (s) {
+        HState.secure => 'secure',
+        HState.attention => 'needs attention',
+        HState.offline => 'offline',
+      };
+
+  static String healthCode(HCode c) => switch (c) {
+        HCode.protectionNotConfigured => 'protection not set up',
+        HCode.enforcementNotArmed => 'locking not active',
+        HCode.overlayUnavailable => 'lock screen permission missing',
+        HCode.detectionOffline => 'app detection off',
+        HCode.accessibilityUnavailable => 'accessibility service off',
+        HCode.accessibilityNotRunning => 'accessibility service not running',
+        HCode.usageAccessUnavailable => 'usage access missing',
+        HCode.watcherNotRunning => 'background watcher not running',
+        HCode.shieldNotArmed => 'shield not active',
+        HCode.notificationsDisabled => 'notifications off',
+        HCode.backgroundRestricted => 'background use restricted',
+        HCode.signalUnknown => 'some checks couldn\'t be completed',
+        HCode.healthSnapshotStale => 'status check out of date',
+      };
+
+  /// (title, subtitle) for an M2 journal entry; time labels follow gate R2
+  /// §1.2 ("recorded at" for outcomes, "detected at" for health/storage).
+  static (String, String) entryText(TimelineEntry e, String time) =>
+      switch (e.kind) {
+        TimelineEntryKind.failedUnlock => (
+            e.method == FailedAttemptMethod.pattern
+                ? 'Failed pattern attempt'
+                : 'Failed PIN attempt',
+            time,
+          ),
+        TimelineEntryKind.journalStarted => (
+            'Security journal first used',
+            '$time · $journalStartedNote',
+          ),
+        TimelineEntryKind.journalRecovered => (
+            'Security journal was damaged and reset',
+            '$time · Earlier journal events may be missing.',
+          ),
+        TimelineEntryKind.journalUpgraded => (
+            'Security journal updated to a new format',
+            '$time · Earlier journal events were kept.',
+          ),
+        TimelineEntryKind.captureSaved => (
+            'Photo saved',
+            'recorded at $time',
+          ),
+        TimelineEntryKind.captureNotSaved => (
+            'Photo not saved · '
+                '${e.captureWhy == null ? 'unexpected error' : captureWhy(e.captureWhy!)}',
+            'recorded at $time',
+          ),
+        TimelineEntryKind.alarmStarted => (
+            'Alarm started · plays up to $alarmSeconds s',
+            'recorded at $time',
+          ),
+        TimelineEntryKind.alarmNotStarted => (
+            'Alarm not started · '
+                '${e.alarmWhy == null ? 'unexpected error' : alarmWhy(e.alarmWhy!)}',
+            'recorded at $time',
+          ),
+        TimelineEntryKind.alarmStopped => (
+            'Alarm stop requested',
+            'recorded at $time',
+          ),
+        TimelineEntryKind.protectionHealth => (
+            'Protection '
+                '${e.healthState == null ? 'status unknown' : healthState(e.healthState!)}',
+            'detected at $time'
+                '${e.healthCodes.isEmpty ? '' : ' · ${e.healthCodes.map(healthCode).join(', ')}'}',
+          ),
+        TimelineEntryKind.storageUnavailable => (
+            'Failed-unlock history storage unavailable',
+            'detected at $time · '
+                '${e.storageKind == StoreKind.readOnly ? 'saved by a newer version of the app' : 'couldn\'t be saved or read'}',
+          ),
+        TimelineEntryKind.storageRestored => (
+            'Failed-unlock history storage readable again',
+            'detected at $time',
+          ),
+      };
 
   static String discarded(TimelineSource s, int n) =>
       '${sourceName(s)}: $n older ${n == 1 ? 'event is' : 'events are'} no '
@@ -127,6 +306,13 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
   bool _covered = false;
   bool _paging = false;
   int _loadOp = 0;
+
+  /// M2: the timeline's own details route while it is pushed.
+  Route<void>? _detailRoute;
+
+  /// M2: history was dropped because the own details route covered the
+  /// timeline; a secure reload must run before anything renders again.
+  bool _reloadOnSurface = false;
   Timer? _expiry;
   StreamSubscription<Result<ScreenStateEvent>>? _screen;
 
@@ -156,6 +342,9 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
         }
       },
       onError: (Object _) => session.invalidate('screenStateError'),
+      // W-03: an unexpected end of the screen-state stream means screen-off
+      // can no longer arrive: fail closed (the session ends, pixels drop).
+      onDone: () => session.invalidate('screenStateClosed'),
     );
     unawaited(_load());
   }
@@ -243,6 +432,10 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
       scheduleMicrotask(() {
         if (!mounted) return;
         final ModalRoute<Object?>? r = ModalRoute.of(context);
+        if (r != null && r.isActive && !r.isCurrent && _ownDetailOnTop()) {
+          _dropForOwnRoute(); // own details route: keep the session
+          return;
+        }
         if (r != null && r.isActive && !r.isCurrent) {
           session.invalidate('covered');
         }
@@ -251,7 +444,44 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
       _covered = false;
       scheduleMicrotask(() {
         if (mounted && !session.isValid) _onSessionEnded();
+        if (mounted && session.isValid && _reloadOnSurface) {
+          _reloadOnSurface = false;
+          unawaited(_load()); // FLAG_SECURE -> re-check -> load
+        }
       });
+    }
+  }
+
+  bool _ownDetailOnTop() {
+    final Route<void>? d = _detailRoute;
+    return d != null && d.isCurrent && isSecurityTimelineFlowRoute(d);
+  }
+
+  void _dropForOwnRoute() {
+    _loadOp++;
+    _reloadOnSurface = true;
+    setState(() {
+      _snapshot = null; // nothing is kept while covered
+    });
+  }
+
+  Future<void> _openDetails(TimelineRow row) async {
+    final SecurityTimelineSnapshot? snap = _snapshot;
+    if (snap == null || !session.isValid || _detailRoute != null) return;
+    final Route<void> route = MaterialPageRoute<void>(
+      settings: const RouteSettings(name: securityTimelineDetailRouteName),
+      builder: (_) => SecurityTimelineDetailScreen(
+        container: widget.container,
+        session: session,
+        data: SecurityTimelineDetailData(row, snap.labels,
+            failureLogDamaged: failureLogDamagedEarlier(snap)),
+      ),
+    );
+    _detailRoute = route;
+    try {
+      await Navigator.of(context).push<void>(route);
+    } finally {
+      _detailRoute = null;
     }
   }
 
@@ -276,6 +506,7 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
         snapshot: snap,
         visible: _visible,
         onShowOlder: _showOlder,
+        onDetails: _openDetails,
       );
     }
     return Scaffold(
@@ -290,11 +521,13 @@ class _TimelineList extends StatelessWidget {
     required this.snapshot,
     required this.visible,
     required this.onShowOlder,
+    required this.onDetails,
   });
 
   final SecurityTimelineSnapshot snapshot;
   final int visible;
   final VoidCallback onShowOlder;
+  final void Function(TimelineRow row) onDetails;
 
   @override
   Widget build(BuildContext context) {
@@ -335,7 +568,34 @@ class _TimelineList extends StatelessWidget {
         ));
       }
     }
+    if (snapshot.resetPending) {
+      rows.add(const _Notice(
+        key: Key('security_timeline_reset_pending'),
+        icon: Icons.info_outline,
+        text: SecurityTimelineText.resetPending,
+      ));
+    }
+    if (snapshot.resetFailures > 0) {
+      rows.add(_Notice(
+        key: const Key('security_timeline_reset_failures'),
+        icon: Icons.warning_amber_outlined,
+        text: SecurityTimelineText.resetFailures(snapshot.resetFailures),
+      ));
+    }
     final List<TimelineEntry> entries = snapshot.entries;
+    if (entries.any(
+        (TimelineEntry e) => e.kind == TimelineEntryKind.protectionHealth)) {
+      rows.add(const _Notice(
+        key: Key('security_timeline_health_coverage'),
+        icon: Icons.info_outline,
+        text: SecurityTimelineText.healthCoverage,
+      ));
+    }
+    rows.add(const _Notice(
+      key: Key('security_timeline_photo_link'),
+      icon: Icons.photo_library_outlined,
+      text: SecurityTimelineText.photoLink,
+    ));
     if (snapshot.confirmedEmpty) {
       rows.add(const Padding(
         key: Key('security_timeline_empty'),
@@ -343,12 +603,45 @@ class _TimelineList extends StatelessWidget {
         child: Text(SecurityTimelineText.empty, textAlign: TextAlign.center),
       ));
     }
-    final int shown = visible < entries.length ? visible : entries.length;
+    final List<TimelineRow> all = buildTimelineRows(entries);
+    final int shown = visibleRowCount(all, visible);
     for (int i = 0; i < shown; i++) {
-      rows.add(_EntryTile(entries[i]));
+      final TimelineRow r = all[i];
+      switch (r) {
+        case TimelineFailureGroup():
+          rows.add(_GroupHeader(
+            group: r,
+            labels: snapshot.labels,
+            onDetails: () => onDetails(r),
+          ));
+          final int inline =
+              r.count < SecurityTimelineGrouping.maxInlineAttempts
+                  ? r.count
+                  : SecurityTimelineGrouping.maxInlineAttempts;
+          for (int k = 0; k < inline; k++) {
+            rows.add(_EntryTile(r.attempts[k], labels: snapshot.labels));
+          }
+          if (r.count > inline) {
+            rows.add(Padding(
+              key: Key('security_timeline_group_more_${r.lastSeq}'),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: DsSpacing.lg, vertical: DsSpacing.sm),
+              child: Text(SecurityTimelineText.moreInDetails(r.count - inline)),
+            ));
+          }
+        case TimelineEntryRow(:final TimelineEntry entry):
+          final bool m2 = entry.source == TimelineSource.journal &&
+              entry.kind.index > TimelineEntryKind.journalRecovered.index;
+          rows.add(_EntryTile(
+            entry,
+            labels: snapshot.labels,
+            detached: r.detachedOutcome,
+            onTap: m2 ? () => onDetails(r) : null,
+          ));
+      }
       rows.add(const Divider(height: 1));
     }
-    if (shown < entries.length) {
+    if (shown < all.length) {
       rows.add(Center(
         child: TextButton(
           key: const Key('security_timeline_show_older'),
@@ -360,7 +653,15 @@ class _TimelineList extends StatelessWidget {
     rows.add(const Padding(
       key: Key('security_timeline_footer'),
       padding: EdgeInsets.all(DsSpacing.lg),
-      child: Text(SecurityTimelineText.footer),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(SecurityTimelineText.footer),
+          SizedBox(height: DsSpacing.sm),
+          Text(SecurityTimelineText.footerProcessDeath,
+              key: Key('security_timeline_footer_process_death')),
+        ],
+      ),
     ));
     return ListView(
       key: const Key('security_timeline_list'),
@@ -369,38 +670,96 @@ class _TimelineList extends StatelessWidget {
   }
 }
 
-class _EntryTile extends StatelessWidget {
-  const _EntryTile(this.e);
+/// Group header (key deliberately NOT `security_timeline_entry_…`).
+class _GroupHeader extends StatelessWidget {
+  const _GroupHeader({
+    required this.group,
+    required this.labels,
+    required this.onDetails,
+  });
 
-  final TimelineEntry e;
+  final TimelineFailureGroup group;
+  final Map<String, String> labels;
+  final VoidCallback onDetails;
 
   @override
   Widget build(BuildContext context) {
-    final (IconData icon, String title, String subtitle) = switch (e.kind) {
-      TimelineEntryKind.failedUnlock => (
-          Icons.lock_outline,
-          e.method == FailedAttemptMethod.pattern
-              ? 'Failed pattern attempt'
-              : 'Failed PIN attempt',
-          '${e.surface == AuthAttemptSurface.protectedAppChallenge ? (e.packageName ?? 'Protected app') : 'Smart App Lock'}'
-              '${e.lockoutTriggered ? ' · lock-out started' : ''}',
-        ),
-      TimelineEntryKind.journalStarted => (
-          Icons.play_circle_outline,
-          'Security journal first used',
-          'No journal events were recorded before this time.',
-        ),
-      TimelineEntryKind.journalRecovered => (
-          Icons.report_outlined,
-          'Security journal was damaged and reset',
-          'Earlier journal events may be missing.',
-        ),
+    final TimelineFailureGroup g = group;
+    final String apps = g.packages
+        .map((String? p) => SecurityTimelineText.appLabel(p, labels))
+        .join(', ');
+    final String span = g.count == 1
+        ? _fmtTime(g.lastAt)
+        : '${_fmtTime(g.firstAt)} – ${_fmtTime(g.lastAt)}';
+    final List<String> badges = <String>[
+      if (g.lockouts == 1) 'Cooldown started',
+      if (g.lockouts > 1) 'Cooldown started ×${g.lockouts}',
+      if (g.has(TimelineEntryKind.captureSaved)) 'Photo saved',
+      if (g.has(TimelineEntryKind.captureNotSaved)) 'Photo not saved',
+      if (g.has(TimelineEntryKind.alarmStarted)) 'Alarm started',
+      if (g.has(TimelineEntryKind.alarmNotStarted)) 'Alarm not started',
+      if (g.counterNotSaved) '⚠ attempt counter couldn\'t be saved',
+    ];
+    return ListTile(
+      key: Key('security_timeline_group_failedAttempts_${g.lastSeq}'),
+      leading: const Icon(Icons.lock_outline),
+      title: Text('${SecurityTimelineText.attempts(g.count)} · $apps · $span'),
+      subtitle: badges.isEmpty ? null : Text(badges.join(' · ')),
+      trailing: TextButton(
+        key: Key('security_timeline_group_details_${g.lastSeq}'),
+        onPressed: onDetails,
+        child: const Text(SecurityTimelineText.details),
+      ),
+    );
+  }
+}
+
+class _EntryTile extends StatelessWidget {
+  const _EntryTile(
+    this.e, {
+    this.labels = const <String, String>{},
+    this.detached = false,
+    this.onTap,
+  });
+
+  final TimelineEntry e;
+  final Map<String, String> labels;
+  final bool detached;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final IconData icon = switch (e.kind) {
+      TimelineEntryKind.failedUnlock => Icons.lock_outline,
+      TimelineEntryKind.journalStarted => Icons.play_circle_outline,
+      TimelineEntryKind.journalRecovered => Icons.report_outlined,
+      TimelineEntryKind.journalUpgraded => Icons.upgrade,
+      TimelineEntryKind.captureSaved => Icons.photo_camera_outlined,
+      TimelineEntryKind.captureNotSaved => Icons.no_photography_outlined,
+      TimelineEntryKind.alarmStarted ||
+      TimelineEntryKind.alarmNotStarted ||
+      TimelineEntryKind.alarmStopped =>
+        Icons.notifications_active_outlined,
+      TimelineEntryKind.protectionHealth => Icons.shield_outlined,
+      TimelineEntryKind.storageUnavailable ||
+      TimelineEntryKind.storageRestored =>
+        Icons.storage_outlined,
     };
+    final String time = _fmtTime(e.at);
+    final (String title, String text) = SecurityTimelineText.entryText(e, time);
+    final String subtitle = e.kind == TimelineEntryKind.failedUnlock
+        ? '$time · '
+            '${e.surface == AuthAttemptSurface.protectedAppChallenge ? (e.packageName == null ? 'Protected app' : SecurityTimelineText.appLabel(e.packageName, labels)) : 'Smart App Lock'}'
+            '${e.lockoutTriggered ? ' · lock-out started' : ''}'
+        : text;
     return ListTile(
       key: Key('security_timeline_entry_${e.source.name}_${e.sourceSeq}'),
       leading: Icon(icon),
       title: Text(title),
-      subtitle: Text('${_fmtTime(e.at)} · $subtitle'),
+      subtitle: Text(detached
+          ? '$subtitle\n${SecurityTimelineText.detachedOutcome}'
+          : subtitle),
+      onTap: onTap,
     );
   }
 }

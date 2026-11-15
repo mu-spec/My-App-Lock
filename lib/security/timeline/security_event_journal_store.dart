@@ -1,6 +1,13 @@
 // Phase 13 / Milestone 1 — encrypted single-row storage for the security
 // event journal. Same database and AES-GCM settings cipher as the security
 // settings; mirrors the Phase 12 failure-log store contract.
+//
+// M2: rows declaring version 1 or 2 are decoded (v1 is upgraded in memory
+// only; the store never rewrites a row on read). A row of the journal
+// schema declaring a version ABOVE 2 is `unsupported` (read-only for the
+// process, never overwritten); any other invalid content — including a
+// malformed version-2 row — is corrupt and goes through the M1
+// quarantine-first path.
 import 'dart:convert';
 
 import '../../data/storage/local_database.dart';
@@ -89,6 +96,7 @@ class SecurityEventJournalStore {
       return SecurityJournalCorrupt(raw);
     }
     final int? declared = SecurityJournalDocument.declaredVersion(decoded);
+    // Newer than this build (version 2): never decoded, never overwritten.
     if (declared != null &&
         declared > SecurityJournalDocument.version &&
         decoded is Map &&

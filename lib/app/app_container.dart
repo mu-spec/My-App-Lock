@@ -31,6 +31,7 @@ import '../protection/lock_trigger.dart';
 import '../protection/protected_app_matcher.dart';
 import '../protection/health/protection_health_monitor.dart';
 import '../protection/protection_bootstrap.dart';
+import 'protection_health_journal_recorder.dart';
 import '../security/encryption/settings_cipher.dart';
 import '../security/encryption/settings_cipher_impl.dart';
 import '../security/credentials/credential_manager.dart';
@@ -46,7 +47,9 @@ import '../security/intruder/intruder_monitor.dart';
 import '../security/intruder/intruder_owner_session.dart';
 import '../security/timeline/security_event_journal.dart';
 import '../security/timeline/security_event_journal_store.dart';
+import '../security/timeline/intruder_outcome_journal_adapter.dart';
 import '../security/timeline/security_timeline.dart';
+import '../security/timeline/storage_health_journal_sampler.dart';
 import '../security/credentials/impl/default_pin_credential_store.dart';
 import '../security/storage/impl/flutter_secure_secret_store.dart';
 import '../security/storage/impl/in_memory_secret_store.dart';
@@ -177,11 +180,18 @@ class AppContainer {
     securityJournalStore =
         SecurityEventJournalStore(_database, cipher: settingsCipher);
     securityJournal = SecurityEventJournal(store: securityJournalStore);
+    // Phase 13 / M2: capture/alarm outcomes reach the journal only through
+    // the adapter (sync O(1) call -> microtask -> bounded journal queue).
+    intruderDefense.outcomeObserver =
+        IntruderOutcomeJournalAdapter(securityJournal);
+    securityStorageSampler = StorageHealthJournalSampler(securityJournal);
     securityTimeline = SecurityTimelineReader(
       monitor: intruderMonitor,
       journal: securityJournal,
       journalStore: securityJournalStore,
       database: _database,
+      storageSampler: securityStorageSampler,
+      protectedApps: protectedApps,
     );
     securityJournalStartup =
         securityJournal.startup().catchError((Object _) {});
@@ -236,6 +246,13 @@ class AppContainer {
       preferences: preferences,
       biometrics: biometrics,
     );
+    // Phase 13 / M2: observe-only health recorder. It never refreshes the
+    // monitor; it records only what existing UI refreshes emit.
+    securityHealthRecorder = ProtectionHealthJournalRecorder(
+      journal: securityJournal,
+      storageSampler: securityStorageSampler,
+      intruderStatus: () => intruderMonitor.status,
+    )..attach(protectionHealth);
     // Phase 5D: the access decision pipeline (protected -> challenge ->
     // session) and the trigger that drives it from foreground changes.
     // Phase 5E: the controller also consults the credential manager so
@@ -326,6 +343,10 @@ class AppContainer {
     KeyValueStore? keyValueStore,
     // Phase 12 / M2: fake camera/alarm platform (default: no camera).
     IntruderEvidenceService? intruderEvidence,
+    // Phase 13 / M2 F-CL-2: run the real production subscribers over a
+    // given screen-state service (e.g. the method-channel service on a
+    // mocked channel). Default: the static test service.
+    ScreenStateService? screenState,
   }) {
     final InstalledAppsService installedAppsService =
         StaticInstalledAppsService(
@@ -349,7 +370,7 @@ class AppContainer {
       installedAppsService: installedAppsService,
       accessibilityService: accessibilityService,
       overlayService: overlayService,
-      screenStateService: StaticScreenStateService(),
+      screenStateService: screenState ?? StaticScreenStateService(),
       watcherService: StaticWatcherService(),
       intruderEvidenceOverride:
           intruderEvidence ?? StaticIntruderEvidenceService(),
@@ -432,6 +453,13 @@ class AppContainer {
   /// Phase 13 / M1 — read-only timeline model over the failure log and the
   /// journal.
   late final SecurityTimelineReader securityTimeline;
+
+  /// Phase 13 / M2 — failed-unlock history storage sampler (provable
+  /// transitions only; feeds the journal).
+  late final StorageHealthJournalSampler securityStorageSampler;
+
+  /// Phase 13 / M2 — protection-health journal recorder (observe-only).
+  late final ProtectionHealthJournalRecorder securityHealthRecorder;
 
   /// Phase 13 / M1 — completes when journal startup maintenance finished.
   /// Never fails.

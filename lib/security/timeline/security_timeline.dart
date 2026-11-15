@@ -7,8 +7,17 @@
 // unavailable — never as empty — and every known gap (retention / caps,
 // unrecorded events, damaged earlier history, unknown integrity) is
 // reported per source.
+//
+// M2: one entry per source event (journal v2 types included); a busy
+// failure-log read is labelled busy only on REQUEST-LOCAL proof; storage
+// observations are fed to the optional sampler; reset facts and render-time
+// app labels are exposed. The reader NEVER calls the evidence store or the
+// evidence service (photo availability is decided only inside the verified
+// evidence viewer).
 import 'dart:async';
 
+import '../../data/models/protected_app.dart';
+import '../../data/repositories/protected_apps_repository.dart';
 import '../../data/storage/local_database.dart';
 import '../credentials/verified_attempt.dart';
 import '../intruder/failed_attempt_event.dart';
@@ -17,11 +26,25 @@ import '../intruder/intruder_monitor.dart';
 import 'security_event_journal.dart';
 import 'security_event_journal_store.dart';
 import 'security_journal_event.dart';
+import 'storage_health_journal_sampler.dart';
 
 /// Source of an entry. The index is the fixed tie-break rank.
 enum TimelineSource { failedAttempts, journal }
 
-enum TimelineEntryKind { failedUnlock, journalStarted, journalRecovered }
+enum TimelineEntryKind {
+  failedUnlock,
+  journalStarted,
+  journalRecovered,
+  journalUpgraded,
+  captureSaved,
+  captureNotSaved,
+  alarmStarted,
+  alarmNotStarted,
+  alarmStopped,
+  protectionHealth,
+  storageUnavailable,
+  storageRestored,
+}
 
 /// Metadata-only timeline row (no credential material, no pixels).
 final class TimelineEntry {
@@ -35,6 +58,16 @@ final class TimelineEntry {
     this.packageName,
     this.consecutiveFailures,
     this.lockoutTriggered = false,
+    this.persisted = true,
+    this.trig,
+    this.captureWhy,
+    this.alarmWhy,
+    this.healthState,
+    this.healthCodes = const <HCode>[],
+    this.healthFirst = false,
+    this.suppressed = 0,
+    this.storageKind,
+    this.clockBack = false,
   });
 
   final TimelineSource source;
@@ -50,6 +83,24 @@ final class TimelineEntry {
   final String? packageName;
   final int? consecutiveFailures;
   final bool lockoutTriggered;
+
+  /// Failure-log only: false when the attempt counter write had failed.
+  final bool persisted;
+
+  /// M2 outcomes: the failed-attempt seq the outcome belongs to.
+  final int? trig;
+  final CaptureWhy? captureWhy;
+  final AlarmWhy? alarmWhy;
+  final HState? healthState;
+
+  /// Unmodifiable.
+  final List<HCode> healthCodes;
+  final bool healthFirst;
+  final int suppressed;
+  final StoreKind? storageKind;
+
+  /// Recorded while the wall clock was behind the previous event.
+  final bool clockBack;
 }
 
 enum TimelineSourceState {
@@ -60,6 +111,10 @@ enum TimelineSourceState {
 
   /// Could not be read.
   unavailableUnreadable,
+
+  /// M2: this request was rejected because the failed-unlock history was
+  /// busy (request-local proof only).
+  unavailableBusy,
 }
 
 final class TimelineSourceStatus {
@@ -91,11 +146,28 @@ final class SecurityTimelineSnapshot {
   const SecurityTimelineSnapshot({
     required this.entries,
     required this.sources,
+    this.resetPending = false,
+    this.resetFailures = 0,
+    this.suppressedHealth = 0,
+    this.labels = const <String, String>{},
   });
 
   /// Newest first; total order (see [SecurityTimelineReader.compare]).
   final List<TimelineEntry> entries;
   final List<TimelineSourceStatus> sources;
+
+  /// IntruderMonitor (failed-unlock history) facts from the same status
+  /// read: an owner success not yet persisted to THIS history, and failed
+  /// persists of such resets. They say nothing about credential or lock-out
+  /// storage.
+  final bool resetPending;
+  final int resetFailures;
+
+  /// Protection changes not recorded individually (rate window).
+  final int suppressedHealth;
+
+  /// Render-time protected-app labels (package -> label). Never persisted.
+  final Map<String, String> labels;
 
   bool get allSourcesAvailable =>
       sources.every((TimelineSourceStatus s) => s.available);
@@ -116,10 +188,14 @@ class SecurityTimelineReader {
     required SecurityEventJournal journal,
     required SecurityEventJournalStore journalStore,
     required LocalDatabase database,
+    StorageHealthJournalSampler? storageSampler,
+    ProtectedAppsRepository? protectedApps,
   })  : _monitor = monitor,
         _journal = journal,
         _journalStore = journalStore,
-        _database = database;
+        _database = database,
+        _sampler = storageSampler,
+        _protectedApps = protectedApps;
 
   static const int pageSize = 50;
 
@@ -127,6 +203,8 @@ class SecurityTimelineReader {
   final SecurityEventJournal _journal;
   final SecurityEventJournalStore _journalStore;
   final LocalDatabase _database;
+  final StorageHealthJournalSampler? _sampler;
+  final ProtectedAppsRepository? _protectedApps;
 
   /// Newest first: (at desc, source rank desc, sourceSeq desc).
   static int compare(TimelineEntry a, TimelineEntry b) {
@@ -188,24 +266,61 @@ class SecurityTimelineReader {
   /// One uncoalesced load. Never throws.
   Future<SecurityTimelineSnapshot> _loadOnce() async {
     final List<TimelineEntry> entries = <TimelineEntry>[];
-    final TimelineSourceStatus failures = await _loadFailures(entries);
-    final TimelineSourceStatus journal = await _loadJournal(entries);
+    final (TimelineSourceStatus, IntruderMonitorStatus) f =
+        await _loadFailures(entries);
+    final TimelineSourceStatus failures = f.$1;
+    final (TimelineSourceStatus, int) j = await _loadJournal(entries);
+    final TimelineSourceStatus journal = j.$1;
     entries.sort(compare);
     return SecurityTimelineSnapshot(
       entries: List<TimelineEntry>.unmodifiable(entries),
       sources: List<TimelineSourceStatus>.unmodifiable(
           <TimelineSourceStatus>[failures, journal]),
+      resetPending: f.$2.resetPending,
+      resetFailures: f.$2.resetFailures,
+      suppressedHealth: j.$2,
+      labels: await _loadLabels(),
     );
   }
 
-  Future<TimelineSourceStatus> _loadFailures(List<TimelineEntry> out) async {
-    IntruderFailureLog? log;
+  /// Render-time labels; any failure shows package names instead.
+  Future<Map<String, String>> _loadLabels() async {
+    final ProtectedAppsRepository? repo = _protectedApps;
+    if (repo == null) return const <String, String>{};
     try {
-      log = await _monitor.snapshot();
+      final List<ProtectedApp>? apps =
+          (await repo.getProtectedApps()).valueOrNull;
+      if (apps == null) return const <String, String>{};
+      return Map<String, String>.unmodifiable(<String, String>{
+        for (final ProtectedApp a in apps) a.packageName: a.label,
+      });
+    } catch (_) {
+      return const <String, String>{};
+    }
+  }
+
+  Future<(TimelineSourceStatus, IntruderMonitorStatus)> _loadFailures(
+      List<TimelineEntry> out) async {
+    IntruderFailureLog? log;
+    // Request-local busy proof (M2): the counter has exactly one increment
+    // site, inside the synchronous rejection branch of snapshot(); these
+    // three statements run with no await in between.
+    bool rejectedThisCall = false;
+    try {
+      final int before = _monitor.status.snapshotsRejected;
+      final Future<IntruderFailureLog?> pending = _monitor.snapshot();
+      final int after = _monitor.status.snapshotsRejected;
+      rejectedThisCall = after == before + 1;
+      log = await pending;
     } catch (_) {
       log = null;
     }
     final IntruderMonitorStatus status = _monitor.status;
+    try {
+      _sampler?.afterFailureLogRead(log, rejectedThisCall, status);
+    } catch (_) {
+      // Recording never affects the read.
+    }
     bool? damaged;
     try {
       damaged = status.quarantinedCorruptLog ||
@@ -215,14 +330,19 @@ class SecurityTimelineReader {
       damaged = status.quarantinedCorruptLog ? true : null;
     }
     if (log == null) {
-      return TimelineSourceStatus(
-        source: TimelineSource.failedAttempts,
-        state: status.health == IntruderMonitorHealth.readOnly
-            ? TimelineSourceState.unavailableNewerVersion
-            : TimelineSourceState.unavailableUnreadable,
-        discarded: 0,
-        lost: status.droppedEvents,
-        damagedEarlier: damaged,
+      return (
+        TimelineSourceStatus(
+          source: TimelineSource.failedAttempts,
+          state: rejectedThisCall
+              ? TimelineSourceState.unavailableBusy
+              : status.health == IntruderMonitorHealth.readOnly
+                  ? TimelineSourceState.unavailableNewerVersion
+                  : TimelineSourceState.unavailableUnreadable,
+          discarded: 0,
+          lost: status.droppedEvents,
+          damagedEarlier: damaged,
+        ),
+        status,
       );
     }
     for (final FailedAttemptEvent e in log.events) {
@@ -238,19 +358,24 @@ class SecurityTimelineReader {
             : null,
         consecutiveFailures: e.consecutiveFailures,
         lockoutTriggered: e.lockoutTriggered,
+        persisted: e.counterPersisted,
       ));
     }
     final int discarded = log.nextSeq - log.events.length;
-    return TimelineSourceStatus(
-      source: TimelineSource.failedAttempts,
-      state: TimelineSourceState.available,
-      discarded: discarded < 0 ? 0 : discarded,
-      lost: status.droppedEvents,
-      damagedEarlier: damaged,
+    return (
+      TimelineSourceStatus(
+        source: TimelineSource.failedAttempts,
+        state: TimelineSourceState.available,
+        discarded: discarded < 0 ? 0 : discarded,
+        lost: status.droppedEvents,
+        damagedEarlier: damaged,
+      ),
+      status,
     );
   }
 
-  Future<TimelineSourceStatus> _loadJournal(List<TimelineEntry> out) async {
+  Future<(TimelineSourceStatus, int)> _loadJournal(
+      List<TimelineEntry> out) async {
     SecurityJournalView view;
     try {
       view = await _journal.read();
@@ -278,25 +403,58 @@ class SecurityTimelineReader {
     };
     if (state == TimelineSourceState.available) {
       for (final SecurityJournalEvent e in view.events) {
-        out.add(TimelineEntry(
-          source: TimelineSource.journal,
-          sourceSeq: e.seq,
-          at: e.at,
-          kind: switch (e.type) {
-            SecurityJournalEventType.journalStarted =>
-              TimelineEntryKind.journalStarted,
-            SecurityJournalEventType.journalRecovered =>
-              TimelineEntryKind.journalRecovered,
-          },
-        ));
+        out.add(journalEntry(e));
       }
     }
-    return TimelineSourceStatus(
+    return (
+      TimelineSourceStatus(
+        source: TimelineSource.journal,
+        state: state,
+        discarded: view.discarded,
+        lost: view.lost,
+        damagedEarlier: damaged,
+      ),
+      view.suppressed,
+    );
+  }
+
+  /// Metadata-only entry for one journal event (exhaustive mapping).
+  static TimelineEntry journalEntry(SecurityJournalEvent e) {
+    final SecurityEventFields? f = e.fields;
+    return TimelineEntry(
       source: TimelineSource.journal,
-      state: state,
-      discarded: view.discarded,
-      lost: view.lost,
-      damagedEarlier: damaged,
+      sourceSeq: e.seq,
+      at: e.at,
+      clockBack: e.clockBack,
+      kind: switch (e.type) {
+        SecurityJournalEventType.journalStarted =>
+          TimelineEntryKind.journalStarted,
+        SecurityJournalEventType.journalRecovered =>
+          TimelineEntryKind.journalRecovered,
+        SecurityJournalEventType.journalUpgraded =>
+          TimelineEntryKind.journalUpgraded,
+        SecurityJournalEventType.captureSaved => TimelineEntryKind.captureSaved,
+        SecurityJournalEventType.captureNotSaved =>
+          TimelineEntryKind.captureNotSaved,
+        SecurityJournalEventType.alarmStarted => TimelineEntryKind.alarmStarted,
+        SecurityJournalEventType.alarmNotStarted =>
+          TimelineEntryKind.alarmNotStarted,
+        SecurityJournalEventType.alarmStopped => TimelineEntryKind.alarmStopped,
+        SecurityJournalEventType.protectionHealth =>
+          TimelineEntryKind.protectionHealth,
+        SecurityJournalEventType.storageUnavailable =>
+          TimelineEntryKind.storageUnavailable,
+        SecurityJournalEventType.storageRestored =>
+          TimelineEntryKind.storageRestored,
+      },
+      trig: f?.trig,
+      captureWhy: f is CaptureNotSavedFields ? f.why : null,
+      alarmWhy: f is AlarmNotStartedFields ? f.why : null,
+      healthState: f is ProtectionHealthFields ? f.state : null,
+      healthCodes: f is ProtectionHealthFields ? f.codes : const <HCode>[],
+      healthFirst: f is ProtectionHealthFields && f.first,
+      suppressed: f is ProtectionHealthFields ? f.suppressed : 0,
+      storageKind: f is StorageUnavailableFields ? f.kind : null,
     );
   }
 }
