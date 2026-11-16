@@ -253,6 +253,62 @@ class SqfliteLocalDatabase implements LocalDatabase {
     );
   }
 
+  /// P13/M3 F-1: CAS when a row is expected. ONE statement; the changed-row
+  /// count (Android `executeUpdateDelete` -> `sqlite3_changes`) decides.
+  @visibleForTesting
+  static const String casUpdateSql = 'UPDATE security_settings '
+      'SET value = ?, updated_at = ? WHERE key = ? AND value = ?';
+
+  /// P13/M3 F-1: CAS when NO row is expected. `OR IGNORE` never replaces an
+  /// existing row; run through `rawUpdate` so the outcome is the same
+  /// changed-row count (never a possibly stale last-insert rowid).
+  @visibleForTesting
+  static const String casInsertSql = 'INSERT OR IGNORE INTO security_settings'
+      '(key, value, updated_at) VALUES (?, ?, ?)';
+
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    checkCompareAndSetArguments(expected, next);
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    final int changed;
+    try {
+      final Database db = await _database;
+      changed = expected == null
+          ? await db.rawUpdate(casInsertSql, <Object?>[key, next, now])
+          : await db.rawUpdate(
+              casUpdateSql, <Object?>[next, now, key, expected]);
+    } on DatabaseException catch (e) {
+      throw CasUnknownOutcome(_casUnknownCode(e));
+    } catch (_) {
+      throw const CasUnknownOutcome(CasUnknownCode.other);
+    }
+    switch (changed) {
+      case 1:
+        return CasOutcome.committed;
+      case 0:
+        return CasOutcome.conflict;
+      default:
+        // Impossible for a PRIMARY KEY row; never guessed as either outcome.
+        throw const CasUnknownOutcome(CasUnknownCode.other);
+    }
+  }
+
+  static CasUnknownCode _casUnknownCode(DatabaseException e) {
+    if (e.isDatabaseClosedError()) {
+      return CasUnknownCode.closed;
+    }
+    // SQLITE_BUSY (5) / SQLITE_LOCKED (6), primary result codes.
+    final int? code = e.getResultCode();
+    if (code != null && ((code & 0xff) == 5 || (code & 0xff) == 6)) {
+      return CasUnknownCode.busy;
+    }
+    return CasUnknownCode.io;
+  }
+
   @override
   Future<void> removeSetting(String key) async {
     final Database db = await _database;

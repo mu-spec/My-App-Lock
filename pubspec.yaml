@@ -35,9 +35,21 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  # P13/M3 F-1 (test-only): real-SQLite tests of compareAndSetSetting.
+  # Exact pin; dev dependency only, never imported from lib/.
+  sqflite_common_ffi: 2.4.7
 
 flutter:
   uses-material-design: true
 
   # Assets, fonts, and native plugin declarations get added here in later
   # phases (app icons cache, lock screen assets, platform plugins, ...).
+
+# P13/M3 F-1 (test-only): the sqlite3 build hook (reached only through the
+# sqflite_common_ffi dev dependency) looks up the system libsqlite3 instead of
+# downloading a prebuilt binary. Release builds skip dev-dependency hooks;
+# debug/profile builds run them, and `source: system` bundles nothing.
+hooks:
+  user_defines:
+    sqlite3:
+      source: system

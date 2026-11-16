@@ -79,6 +79,24 @@ class InMemoryLocalDatabase implements LocalDatabase {
     _settings.remove(key);
   }
 
+  /// P13/M3 F-1: compare and set run in ONE synchronous section (no await
+  /// between the read of the current value and the write), so the operation
+  /// is atomic within the isolate.
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    checkCompareAndSetArguments(expected, next);
+    final String? current = _settings[key];
+    if (current != expected) {
+      return CasOutcome.conflict;
+    }
+    _settings[key] = next;
+    return CasOutcome.committed;
+  }
+
   // -- lock profiles -------------------------------------------------------
 
   @override
