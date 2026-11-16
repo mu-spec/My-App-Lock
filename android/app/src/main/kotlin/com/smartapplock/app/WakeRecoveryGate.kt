@@ -775,9 +775,9 @@ object WatcherTeardownPolicy {
     fun onDestroy(protectionEnabled: Boolean): Action =
         if (protectionEnabled) Action.INTERRUPTED else Action.PROTECTION_DISABLED
 
-    /** A successful restart clears only the message this policy recorded. */
-    fun clearsLastErrorOnStart(lastError: String?): Boolean =
-        lastError == INTERRUPTED_MESSAGE
+    /** A successful restart clears only the code this policy recorded. */
+    fun clearsLastErrorOnStart(code: LastErrorCode?): Boolean =
+        code == LastErrorCode.WATCHER_INTERRUPTED
 
     /**
      * R-M3-2: `MainActivity.onDestroy` tears down the Flutter engine, and with

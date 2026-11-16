@@ -107,7 +107,7 @@ object WatcherChannel {
                         else -> result.notImplemented()
                     }
                 } catch (e: Exception) {
-                    ProtectionStateStore.setLastError(activity, e.message)
+                    ProtectionStateStore.setLastError(activity, LastErrorCode.CHANNEL_CALL_FAILED)
                     result.error("watcher_error", e.message, null)
                 }
             }
@@ -140,6 +140,7 @@ object WatcherChannel {
 
     private fun health(activity: MainActivity): Map<String, Any?> {
         val configured = ProtectionStateStore.isEnabled(activity)
+        val lastErrorCode = ProtectionStateStore.lastErrorCode(activity)
         val engineState = when {
             !configured -> "inactive"
             ProtectionRuntime.isEngineHealthy() -> "healthy"
@@ -154,7 +155,9 @@ object WatcherChannel {
             "serviceRunning" to WatcherService.isRunning(),
             "engineState" to engineState,
             "notificationPermissionGranted" to notificationGranted,
-            "lastError" to ProtectionStateStore.lastError(activity),
+            // NF-RG-1: allowlisted code + its neutral sentence only.
+            "lastError" to lastErrorCode?.neutralText,
+            "lastErrorCode" to lastErrorCode?.wire,
         ) + healthSignals(activity)
     }
 

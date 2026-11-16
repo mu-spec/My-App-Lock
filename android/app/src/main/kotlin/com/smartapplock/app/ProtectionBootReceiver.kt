@@ -12,7 +12,7 @@ class ProtectionBootReceiver : BroadcastReceiver() {
         if (!WatcherService.start(context)) {
             ProtectionStateStore.setLastError(
                 context,
-                "Protection service could not restart after boot.",
+                LastErrorCode.BOOT_RESTART_FAILED,
             )
             DiagLog.w(context, TAG) { "Boot recovery could not start WatcherService" }
         }

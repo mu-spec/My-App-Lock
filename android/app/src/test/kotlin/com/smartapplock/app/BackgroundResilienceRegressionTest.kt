@@ -93,17 +93,28 @@ class BackgroundResilienceRegressionTest {
 
     @Test
     fun `a restart clears only the interruption message, never another error`() {
+        // P13/M3 NF-RG-1 re-baseline: the policy now compares the allowlisted
+        // CODE; the intent (clear ONLY what this policy recorded) is unchanged
+        // and is now checked against EVERY other code, not two samples.
         assertTrue(
             WatcherTeardownPolicy.clearsLastErrorOnStart(
-                WatcherTeardownPolicy.INTERRUPTED_MESSAGE,
+                LastErrorCode.WATCHER_INTERRUPTED,
             ),
         )
         assertFalse(WatcherTeardownPolicy.clearsLastErrorOnStart(null))
-        assertFalse(WatcherTeardownPolicy.clearsLastErrorOnStart("Watcher start failed: x"))
+        assertFalse(WatcherTeardownPolicy.clearsLastErrorOnStart(LastErrorCode.WATCHER_START_FAILED))
         assertFalse(
             WatcherTeardownPolicy.clearsLastErrorOnStart(
-                "Protection service could not restart after boot.",
+                LastErrorCode.BOOT_RESTART_FAILED,
             ),
+        )
+        for (other in LastErrorCode.entries - LastErrorCode.WATCHER_INTERRUPTED) {
+            assertFalse("$other", WatcherTeardownPolicy.clearsLastErrorOnStart(other))
+        }
+        // The interruption sentence itself is unchanged (neutral text).
+        assertEquals(
+            WatcherTeardownPolicy.INTERRUPTED_MESSAGE,
+            LastErrorCode.WATCHER_INTERRUPTED.neutralText,
         )
     }
 
@@ -340,7 +351,8 @@ class BackgroundResilienceRegressionTest {
             Regex("""if \(action\.disarmsOverlay\) \{\s*ProtectionOverlayController\.disarm\(\)""")
                 .containsMatchIn(destroy),
         )
-        assertTrue(destroy.contains("WatcherTeardownPolicy.INTERRUPTED_MESSAGE"))
+        // NF-RG-1 re-baseline: the interruption is recorded as its code.
+        assertTrue(destroy.contains("ProtectionStateStore.setLastError(this, LastErrorCode.WATCHER_INTERRUPTED)"))
         for (forbidden in listOf(
             "clearPendingChallenge",
             "invalidateChallengeHandoff",
@@ -405,7 +417,10 @@ class BackgroundResilienceRegressionTest {
         val start = watcher.substringAfter("fun start(context: Context): Boolean = try {")
             .substringBefore("fun stop(")
         assertTrue(start.contains("catch (e: Exception)"))
-        assertTrue(start.contains("ProtectionStateStore.setLastError(context, \"Watcher start failed:"))
+        // NF-RG-1 re-baseline: a failed start is still REPORTED, now as a
+        // class-selected code; the exception text is never persisted.
+        assertTrue(start.contains("ProtectionStateStore.setLastError(context, LastErrorCode.forWatcherStart(e))"))
+        assertFalse(start.contains("e.message"))
         assertTrue(start.contains("false"))
         val reportBody = watcher.substringAfter("fun reportForeground(")
             .substringBefore("fun setGracePeriod(")

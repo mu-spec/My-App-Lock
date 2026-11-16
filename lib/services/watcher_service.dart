@@ -1,6 +1,7 @@
 import '../data/models/app_security_level.dart';
 import '../utilities/result.dart';
 import 'pending_lock_challenge.dart';
+import 'watcher_last_error_code.dart';
 
 enum ProtectionEngineState { inactive, healthy, recovering, unavailable }
 
@@ -10,7 +11,7 @@ class ProtectionEngineHealth {
     required this.serviceRunning,
     required this.engineState,
     required this.notificationPermissionGranted,
-    this.lastError,
+    this.lastErrorCode,
     this.accessibilityServiceConnected,
     this.shieldArmed,
     this.challengePending,
@@ -25,7 +26,7 @@ class ProtectionEngineHealth {
         serviceRunning = false,
         engineState = ProtectionEngineState.inactive,
         notificationPermissionGranted = true,
-        lastError = null,
+        lastErrorCode = null,
         accessibilityServiceConnected = null,
         shieldArmed = null,
         challengePending = null,
@@ -45,7 +46,8 @@ class ProtectionEngineHealth {
       ),
       notificationPermissionGranted:
           map['notificationPermissionGranted'] as bool? ?? true,
-      lastError: map['lastError'] as String?,
+      // NF-RG-1: validated again here; raw platform text is never kept.
+      lastErrorCode: WatcherLastErrorCode.fromNative(map),
       accessibilityServiceConnected: _optionalBool(
         map['accessibilityServiceConnected'],
       ),
@@ -68,7 +70,11 @@ class ProtectionEngineHealth {
   final bool serviceRunning;
   final ProtectionEngineState engineState;
   final bool notificationPermissionGranted;
-  final String? lastError;
+  /// P13/M3 NF-RG-1: allowlisted last error (null = none recorded).
+  final WatcherLastErrorCode? lastErrorCode;
+
+  /// The neutral sentence of [lastErrorCode] from the Flutter table only.
+  String? get lastError => lastErrorCode?.neutralText;
 
   // Phase 7 / M1 — additive, observational health signals (null = UNKNOWN:
   // unsupported API level, a failed platform read, or an older native build).

@@ -5,6 +5,7 @@ import '../../rules/smart_rule.dart';
 import '../../rules/smart_rule_policy.dart';
 import '../../utilities/result.dart';
 import '../pending_lock_challenge.dart';
+import '../watcher_last_error_code.dart';
 import '../watcher_service.dart';
 import 'static_native_challenge_contract.dart';
 
@@ -30,7 +31,7 @@ class StaticWatcherService implements WatcherService {
   Set<String> protectedPackages = <String>{};
   String? pendingChallenge;
   int pendingChallengeGeneration = 1;
-  String? lastError;
+  WatcherLastErrorCode? lastErrorCode;
 
   /// Phase 7 / M1 health signals (null = UNKNOWN, as from native).
   bool? accessibilityServiceConnected;
@@ -414,7 +415,7 @@ class StaticWatcherService implements WatcherService {
                     ? ProtectionEngineState.recovering
                     : ProtectionEngineState.unavailable,
         notificationPermissionGranted: notificationPermissionGranted,
-        lastError: lastError,
+        lastErrorCode: lastErrorCode,
         accessibilityServiceConnected: accessibilityServiceConnected,
         shieldArmed: shieldArmed,
         challengePending: challengePending,

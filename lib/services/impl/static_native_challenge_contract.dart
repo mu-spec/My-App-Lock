@@ -1,4 +1,5 @@
 import '../pending_lock_challenge.dart';
+import '../watcher_last_error_code.dart';
 import 'static_overlay_lock_service.dart';
 import 'static_watcher_service.dart';
 
@@ -260,8 +261,12 @@ class StaticNativeChallengeContract {
   /// process-scoped and keeps running without it.
   bool serviceRunning = true;
 
-  /// Phase 6 / M3: `getHealth().lastError` as far as this model sets it.
-  String? lastError;
+  /// Phase 6 / M3: `getHealth().lastErrorCode` as far as this model sets it
+  /// (P13/M3 NF-RG-1: a code, never text).
+  WatcherLastErrorCode? lastErrorCode;
+
+  /// `getHealth().lastError`: the code's neutral sentence only.
+  String? get lastError => lastErrorCode?.neutralText;
 
   /// `WatcherTeardownPolicy.INTERRUPTED_MESSAGE`.
   static const String interruptedMessage =
@@ -291,7 +296,7 @@ class StaticNativeChallengeContract {
     serviceRunning = false;
     if (enabled) {
       authorizedPackages.clear(); // ProtectionAccessState.revokeAll()
-      lastError = interruptedMessage;
+      lastErrorCode = WatcherLastErrorCode.watcherInterrupted;
     } else {
       shieldVisible = false; // ProtectionOverlayController.disarm()
     }
@@ -690,7 +695,9 @@ class StaticNativeChallengeContract {
   /// `recoverProtected(RETRY)`), then F3's one restart decision per process.
   void serviceStart() {
     serviceRunning = true;
-    if (lastError == interruptedMessage) lastError = null;
+    if (lastErrorCode == WatcherLastErrorCode.watcherInterrupted) {
+      lastErrorCode = null; // WatcherTeardownPolicy.clearsLastErrorOnStart
+    }
     recoveryRetryTick();
     if (_restartLatchAcquired) return;
     _restartLatchAcquired = true;

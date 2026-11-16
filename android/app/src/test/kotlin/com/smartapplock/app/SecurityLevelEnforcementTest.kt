@@ -490,7 +490,9 @@ class SecurityLevelEnforcementTest {
         val out = ProtectionStateStore.configure(ctx, true, pk, ProtectionStateStore.PolicyInput(1, mapOf(app to "standard"), session(), 1))
         assertEquals("invalid", out.status)
         assertEquals(pk.associateWith { SecurityLevel.CRITICAL }, ProtectionStateStore.securityLevels(ctx))
-        assertEquals(ProtectionStateStore.ERROR_LEVELS_INVALID, ProtectionStateStore.lastError(ctx))
+        // NF-RG-1 re-baseline: recorded as the allowlisted code.
+        assertEquals(LastErrorCode.SECURITY_LEVELS_INVALID, ProtectionStateStore.lastErrorCode(ctx))
+        assertEquals(LastErrorCode.SECURITY_LEVELS_INVALID.neutralText, ProtectionStateStore.lastError(ctx))
         assertTrue(ProtectionStateStore.isEnabled(ctx)) // protection is never dropped
     }
 
@@ -599,7 +601,7 @@ class SecurityLevelEnforcementTest {
         )
         // The disk recovers; other writers flush the WHOLE in-memory map.
         ctx.prefs.failCommit = false
-        ProtectionStateStore.setLastError(ctx, "unrelated")
+        ProtectionStateStore.setLastError(ctx, LastErrorCode.CHANNEL_CALL_FAILED) // an unrelated writer
         ProtectionStateStore.replacePendingChallenge(ctx, other)
         assertTrue(SecurityLevelStoreCodec.encode(mapOf(app to SecurityLevel.CRITICAL)).first() in
             (ctx.prefs.disk["security_levels"] as Set<*>))

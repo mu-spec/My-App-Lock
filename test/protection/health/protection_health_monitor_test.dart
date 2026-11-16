@@ -21,6 +21,7 @@ import 'package:smart_app_lock/services/impl/static_watcher_service.dart';
 import 'package:smart_app_lock/services/overlay_lock_service.dart';
 import 'package:smart_app_lock/services/watcher_service.dart';
 import 'package:smart_app_lock/utilities/result.dart';
+import 'package:smart_app_lock/services/watcher_last_error_code.dart';
 
 class _Biometrics implements BiometricService {
   bool hardware = true;
@@ -211,15 +212,18 @@ void main() {
     await m.refresh();
     rig.watcher
       ..running = false
-      ..lastError = 'Android stopped the protection service.';
+      ..lastErrorCode = WatcherLastErrorCode.watcherInterrupted;
     final ProtectionHealthReport down = await m.refresh();
     expect(down.state, ProtectionHealthState.attentionRequired);
     expect(down.issues.single.code, HealthIssueCode.watcherNotRunning);
+    // P13/M3 NF-RG-1 re-baseline: the reason is still surfaced, as the
+    // allowlisted code plus its neutral sentence from the Flutter table.
     expect(down.issues.single.detail['lastError'],
-        'Android stopped the protection service.');
+        WatcherLastErrorCode.watcherInterrupted.neutralText);
+    expect(down.issues.single.detail['lastErrorCode'], 'watcher_interrupted');
     rig.watcher
       ..running = true
-      ..lastError = null;
+      ..lastErrorCode = null;
     expect((await m.refresh()).state, ProtectionHealthState.secure);
     await m.refresh(); // identical → no duplicate change event
     await Future<void>.delayed(Duration.zero);

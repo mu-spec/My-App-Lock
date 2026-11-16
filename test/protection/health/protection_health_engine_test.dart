@@ -6,6 +6,7 @@
 // as inputs, not observed on a device.
 import 'package:flutter_test/flutter_test.dart';
 import 'package:smart_app_lock/protection/health/protection_health_engine.dart';
+import 'package:smart_app_lock/services/watcher_last_error_code.dart';
 
 final DateTime t0 = DateTime(2026, 11, 1, 10);
 
@@ -24,7 +25,7 @@ HealthSignals healthy({
   bool usageEver = true,
   bool native = true,
   bool? watcher = true,
-  String? lastError,
+  WatcherLastErrorCode? lastError,
   bool? shield = true,
   bool? notifications = true,
   bool? restricted = false,
@@ -290,12 +291,15 @@ void main() {
 
     test('watcher interruption is reported with the native reason', () {
       final ProtectionHealthReport r = eval(
-        healthy(watcher: false, lastError: 'Android stopped the service.'),
+        healthy(
+            watcher: false, lastError: WatcherLastErrorCode.watcherInterrupted),
       );
       expect(r.state, ProtectionHealthState.attentionRequired);
       expect(ids(r), <String>['watcher_not_running']);
-      expect(
-          r.issues.single.detail['lastError'], 'Android stopped the service.');
+      // P13/M3 NF-RG-1 re-baseline: code + neutral sentence only.
+      expect(r.issues.single.detail['lastError'],
+          WatcherLastErrorCode.watcherInterrupted.neutralText);
+      expect(r.issues.single.detail['lastErrorCode'], 'watcher_interrupted');
       expect(r.components[HealthComponent.watcher], ComponentStatus.notRunning);
     });
 

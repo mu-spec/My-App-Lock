@@ -178,7 +178,7 @@ class ProtectionHealthMonitor {
           usage == false && await _everGranted('usageAccess'),
       nativeHealthAvailable: native != null,
       watcherRunning: native?.serviceRunning,
-      watcherLastError: native?.lastError,
+      watcherLastError: native?.lastErrorCode,
       shieldArmed: native?.shieldArmed,
       notificationsGranted: native?.notificationPermissionGranted,
       backgroundRestricted: native?.backgroundRestricted,

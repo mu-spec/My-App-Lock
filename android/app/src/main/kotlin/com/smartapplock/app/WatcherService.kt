@@ -172,7 +172,7 @@ class WatcherService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-        if (WatcherTeardownPolicy.clearsLastErrorOnStart(ProtectionStateStore.lastError(this))) {
+        if (WatcherTeardownPolicy.clearsLastErrorOnStart(ProtectionStateStore.lastErrorCode(this))) {
             ProtectionStateStore.setLastError(this, null)
         }
         // Keep an invisible, full-size overlay attached. Making it opaque on
@@ -216,7 +216,7 @@ class WatcherService : Service() {
             ProtectionAccessState.revokeAll()
         }
         if (action.recordsInterruption) {
-            ProtectionStateStore.setLastError(this, WatcherTeardownPolicy.INTERRUPTED_MESSAGE)
+            ProtectionStateStore.setLastError(this, LastErrorCode.WATCHER_INTERRUPTED)
         }
         if (action.disarmsOverlay) {
             ProtectionOverlayController.disarm()
@@ -399,7 +399,7 @@ class WatcherService : Service() {
             }
             true
         } catch (e: Exception) {
-            ProtectionStateStore.setLastError(context, "Watcher start failed: ${e.message}")
+            ProtectionStateStore.setLastError(context, LastErrorCode.forWatcherStart(e))
             DiagLog.w(context, TAG, e) { "Could not start watcher" }
             false
         }
@@ -682,11 +682,11 @@ class WatcherService : Service() {
             when {
                 !shielded -> ProtectionStateStore.setLastError(
                     context,
-                    "Overlay permission is unavailable; lock presentation is unavailable.",
+                    LastErrorCode.OVERLAY_UNAVAILABLE,
                 )
                 !launched -> ProtectionStateStore.setLastError(
                     context,
-                    "Android blocked the challenge activity; recovery shield remains active.",
+                    LastErrorCode.CHALLENGE_LAUNCH_BLOCKED,
                 )
                 else -> ProtectionStateStore.setLastError(context, null)
             }
@@ -1070,7 +1070,7 @@ class WatcherService : Service() {
             if (!ProtectionOverlayController.hide()) {
                 ProtectionStateStore.setLastError(
                     context,
-                    "Emergency Home exit released state but shield hide failed.",
+                    LastErrorCode.EMERGENCY_HIDE_FAILED,
                 )
             }
             return true

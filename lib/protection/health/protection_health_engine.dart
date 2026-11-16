@@ -27,6 +27,8 @@
 /// reset a lockout, change a permission or start/stop a component.
 library;
 
+import '../../services/watcher_last_error_code.dart';
+
 /// Overall Protection Health.
 enum ProtectionHealthState {
   secure('SECURE'),
@@ -326,7 +328,8 @@ class HealthSignals {
   /// below are only meaningful when it did).
   final bool nativeHealthAvailable;
   final bool? watcherRunning;
-  final String? watcherLastError;
+  /// P13/M3 NF-RG-1: allowlisted code only (never platform text).
+  final WatcherLastErrorCode? watcherLastError;
   final bool? shieldArmed;
   final bool? notificationsGranted;
   final bool? backgroundRestricted;
@@ -756,7 +759,7 @@ abstract final class ProtectionHealthEngine {
     // Native watcher (screen-off re-lock, wake tickets, usage polling).
     switch (s.watcherRunning) {
       case false:
-        final String? error = s.watcherLastError;
+        final WatcherLastErrorCode? error = s.watcherLastError;
         issues.add(
           HealthIssue(
             code: HealthIssueCode.watcherNotRunning,
@@ -764,7 +767,8 @@ abstract final class ProtectionHealthEngine {
             cause: HealthCause.notRunning,
             action: HealthRepairAction.openSmartAppLock,
             detail: <String, String>{
-              if (error != null && error.isNotEmpty) 'lastError': error,
+              if (error != null) 'lastError': error.neutralText,
+              if (error != null) 'lastErrorCode': error.wire,
             },
           ),
         );

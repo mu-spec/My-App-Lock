@@ -30,6 +30,8 @@ object ProtectionStateStore {
     private const val KEY_WAKE_REAUTH_STAMP_ELAPSED = "wake_reauth_stamp_elapsed"
     private const val KEY_WAKE_REAUTH_STAMP_WALL = "wake_reauth_stamp_wall"
     private const val KEY_LAST_ERROR = "last_error"
+    // P13/M3 NF-RG-1: authoritative allowlisted code ("v1:<wire>").
+    private const val KEY_LAST_ERROR_CODE = "last_error_code"
     // Phase 8 / M2: effective per-package levels, written in the SAME edit
     // as the protected set. The version key is the presence marker: absent
     // = legacy store (pre-M2, every app Standard); present = map in force.
@@ -192,7 +194,7 @@ object ProtectionStateStore {
             }
         }
         if (resolution.status == PolicySnapshotResolver.Status.INVALID) {
-            setLastError(context, ERROR_LEVELS_INVALID)
+            setLastError(context, LastErrorCode.SECURITY_LEVELS_INVALID)
         }
         val pending = pendingChallenge(context)
         if (!enabled || (pending != null && pending.packageName !in normalized)) {
@@ -530,19 +532,56 @@ object ProtectionStateStore {
         return PendingChallenge(packageName, generation)
     }
 
-    fun setLastError(context: Context, message: String?) {
+    /**
+     * P13/M3 NF-RG-1: records an allowlisted code (null clears). Both keys are
+     * written in ONE editor and one apply(). There is no String overload: raw
+     * exception text can never reach the persisted sink.
+     */
+    fun setLastError(context: Context, code: LastErrorCode?) {
         val editor = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-        if (message == null) {
+        if (code == null) {
+            editor.remove(KEY_LAST_ERROR_CODE)
             editor.remove(KEY_LAST_ERROR)
         } else {
-            editor.putString(KEY_LAST_ERROR, message)
+            editor.putString(KEY_LAST_ERROR_CODE, LastErrorCode.encode(code))
+            editor.putString(KEY_LAST_ERROR, code.neutralText)
         }
         editor.apply()
     }
 
-    fun lastError(context: Context): String? =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getString(KEY_LAST_ERROR, null)
+    /**
+     * Read-time reconciliation (NF-RG-1 design section 6). A legacy or
+     * downgrade-written raw value is mapped by EXACT match only, else UNKNOWN,
+     * and is overwritten on this read; it is never returned or copied.
+     */
+    fun lastErrorCode(context: Context): LastErrorCode? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        // RE-2: a wrong-typed value (ClassCastException) is corrupt state:
+        // fail to UNKNOWN and rewrite both keys; the value is never read out.
+        val (storedCode, storedText) = try {
+            prefs.getString(KEY_LAST_ERROR_CODE, null) to prefs.getString(KEY_LAST_ERROR, null)
+        } catch (_: ClassCastException) {
+            setLastError(context, LastErrorCode.UNKNOWN)
+            return LastErrorCode.UNKNOWN
+        }
+        val code = LastErrorCode.decode(storedCode)
+        return when {
+            code == null && storedText == null -> null
+            code == null -> LastErrorCode.fromLegacy(storedText!!).also { setLastError(context, it) }
+            storedText == null -> {
+                // An older build cleared `last_error` after a downgrade.
+                setLastError(context, null)
+                null
+            }
+            storedText == code.neutralText && storedCode == LastErrorCode.encode(code) -> code
+            // Text changed by an older build (or a non-canonical code):
+            // the TEXT is newer than the code, so the code is never trusted.
+            else -> LastErrorCode.fromLegacy(storedText).also { setLastError(context, it) }
+        }
+    }
+
+    /** Neutral sentence of the current code only; never stored raw text. */
+    fun lastError(context: Context): String? = lastErrorCode(context)?.neutralText
 }
 
 /** Process-local liveness. It intentionally resets after genuine process death. */

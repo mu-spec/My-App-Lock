@@ -4,6 +4,7 @@ import 'package:smart_app_lock/services/impl/static_native_challenge_contract.da
 import 'package:smart_app_lock/services/impl/static_watcher_service.dart';
 import 'package:smart_app_lock/services/pending_lock_challenge.dart';
 import 'package:smart_app_lock/ui/screens/pin/pin_unlock_screen.dart';
+import 'package:smart_app_lock/services/watcher_last_error_code.dart';
 
 import '../support/focus_aware_wake_device.dart';
 
@@ -65,6 +66,8 @@ void main() {
       expect(native.authorizedPackages, isEmpty);
       expect(
           native.lastError, StaticNativeChallengeContract.interruptedMessage);
+      // P13/M3 NF-RG-1: recorded as the allowlisted code.
+      expect(native.lastErrorCode, WatcherLastErrorCode.watcherInterrupted);
       // Navigation inside the protected app (Accessibility keeps running).
       native.reportForeground(_pkg);
       expect(native.pending?.packageName, _pkg);
