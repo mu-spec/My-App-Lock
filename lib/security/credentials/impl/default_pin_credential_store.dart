@@ -48,17 +48,45 @@ class DefaultPinCredentialStore implements PinCredentialStore {
 
     final Result<SecuritySettings> loaded = await _settings.getSettings();
     return loaded.fold(
-      (SecuritySettings s) => _settings.saveSettings(
-        s.copyWith(
-          pinHash: hash,
-          pinLength: pinLength,
-          primaryAuthType: makePrimary ? AuthType.pin : null,
-          failedAttempts: resetAttemptState ? 0 : null,
-          clearLockout: resetAttemptState,
-          lockoutStreak: resetAttemptState ? 0 : null,
-        ),
+      (SecuritySettings s) => saveOnto(
+        s,
+        hash,
+        pinLength: pinLength,
+        makePrimary: makePrimary,
+        resetAttemptState: resetAttemptState,
       ),
       Result.failure,
+    );
+  }
+
+  @override
+  Future<Result<void>> saveOnto(
+    SecuritySettings basis,
+    PinHash hash, {
+    int? pinLength,
+    bool makePrimary = false,
+    bool resetAttemptState = false,
+  }) async {
+    // Refuse to persist credential material below the storage policy.
+    final HashPolicyViolation? violation = _policy.validate(hash);
+    if (violation != null) {
+      return Result.failure(
+        StateError(
+          'Refusing to store a PIN credential that violates the storage '
+          'security policy: ${violation.name}',
+        ),
+      );
+    }
+    // Conditional on [basis] (compare-and-set in the repository).
+    return _settings.saveSettings(
+      basis.copyWith(
+        pinHash: hash,
+        pinLength: pinLength,
+        primaryAuthType: makePrimary ? AuthType.pin : null,
+        failedAttempts: resetAttemptState ? 0 : null,
+        clearLockout: resetAttemptState,
+        lockoutStreak: resetAttemptState ? 0 : null,
+      ),
     );
   }
 

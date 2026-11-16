@@ -7,6 +7,7 @@ import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/security/credentials/auth_result.dart';
 import 'package:smart_app_lock/security/credentials/auth_type.dart';
 import 'package:smart_app_lock/security/credentials/verified_attempt.dart';
@@ -51,6 +52,19 @@ class _SpyDb extends InMemoryLocalDatabase {
   Future<void> setSetting(String key, String value) async {
     writes.add(key);
     return super.setSetting(key, value);
+  }
+
+  // P13/M3 NF-NS-1: settings writes are compare-and-set now; the same
+  // interception applies to them (CAS-G2: never inherit an un-intercepted
+  // CAS).
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    writes.add(key);
+    return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 }
 

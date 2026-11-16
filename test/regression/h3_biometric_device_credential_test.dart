@@ -54,7 +54,11 @@ void main() {
         (await c.securitySettings.getSettings()).valueOrNull!;
     final Map<String, dynamic> json = current.toJson()
       ..['biometricOptions'] = legacyBiometricJson;
-    await c.securitySettings.saveSettings(SecuritySettings.fromJson(json));
+    // NF-NS-1: a fresh value must carry the read basis to replace the
+    // stored document (CAS); the planted options are unchanged.
+    final planted = await c.securitySettings
+        .saveSettings(SecuritySettings.fromJson(json).rebasedOn(current));
+    expect(planted.isSuccess, isTrue, reason: 'fixture plant must land');
   }
 
   // ---------------------------------------------------------------------

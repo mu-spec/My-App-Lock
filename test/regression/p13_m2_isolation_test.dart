@@ -12,6 +12,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:smart_app_lock/app/app_container.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/security/credentials/credential_state.dart';
 import 'package:smart_app_lock/security/credentials/verified_attempt.dart';
 import 'package:smart_app_lock/security/intruder/intruder_defense_coordinator.dart';
@@ -465,6 +466,19 @@ class _KeysDb extends InMemoryLocalDatabase {
     if (!written.contains(key)) written.add(key);
     return super.setSetting(key, value);
   }
+
+  // P13/M3 NF-NS-1: settings writes are compare-and-set now; the same
+  // interception applies to them (CAS-G2: never inherit an un-intercepted
+  // CAS).
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    if (!written.contains(key)) written.add(key);
+    return super.compareAndSetSetting(key, expected: expected, next: next);
+  }
 }
 
 /// Delegates to [inner] but never completes journal reads (the process
@@ -479,4 +493,12 @@ class _StallDb extends InMemoryLocalDatabase {
   @override
   Future<void> setSetting(String key, String value) =>
       inner.setSetting(key, value);
+  // P13/M3 NF-NS-1: delegate CAS to the same store (CAS-G2).
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) =>
+      inner.compareAndSetSetting(key, expected: expected, next: next);
 }

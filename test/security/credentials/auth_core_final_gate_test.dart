@@ -237,8 +237,11 @@ const String _managerPath =
     'lib/security/credentials/impl/default_credential_manager.dart';
 
 /// Member name -> member source text, for the DefaultCredentialManager class.
-Map<String, String> _managerMembers() {
-  final String src = File(_managerPath).readAsStringSync();
+Map<String, String> _managerMembers() =>
+    _membersOf(File(_managerPath).readAsStringSync());
+
+/// Member name -> member source text, for a DefaultCredentialManager source.
+Map<String, String> _membersOf(String src) {
   final int start = src.indexOf('class DefaultCredentialManager');
   final int end = src.indexOf('\n}\n', start);
   final String body = src.substring(start, end);
@@ -260,6 +263,237 @@ Map<String, String> _managerMembers() {
 String _afterArrow(String member) {
   final int i = member.indexOf('=>');
   return i < 0 ? '' : member.substring(i + 2).trimLeft();
+}
+
+// ---------------------------------------------------------------------------
+// NF-NS-1 call-graph guard (owner decision 2)
+// ---------------------------------------------------------------------------
+
+const Set<String> _kVerifyForChange = <String>{
+  'verifyPinForCredentialChange',
+  'verifyPatternForCredentialChange',
+};
+
+/// The ONLY members allowed to contain a settings / PIN-store write.
+const Set<String> _kApprovedWriters = <String>{
+  '_enrollPinLocked',
+  '_enrollPatternLocked',
+  '_conditionalUpdate',
+  '_commitVerdict',
+};
+
+/// The ONLY members allowed to acquire the lock.
+const Set<String> _kApprovedAcquirers = <String>{
+  'enrollPin',
+  'enrollPattern',
+  'updateBiometricOptions',
+  'setRandomizedKeypadEnabled',
+  'setPatternVisibilityEnabled',
+  'authenticatePin',
+  'authenticatePattern',
+  'clearAll',
+  '_evaluateLatestAndPersist',
+  ..._kVerifyForChange,
+};
+
+final RegExp _kWriteCall =
+    RegExp(r'saveSettings\(|_pinStore\.(save|saveOnto|delete)\(');
+
+/// The platform biometric prompt call.
+const String _kPromptCall = '.authenticate(reason:';
+
+/// Any reference to [name] (a call OR a tear-off such as
+/// `_lock.run(_clearAllLocked)`): every reference is a potential call site.
+RegExp _refOf(String name) =>
+    RegExp('(?<![\\w.])${RegExp.escape(name)}(?![\\w])');
+
+/// [member] without `//` comments (doc references are not call sites).
+String _code(String member) => member.replaceAll(RegExp(r'//[^\n]*'), '');
+
+RegExp _callOf(String name) => RegExp('(?<![\\w.])${RegExp.escape(name)}\\(');
+
+/// Source range [start, end) of the argument list of the FIRST `_lock.run(`
+/// in [body] (the lock-held closure), or null.
+(int, int)? _lockRange(String body) {
+  final int at = body.indexOf('_lock.run(');
+  if (at < 0) return null;
+  final int open = at + '_lock.run'.length;
+  int depth = 0;
+  for (int i = open; i < body.length; i++) {
+    final String c = body[i];
+    if (c == '(') depth++;
+    if (c == ')') {
+      depth--;
+      if (depth == 0) return (at, i + 1);
+    }
+  }
+  return (at, body.length); // unbalanced: treat the rest as held
+}
+
+/// Stricter member parser for the NF-NS-1 call-graph guard: the member name
+/// must be on the header line (a greedy return type can never swallow an
+/// `=>` and a wrapped body), getters / setters are members too, and a name
+/// parsed twice fails closed (no member can shadow another).
+Map<String, String> _membersStrict(String src) {
+  final int start = src.indexOf('class DefaultCredentialManager');
+  final int end = src.indexOf('\n}\n', start);
+  final String body = src.substring(start, end);
+  final RegExp header = RegExp(
+    r'^  (?:static |external )?'
+    r'(?:Future<[^\n]*?>|[A-Z]\w*(?:<[^\n]*?>)?\??|void|bool|int|String|double)'
+    r'[ ]+(?:get[ ]+|set[ ]+)?(\w+)[ ]*(?:[(<]|=>)',
+    multiLine: true,
+  );
+  final List<RegExpMatch> hs = header.allMatches(body).toList();
+  final Map<String, String> out = <String, String>{};
+  for (int i = 0; i < hs.length; i++) {
+    final int to = i + 1 < hs.length ? hs[i + 1].start : body.length;
+    final String name = hs[i].group(1)!;
+    if (out.containsKey(name)) {
+      throw StateError('ambiguous member parse: $name');
+    }
+    out[name] = body.substring(hs[i].start, to);
+  }
+  return out;
+}
+
+/// Lock-structure violations of a parsed manager ([_membersOf]). Empty means:
+///  * the lock is acquired only by approved members, each exactly once;
+///  * every write sits in an approved writer, and every approved writer is
+///    reachable ONLY from inside a `_lock.run(...)` closure (transitively
+///    through private helpers — fixed point over the whole call graph);
+///  * no lock-held code acquires the lock again or calls a lock acquirer;
+///  * the biometric prompt is never awaited under the lock;
+///  * the verify-for-change methods capture the attempt context, run the
+///    locked authenticate helper as the ENTIRE lock body, and issue the
+///    grant after the lock is released.
+List<String> _lockViolations(Map<String, String> m) {
+  final List<String> v = <String>[];
+  String bodyOf(String k) {
+    final String t = m[k]!;
+    final int i = t.indexOf('\n');
+    return i < 0 ? '' : t.substring(i);
+  }
+
+  final Set<String> acq = m.entries
+      .where((MapEntry<String, String> e) => e.value.contains('_lock.run('))
+      .map((MapEntry<String, String> e) => e.key)
+      .toSet();
+  for (final String a in acq.difference(_kApprovedAcquirers)) {
+    v.add('unapproved lock acquirer: $a');
+  }
+  for (final String a in _kApprovedAcquirers.difference(acq)) {
+    v.add('approved acquirer lost its lock: $a');
+  }
+  for (final String a in acq) {
+    if ('_lock.run('.allMatches(m[a]!).length != 1) {
+      v.add('lock acquired more than once in: $a');
+    }
+  }
+  for (final MapEntry<String, String> e in m.entries) {
+    if (_kWriteCall.hasMatch(bodyOf(e.key)) &&
+        !_kApprovedWriters.contains(e.key)) {
+      v.add('unapproved writer: ${e.key}');
+    }
+  }
+
+  // Fixed point: a private helper is lock-held iff it has at least one call
+  // site and EVERY call site is inside a `_lock.run(` closure of an acquirer
+  // or inside another lock-held helper.
+  final Set<String> helpers = m.keys
+      .where((String k) => k.startsWith('_') && !acq.contains(k))
+      .toSet();
+  final Set<String> held = <String>{};
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (final String h in helpers.difference(held)) {
+      final List<bool> sites = <bool>[];
+      for (final MapEntry<String, String> e in m.entries) {
+        if (e.key == h) continue;
+        final String code = _code(e.value);
+        final (int, int)? range = _lockRange(code);
+        for (final RegExpMatch c in _refOf(h).allMatches(code)) {
+          sites.add(held.contains(e.key) ||
+              (acq.contains(e.key) &&
+                  range != null &&
+                  c.start > range.$1 &&
+                  c.start < range.$2));
+        }
+      }
+      if (sites.isNotEmpty && sites.every((bool b) => b)) {
+        held.add(h);
+        changed = true;
+      }
+    }
+  }
+  for (final String w in _kApprovedWriters) {
+    if (!m.containsKey(w)) {
+      v.add('approved writer missing: $w');
+    } else if (!held.contains(w)) {
+      v.add('writer reachable outside the lock: $w');
+    }
+  }
+
+  // No nested acquisition.
+  for (final String h in held) {
+    for (final String a in acq) {
+      if (_callOf(a).hasMatch(bodyOf(h))) {
+        v.add('lock-held $h calls acquirer $a');
+      }
+    }
+    if (m[h]!.contains('_lock.run(')) {
+      v.add('nested acquisition in $h');
+    }
+  }
+  for (final String a in acq) {
+    final (int, int) r = _lockRange(m[a]!)!;
+    final String inner = m[a]!.substring(r.$1 + '_lock.run('.length, r.$2);
+    for (final String b in acq) {
+      if (_callOf(b).hasMatch(inner)) {
+        v.add('lock body of $a calls acquirer $b');
+      }
+    }
+  }
+
+  // The biometric prompt is never awaited under the lock.
+  bool promptSeen = false;
+  for (final MapEntry<String, String> e in m.entries) {
+    final int at = e.value.indexOf(_kPromptCall);
+    if (at < 0) continue;
+    promptSeen = true;
+    final (int, int)? r = _lockRange(e.value);
+    if (held.contains(e.key) || (r != null && at > r.$1 && at < r.$2)) {
+      v.add('biometric prompt under the lock: ${e.key}');
+    }
+  }
+  if (!promptSeen) {
+    v.add('biometric prompt call not found (guard would be vacuous)');
+  }
+
+  // Verify-for-change shape.
+  for (final String name in _kVerifyForChange) {
+    final String? t = m[name];
+    if (t == null) {
+      v.add('missing: $name');
+      continue;
+    }
+    final (int, int)? r = _lockRange(t);
+    if (r == null) continue; // reported above
+    final String inner = t.substring(r.$1 + '_lock.run('.length, r.$2 - 1);
+    if (!RegExp(r'^\(\)\s*=>\s*_authenticate(Pin|Pattern)Locked\([^()]*\)$')
+        .hasMatch(inner.trim())) {
+      v.add('$name: lock body is not exactly the locked authenticate helper');
+    }
+    final int ctx = t.indexOf('AuthAttemptContext.current');
+    if (ctx < 0 || ctx > r.$1) {
+      v.add('$name: attempt context not captured before the lock');
+    }
+    final int issue = t.indexOf('_issueOnSuccess(');
+    if (issue < r.$2) {
+      v.add('$name: grant not issued after the lock is released');
+    }
+  }
+  return v;
 }
 
 void main() {
@@ -312,19 +546,21 @@ void main() {
           .where((MapEntry<String, String> e) => e.value.contains('_lock.run('))
           .map((MapEntry<String, String> e) => e.key)
           .toSet();
-      expect(acquirers, <String>{...lockedPublic, '_evaluateLatestAndPersist'});
+      // NF-NS-1 (owner decision 2): the verify-for-change methods take the
+      // lock themselves (the grant binds to the epoch of THE commit inside
+      // the lock); their exact shape is pinned by the call-graph group.
+      expect(acquirers, <String>{
+        ...lockedPublic,
+        '_evaluateLatestAndPersist',
+        ..._kVerifyForChange,
+      });
     });
 
     test('every settings / PIN-store write happens in a locked body', () {
-      const Set<String> lockedBodies = <String>{
-        '_enrollPinLocked',
-        '_enrollPatternLocked',
-        'updateBiometricOptions',
-        'setRandomizedKeypadEnabled',
-        'setPatternVisibilityEnabled',
-        '_clearAllLocked',
-        '_evaluateAndPersist',
-      };
+      // NF-NS-1 (owner decision 2): every conditional write now lives in
+      // one of these bodies; the three helpers are proven lock-held below
+      // and in the call-graph group.
+      const Set<String> lockedBodies = _kApprovedWriters;
       final RegExp write = RegExp(r'saveSettings\(|_pinStore\.(save|delete)\(');
       for (final MapEntry<String, String> e in m.entries) {
         if (write.hasMatch(e.value)) {
@@ -346,17 +582,27 @@ void main() {
           }
         }
       }
-      // _evaluateAndPersist is reached only from locked bodies.
-      final Set<String> callers = all.entries
+      // The NF-NS-1 write helpers are reached only from locked bodies
+      // (successor of the `_evaluateAndPersist` caller check).
+      Set<String> callersOf(String helper) => all.entries
           .where((MapEntry<String, String> e) =>
-              e.key != '_evaluateAndPersist' &&
-              e.value.contains('_evaluateAndPersist('))
+              e.key != helper && e.value.contains('$helper('))
           .map((MapEntry<String, String> e) => e.key)
           .toSet();
-      expect(callers, <String>{
+      expect(callersOf('_commitVerdict'), <String>{
         '_authenticatePinLocked',
         '_authenticatePatternLocked',
         '_evaluateLatestAndPersist',
+      });
+      expect(callersOf('_commitCredentialChange'), <String>{
+        '_enrollPinLocked',
+        '_enrollPatternLocked',
+      });
+      expect(callersOf('_conditionalUpdate'), <String>{
+        'updateBiometricOptions',
+        'setRandomizedKeypadEnabled',
+        'setPatternVisibilityEnabled',
+        '_clearAllLocked',
       });
     });
 
@@ -1218,5 +1464,103 @@ void main() {
       expect(session(c), isNull);
       expect(authorized(c), isNot(contains(app)));
     });
+  });
+
+  // -------------------------------------------------------------------------
+  group('Gate A.1/A.5 — NF-NS-1 call graph (owner decision 2)', () {
+    late String src;
+    setUpAll(() => src = File(_managerPath).readAsStringSync());
+
+    String variant(String from, String to) {
+      expect(from.allMatches(src).length, 1,
+          reason: 'self-test anchor must match exactly once: $from');
+      return src.replaceFirst(from, to);
+    }
+
+    String withMember(String member) {
+      final int start = src.indexOf('class DefaultCredentialManager');
+      final int end = src.indexOf('\n}\n', start);
+      return '${src.substring(0, end)}\n$member${src.substring(end)}';
+    }
+
+    test('the real manager: every credential writer is serialized, no '
+        'unapproved path bypasses the lock, prompts stay outside it', () {
+      final Map<String, String> m = _membersStrict(src);
+      expect(_lockViolations(m), isEmpty);
+      // Cross-check: the original parser sees the same lock-relevant names.
+      expect(_membersOf(src).keys.toSet(), containsAll(_kApprovedWriters));
+      // Anti-vacuity: the analysis saw the real structure.
+      for (final String w in _kApprovedWriters) {
+        expect(m.containsKey(w), isTrue, reason: w);
+      }
+      expect(m['authenticateBiometric']!.contains('_lock.run('), isFalse);
+    });
+
+    final Map<String, (String, String, String)> unsafe =
+        <String, (String, String, String)>{
+      'a new public method writes settings without the lock': (
+        '',
+        '  Future<void> sneakyWrite() async {\n'
+            '    await _settings.saveSettings(SecuritySettings.defaults);\n'
+            '  }\n',
+        'unapproved writer: sneakyWrite',
+      ),
+      'a new public method reaches a write helper outside the lock': (
+        '',
+        '  Future<Result<void>> sneakyToggle() =>\n'
+            '      _conditionalUpdate((SecuritySettings s) => s);\n',
+        'writer reachable outside the lock: _conditionalUpdate',
+      ),
+      'a verdict commit outside the lock (biometric path unlocked)': (
+        '      _lock.run(\n        () => _commitVerdict(',
+        '      (\n        () => _commitVerdict(',
+        'writer reachable outside the lock: _commitVerdict',
+      ),
+      'verify-for-change runs the authenticate helper without the lock': (
+        'await _lock.run(() => _authenticatePinLocked(pin, context, sink));',
+        'await (() => _authenticatePinLocked(pin, context, sink))();',
+        'writer reachable outside the lock: _commitVerdict',
+      ),
+      'verify-for-change issues the grant inside the lock': (
+        'await _lock.run(() => _authenticatePinLocked(pin, context, sink));\n'
+            '    return _issueOnSuccess(attempt, AuthType.pin, committedEpoch);',
+        'await _lock.run(() async => _issueOnSuccess(\n'
+            '        await _authenticatePinLocked(pin, context, sink),\n'
+            '        AuthType.pin, committedEpoch)).then((r) => r);\n'
+            '    return Result.success(attempt);',
+        'verifyPinForCredentialChange: lock body is not exactly the locked '
+            'authenticate helper',
+      ),
+      'the biometric prompt awaited under the lock': (
+        '',
+        '  Future<void> _promptHeld(BiometricService service) async {\n'
+            "    await service.authenticate(reason: 'r');\n"
+            '  }\n'
+            '  Future<void> promptUnderLock(BiometricService s) =>\n'
+            '      _lock.run(() => _promptHeld(s));\n',
+        'biometric prompt under the lock: _promptHeld',
+      ),
+      'nested acquisition inside a write helper': (
+        '    for (int attempt = 1;; attempt++) {\n'
+            '      final Result<SecuritySettings> loaded = '
+            'await _settings.getSettings();',
+        '    await _lock.run(() async {});\n'
+            '    for (int attempt = 1;; attempt++) {\n'
+            '      final Result<SecuritySettings> loaded = '
+            'await _settings.getSettings();',
+        // The injected `_lock.run` makes the helper an (unapproved)
+        // acquirer called from inside other lock bodies: nested acquisition.
+        'lock body of updateBiometricOptions calls acquirer _conditionalUpdate',
+      ),
+    };
+    for (final MapEntry<String, (String, String, String)> u
+        in unsafe.entries) {
+      test('self-test: detects ${u.key}', () {
+        final (String from, String to, String expected) = u.value;
+        final String mutated = from.isEmpty ? withMember(to) : variant(from, to);
+        expect(mutated, isNot(src));
+        expect(_lockViolations(_membersStrict(mutated)), contains(expected));
+      });
+    }
   });
 }

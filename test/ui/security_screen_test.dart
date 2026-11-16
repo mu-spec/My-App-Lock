@@ -7,6 +7,7 @@ import 'package:smart_app_lock/app/router.dart';
 import 'package:smart_app_lock/app/theme/app_theme.dart';
 import 'package:smart_app_lock/data/models/protected_app.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/design_system/design_system.dart';
 import 'package:smart_app_lock/protection/impl/default_access_controller.dart';
 import 'package:smart_app_lock/security/credentials/auth_type.dart';
@@ -699,6 +700,27 @@ class _FailingSettingsDatabase extends InMemoryLocalDatabase {
       throw StateError('simulated settings write failure');
     }
     await super.setSetting(key, value);
+  }
+
+  // P13/M3 NF-NS-1: settings writes are compare-and-set now; the same
+  // interception applies to them (CAS-G2: never inherit an un-intercepted
+  // CAS).
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    if (key == 'security_settings' && securityWritesBeforeFailure != null) {
+      if (securityWritesBeforeFailure! <= 0) {
+        throw StateError('simulated settings write failure');
+      }
+      securityWritesBeforeFailure = securityWritesBeforeFailure! - 1;
+    }
+    if (key == 'security_settings' && failSecuritySettingsWrites) {
+      throw StateError('simulated settings write failure');
+    }
+    return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 }
 

@@ -96,15 +96,18 @@ void main() {
         .where((File f) => f.path.endsWith('.dart'))
         .toList();
 
-    test('CAS-G1 no production caller outside lib/data/storage (no monitor '
-        'or credential integration in this patch)', () {
+    // P13/M3 NF-NS-1 RE-BASELINE (E-B6, disclosed): the credential fix makes
+    // the security-settings repository the ONE production caller. Any other
+    // caller (monitor, journal, evidence, UI) still fails here.
+    test('CAS-G1 the only production caller outside lib/data/storage is the '
+        'security-settings repository (no monitor integration)', () {
       final List<String> callers = <String>[
         for (final File f in dartFiles('lib'))
           if (!f.path.replaceAll(r'\', '/').startsWith('lib/data/storage/') &&
               f.readAsStringSync().contains('compareAndSetSetting'))
-            f.path,
+            f.path.replaceAll(r'\', '/'),
       ];
-      expect(callers, isEmpty);
+      expect(callers, <String>[kOnlyCasCaller]);
     });
 
     test('CAS-G2 anti-vacuity: every test fake overriding setSetting is '
@@ -136,15 +139,47 @@ void main() {
           reason: 'inventory changed: review CAS bypass for ${fakes.length} '
               'files');
       expect(fakes.length, kFakeFiles);
-      expect(casOverrides, 0,
-          reason: 'a fake now overrides CAS: update this inventory');
+      // NF-NS-1 RE-BASELINE (E-B6): now that a caller exists, every fake
+      // that intercepts security_settings (or every key) overrides CAS with
+      // the same interception; nothing else does.
+      expect(casOverrides, kCasOverrideFiles.length,
+          reason: 'CAS override set changed: update this inventory');
+      for (final String path in kCasOverrideFiles) {
+        expect(
+          File(path).readAsStringSync(),
+          contains('Future<CasOutcome> compareAndSetSetting('),
+          reason: '$path intercepts security_settings writes but would '
+              'inherit an un-intercepted CAS',
+        );
+      }
     });
   });
 }
 
-/// Frozen at 6110ff8 + this patch (see C/B evidence README).
-const int kSetSettingOverrides = 42;
-const int kFakeFiles = 38;
+/// Frozen at 6110ff8 + F-1 (42 / 38), re-baselined for NF-NS-1 (E-B6):
+/// +1 override in the new NF-NS-1 transition test's fault store.
+const int kSetSettingOverrides = 43;
+const int kFakeFiles = 39;
+
+/// NF-NS-1: the one production compare-and-set caller (CAS-G1).
+const String kOnlyCasCaller =
+    'lib/data/repositories/impl/security_settings_repository_impl.dart';
+
+/// NF-NS-1: fakes that intercept security_settings / all-key writes and
+/// therefore route compareAndSetSetting through the same interception.
+const List<String> kCasOverrideFiles = <String>[
+  'test/regression/host_auth_binding_test.dart',
+  'test/regression/late_pop_route_binding_test.dart',
+  'test/regression/p13_m2_isolation_test.dart',
+  'test/security/credentials/credential_manager_test.dart',
+  'test/security/credentials/p13_m3_nf_ns_1_state_transitions_test.dart',
+  'test/security/intruder/intruder_outcome_observer_test.dart',
+  'test/security/timeline/security_timeline_m2_read_model_test.dart',
+  'test/security/timeline/security_timeline_test.dart',
+  'test/ui/security/security_recommendations_card_test.dart',
+  'test/ui/security/security_score_card_test.dart',
+  'test/ui/security_screen_test.dart',
+];
 
 class _UnreadableDb extends InMemoryLocalDatabase {
   @override

@@ -15,6 +15,7 @@ import '../biometric_options.dart';
 import '../credential_change_authorization.dart';
 import '../credential_hash.dart';
 import '../credential_state.dart';
+import '../credential_state_errors.dart';
 import '../credential_state_machine.dart';
 import '../credential_manager.dart';
 import '../credential_hash_policy.dart';
@@ -36,6 +37,18 @@ import 'default_pin_credential_store.dart';
 /// PIN credential material flows exclusively through the [PinCredentialStore]
 /// (Phase 2D): the raw PIN is hashed in memory and only the derived hash
 /// reaches persistence — never the PIN itself.
+///
+/// P13/M3 NF-NS-1: every write is a CONDITIONAL save of a next document
+/// derived from a FRESH read (see [SecuritySettingsRepository.saveSettings]).
+/// A conflict re-reads the durable state and re-evaluates from scratch — at
+/// most [maxCommitAttempts] attempts, then the operation fails closed — so a
+/// writer holding stale state (another manager, engine or process) can never
+/// lose a failed attempt, lift a lockout, restore a replaced PIN or undo
+/// Clear All. Change grants and biometric prompts are bound to the durable
+/// credential epoch, which no instance can reuse. Slow PBKDF2 work runs
+/// before the single compare-and-set statement: no database transaction is
+/// held across it. The in-process [_SerialLock] is kept as a per-instance
+/// optimisation only; correctness never depends on it.
 class DefaultCredentialManager implements CredentialManager {
   DefaultCredentialManager({
     required SecuritySettingsRepository settings,
@@ -91,6 +104,11 @@ class DefaultCredentialManager implements CredentialManager {
   /// biometric system prompt is NEVER held under this lock (a stuck prompt
   /// must not block PIN entry); only its verdict is applied under it.
   final _SerialLock _lock = _SerialLock();
+
+  /// P13/M3 NF-NS-1: bounded compare-and-set attempts per operation. After
+  /// the last conflict the operation fails ([CredentialStateConflict]); no
+  /// verdict is released and nothing is unlocked.
+  static const int maxCommitAttempts = 3;
 
   /// Phase 12 / M1 gate B: the biometric "basis" epoch. Bumped (under
   /// [_lock], immediately before the write) by every credential-set or
@@ -149,22 +167,30 @@ class DefaultCredentialManager implements CredentialManager {
     if (loaded.isFailure) {
       return Result.failure(loaded.errorOrNull!); // fail closed
     }
-    final CredentialChangeNotAuthorized? denied =
-        _consumeChangeAuthorization(loaded.valueOrNull!, authorization);
+    final SecuritySettings s0 = loaded.valueOrNull!;
+    final _ChangeGate gate = _consumeChangeAuthorization(s0, authorization);
+    final CredentialChangeNotAuthorized? denied = gate.denied;
     if (denied != null) {
       return Result.failure(denied);
     }
+    // Slow KDF: no database transaction is open (the commit below is one
+    // compare-and-set statement).
     final PinHash hash = await _pinHasher.hash(pin);
 
     // The hash and all metadata that describes it must land in ONE settings
     // write. Two writes can leave an old hash paired with a new length or
     // primary method when the second write fails.
     _biometricBasisEpoch++;
-    final Result<void> saved = await _pinStore.save(
-      hash,
-      pinLength: pin.length,
-      makePrimary: true,
-      resetAttemptState: true,
+    final Result<void> saved = await _commitCredentialChange(
+      s0,
+      gate,
+      (SecuritySettings basis) => _pinStore.saveOnto(
+        basis,
+        hash,
+        pinLength: pin.length,
+        makePrimary: true,
+        resetAttemptState: true,
+      ),
     );
     _credentialSetChanged();
     return saved;
@@ -194,24 +220,25 @@ class DefaultCredentialManager implements CredentialManager {
     if (gateLoaded.isFailure) {
       return Result.failure(gateLoaded.errorOrNull!); // fail closed
     }
-    final CredentialChangeNotAuthorized? denied =
-        _consumeChangeAuthorization(gateLoaded.valueOrNull!, authorization);
+    final SecuritySettings s0 = gateLoaded.valueOrNull!;
+    final _ChangeGate gate = _consumeChangeAuthorization(s0, authorization);
+    final CredentialChangeNotAuthorized? denied = gate.denied;
     if (denied != null) {
       return Result.failure(denied);
     }
     final CredentialHash hash = await _patternHasher.hash(nodes);
-    final Result<SecuritySettings> loaded = await _settings.getSettings();
     _biometricBasisEpoch++;
-    final Result<void> saved = await loaded.fold(
-      (SecuritySettings s) => _settings.saveSettings(
-        s.copyWith(
+    final Result<void> saved = await _commitCredentialChange(
+      s0,
+      gate,
+      (SecuritySettings basis) => _settings.saveSettings(
+        basis.copyWith(
           patternHash: hash,
           primaryAuthType: AuthType.pattern,
           failedAttempts: 0,
           clearLockout: true,
         ),
       ),
-      (Object e) async => Result<void>.failure(e),
     );
     _credentialSetChanged();
     return saved;
@@ -219,42 +246,31 @@ class DefaultCredentialManager implements CredentialManager {
 
   @override
   Future<Result<void>> updateBiometricOptions(BiometricOptions? options) =>
-      _lock.run(() async {
-        final Result<SecuritySettings> loaded = await _settings.getSettings();
+      _lock.run(() {
         _biometricBasisEpoch++;
-        return loaded.fold(
-          (SecuritySettings s) => _settings.saveSettings(
-            options == null
-                ? s.copyWith(clearBiometricOptions: true)
-                : s.copyWith(biometricOptions: options),
-          ),
-          Result.failure,
+        return _conditionalUpdate(
+          (SecuritySettings s) => options == null
+              ? s.copyWith(clearBiometricOptions: true)
+              : s.copyWith(biometricOptions: options),
         );
       });
 
   @override
   Future<Result<void>> setRandomizedKeypadEnabled(bool enabled) =>
-      _lock.run(() async {
-        final Result<SecuritySettings> loaded = await _settings.getSettings();
-        return loaded.fold(
-          (SecuritySettings s) => _settings.saveSettings(
-            s.copyWith(randomizedKeypadEnabled: enabled),
-          ),
-          Result.failure,
-        );
-      });
+      _lock.run(
+        () => _conditionalUpdate(
+          (SecuritySettings s) => s.copyWith(randomizedKeypadEnabled: enabled),
+        ),
+      );
 
   @override
   Future<Result<void>> setPatternVisibilityEnabled(bool enabled) =>
-      _lock.run(() async {
-        final Result<SecuritySettings> loaded = await _settings.getSettings();
-        return loaded.fold(
-          (SecuritySettings s) => _settings.saveSettings(
-            s.copyWith(patternVisibilityEnabled: enabled),
-          ),
-          Result.failure,
-        );
-      });
+      _lock.run(
+        () => _conditionalUpdate(
+          (SecuritySettings s) =>
+              s.copyWith(patternVisibilityEnabled: enabled),
+        ),
+      );
 
   // -- authentication -----------------------------------------------------
 
@@ -267,8 +283,9 @@ class DefaultCredentialManager implements CredentialManager {
 
   Future<Result<AuthAttemptResult>> _authenticatePinLocked(
     String pin,
-    AuthAttemptContext context,
-  ) async {
+    AuthAttemptContext context, [
+    void Function(int secretEpoch)? onCommitted,
+  ]) async {
     final Result<PinHash?> loadedHash = await _pinStore.load();
     if (loadedHash.isFailure) {
       // Fail closed: corrupted/weakened stored credential.
@@ -289,6 +306,11 @@ class DefaultCredentialManager implements CredentialManager {
       return Result.failure(loaded.errorOrNull!);
     }
     final SecuritySettings s = loaded.valueOrNull!;
+    // The verification basis V: the hash verified below must be the one in
+    // this document (two reads; a change in between is a T4 race).
+    if (!_sameJson(s.pinHash?.toJson(), stored.toJson())) {
+      return Result.failure(const CredentialChangedDuringVerification());
+    }
 
     final CredentialState state = _stateFrom(s);
     final AuthLockedOut? activeLockout = _activeLockout(state, _now());
@@ -296,8 +318,24 @@ class DefaultCredentialManager implements CredentialManager {
       return Result.success(activeLockout);
     }
 
+    // Slow KDF outside any database transaction.
     final bool matches = await _pinHasher.verify(pin, stored);
-    return _evaluateAndPersist(s, state, matches, AuthType.pin, context);
+    return _commitVerdict(
+      first: s,
+      matches: matches,
+      type: AuthType.pin,
+      context: context,
+      onCommitted: onCommitted,
+      // T4: the verified credential must still be the stored one on EVERY
+      // attempt (fresh state after a conflict included).
+      revalidate: (SecuritySettings fresh) => fresh.credentialEpoch !=
+                  s.credentialEpoch ||
+              !_sameJson(fresh.pinHash?.toJson(), stored.toJson())
+          ? Result<AuthAttemptResult>.failure(
+              const CredentialChangedDuringVerification(),
+            )
+          : null,
+    );
   }
 
   @override
@@ -308,8 +346,9 @@ class DefaultCredentialManager implements CredentialManager {
 
   Future<Result<AuthAttemptResult>> _authenticatePatternLocked(
     List<int> nodes,
-    AuthAttemptContext context,
-  ) async {
+    AuthAttemptContext context, [
+    void Function(int secretEpoch)? onCommitted,
+  ]) async {
     final Result<SecuritySettings> loaded = await _settings.getSettings();
     if (loaded.isFailure) {
       return Result.failure(loaded.errorOrNull!);
@@ -344,8 +383,22 @@ class DefaultCredentialManager implements CredentialManager {
       return Result.success(activeLockout);
     }
 
+    // Slow KDF outside any database transaction.
     final bool matches = await _patternHasher.verify(nodes, patternHash);
-    return _evaluateAndPersist(s, state, matches, AuthType.pattern, context);
+    return _commitVerdict(
+      first: s,
+      matches: matches,
+      type: AuthType.pattern,
+      context: context,
+      onCommitted: onCommitted,
+      revalidate: (SecuritySettings fresh) => fresh.credentialEpoch !=
+                  s.credentialEpoch ||
+              !_sameJson(fresh.patternHash?.toJson(), patternHash.toJson())
+          ? Result<AuthAttemptResult>.failure(
+              const CredentialChangedDuringVerification(),
+            )
+          : null,
+    );
   }
 
   @override
@@ -463,8 +516,15 @@ class DefaultCredentialManager implements CredentialManager {
   Future<Result<void>> _clearAllLocked() async {
     _biometricBasisEpoch++;
     _credentialSetChanged();
-    final Result<void> saved =
-        await _settings.saveSettings(SecuritySettings.defaults);
+    // NF-NS-1 T6: defaults replace the document the clear was decided on;
+    // the credential epoch moves (repository), so no stale writer can CAS
+    // its old document back. An unreadable document is NOT overwritten
+    // (fail closed; no blind write).
+    final Result<void> saved = await _conditionalUpdate(
+      (SecuritySettings s) =>
+          SecuritySettings.defaults.rebasedOn(s, newCredentialEpoch: true),
+      allowCounterReset: true,
+    );
     _credentialSetChanged();
     return saved;
   }
@@ -488,14 +548,30 @@ class DefaultCredentialManager implements CredentialManager {
   @override
   Future<Result<CredentialChangeAttempt>> verifyPinForCredentialChange(
     String pin,
-  ) async =>
-      _issueOnSuccess(await authenticatePin(pin), AuthType.pin);
+  ) async {
+    final AuthAttemptContext context = AuthAttemptContext.current;
+    // The grant binds to the secret epoch of THE commit that released this
+    // verdict (captured inside the lock, issued after it).
+    int? committedEpoch;
+    void sink(int epoch) => committedEpoch = epoch;
+    final Result<AuthAttemptResult> attempt =
+        await _lock.run(() => _authenticatePinLocked(pin, context, sink));
+    return _issueOnSuccess(attempt, AuthType.pin, committedEpoch);
+  }
 
   @override
   Future<Result<CredentialChangeAttempt>> verifyPatternForCredentialChange(
     List<int> nodes,
-  ) async =>
-      _issueOnSuccess(await authenticatePattern(nodes), AuthType.pattern);
+  ) async {
+    final AuthAttemptContext context = AuthAttemptContext.current;
+    // The grant binds to the secret epoch of THE commit that released this
+    // verdict (captured inside the lock, issued after it).
+    int? committedEpoch;
+    void sink(int epoch) => committedEpoch = epoch;
+    final Result<AuthAttemptResult> attempt =
+        await _lock.run(() => _authenticatePatternLocked(nodes, context, sink));
+    return _issueOnSuccess(attempt, AuthType.pattern, committedEpoch);
+  }
 
   @override
   void revokeCredentialChangeAuthorization(
@@ -507,12 +583,18 @@ class DefaultCredentialManager implements CredentialManager {
   Result<CredentialChangeAttempt> _issueOnSuccess(
     Result<AuthAttemptResult> attempt,
     AuthType method,
+    int? durableEpoch,
   ) {
     if (attempt.isFailure) {
       return Result.failure(attempt.errorOrNull!);
     }
     final AuthAttemptResult result = attempt.valueOrNull!;
     if (result is! AuthSuccess || result.type != method) {
+      return Result.success(CredentialChangeAttempt(result));
+    }
+    if (durableEpoch == null) {
+      // A success is only ever released after its commit; without the
+      // committed epoch no grant is issued (fail closed).
       return Result.success(CredentialChangeAttempt(result));
     }
     // At most one live grant: a new verification supersedes older ones.
@@ -522,16 +604,24 @@ class DefaultCredentialManager implements CredentialManager {
     _changeGrants[handle] = _ChangeGrant(
       issuedAt: _now(),
       epoch: _credentialEpoch,
+      secretEpoch: durableEpoch,
     );
     return Result.success(CredentialChangeAttempt(result, handle));
   }
 
-  /// The CR-3 write gate. Returns null if the write may go ahead.
+  /// The CR-3 write gate. Its [_ChangeGate.denied] is null if the write
+  /// may go ahead; the gate then records what every commit attempt must
+  /// re-validate against FRESH state ([_revalidateChange]).
   ///
   /// When a usable app credential exists, the supplied grant is removed
   /// from the registry (consumed) BEFORE it is validated, so it can never be
   /// replayed, even after a denied or failed write.
-  CredentialChangeNotAuthorized? _consumeChangeAuthorization(
+  ///
+  /// NF-NS-1: a grant is bound to the DURABLE credential-SECRET epoch it
+  /// was earned under (never reused, valid across instances and processes;
+  /// owner decision 1b: unaffected by biometric-options changes), in
+  /// addition to this instance's epoch.
+  _ChangeGate _consumeChangeAuthorization(
     SecuritySettings s,
     CredentialChangeAuthorization? authorization,
   ) {
@@ -539,35 +629,110 @@ class DefaultCredentialManager implements CredentialManager {
     final bool hasExistingCredential =
         state.hasEnrolled(AuthType.pin) || state.hasEnrolled(AuthType.pattern);
     if (!hasExistingCredential) {
-      return null; // initial enrollment
+      // Initial enrollment: valid only while no credential appears.
+      return _ChangeGate(epoch: s.secretEpoch, replacement: false);
     }
     if (authorization == null) {
-      return const CredentialChangeNotAuthorized(
-        CredentialChangeDenial.missing,
-      );
+      return _ChangeGate.denied(CredentialChangeDenial.missing);
     }
     final _ChangeGrant? grant = _changeGrants.remove(authorization);
     if (grant == null) {
-      return const CredentialChangeNotAuthorized(
-        CredentialChangeDenial.unknown,
-      );
+      return _ChangeGate.denied(CredentialChangeDenial.unknown);
     }
-    if (grant.epoch != _credentialEpoch) {
-      return const CredentialChangeNotAuthorized(CredentialChangeDenial.stale);
+    if (grant.epoch != _credentialEpoch ||
+        grant.secretEpoch != s.secretEpoch) {
+      return _ChangeGate.denied(CredentialChangeDenial.stale);
     }
     final DateTime now = _now();
     final Duration age = now.difference(grant.issuedAt);
     if (age.isNegative || age > credentialChangeAuthorizationTtl) {
-      return const CredentialChangeNotAuthorized(
-        CredentialChangeDenial.expired,
-      );
+      return _ChangeGate.denied(CredentialChangeDenial.expired);
     }
     if (_activeLockout(state, now) != null) {
+      return _ChangeGate.denied(CredentialChangeDenial.lockedOut);
+    }
+    return _ChangeGate(epoch: grant.secretEpoch, replacement: true);
+  }
+
+  /// Re-validates an admitted credential change against [fresh] durable
+  /// state before EVERY commit attempt (never trusts the first read).
+  CredentialChangeNotAuthorized? _revalidateChange(
+    SecuritySettings fresh,
+    _ChangeGate gate,
+  ) {
+    // Any committed credential-secret change (any instance or process) since
+    // the change was admitted makes it stale — also for initial enrollment,
+    // where another enrollment would otherwise be silently replaced.
+    if (fresh.secretEpoch != gate.epoch) {
+      return const CredentialChangeNotAuthorized(CredentialChangeDenial.stale);
+    }
+    if (gate.replacement && _activeLockout(_stateFrom(fresh), _now()) != null) {
       return const CredentialChangeNotAuthorized(
         CredentialChangeDenial.lockedOut,
       );
     }
     return null;
+  }
+
+  /// Commits an admitted credential change: [write] is applied to the
+  /// re-validated basis; a conflict re-reads, re-validates and retries (at
+  /// most [maxCommitAttempts]); a stale change is denied, never re-applied.
+  Future<Result<void>> _commitCredentialChange(
+    SecuritySettings first,
+    _ChangeGate gate,
+    Future<Result<void>> Function(SecuritySettings basis) write,
+  ) async {
+    SecuritySettings basis = first;
+    for (int attempt = 1;; attempt++) {
+      if (attempt > 1) {
+        final Result<SecuritySettings> loaded = await _settings.getSettings();
+        if (loaded.isFailure) {
+          return Result.failure(loaded.errorOrNull!); // fail closed
+        }
+        basis = loaded.valueOrNull!;
+      }
+      final CredentialChangeNotAuthorized? denied =
+          _revalidateChange(basis, gate);
+      if (denied != null) {
+        return Result.failure(denied);
+      }
+      final Result<void> saved = await write(basis);
+      if (saved.isSuccess || saved.errorOrNull is! SettingsWriteConflict) {
+        return _mapUnknown(saved);
+      }
+      if (attempt >= maxCommitAttempts) {
+        return Result.failure(const CredentialStateConflict());
+      }
+    }
+  }
+
+  /// Read-modify-write of a document field set that carries no verdict
+  /// ([change] is re-applied to FRESH state after a conflict; at most
+  /// [maxCommitAttempts]; an unreadable document is never overwritten).
+  Future<Result<void>> _conditionalUpdate(
+    SecuritySettings Function(SecuritySettings s) change, {
+    bool allowCounterReset = false,
+  }) async {
+    for (int attempt = 1;; attempt++) {
+      final Result<SecuritySettings> loaded = await _settings.getSettings();
+      if (loaded.isFailure) {
+        return Result.failure(loaded.errorOrNull!); // fail closed
+      }
+      final SecuritySettings s = loaded.valueOrNull!;
+      final SecuritySettings next = change(s);
+      final String? regression =
+          updateRegression(s, next, allowCounterReset: allowCounterReset);
+      if (regression != null) {
+        return Result.failure(CredentialStateRegression(regression));
+      }
+      final Result<void> saved = await _settings.saveSettings(next);
+      if (saved.isSuccess || saved.errorOrNull is! SettingsWriteConflict) {
+        return _mapUnknown(saved);
+      }
+      if (attempt >= maxCommitAttempts) {
+        return Result.failure(const CredentialStateConflict());
+      }
+    }
   }
 
   void _credentialSetChanged() {
@@ -642,10 +807,13 @@ class DefaultCredentialManager implements CredentialManager {
   ///  * biometric unlock was disabled or every credential was cleared
   ///    (-> notConfigured, as the pre-prompt gate would answer), or
   ///  * the credential set / biometric options were written (basis epoch
-  ///    moved) or now differ from what the prompt started against
-  ///    (-> cancelled: the prompt ended without a usable verdict).
+  ///    moved — this instance's, or the DURABLE credential epoch, which
+  ///    catches writes from any manager, engine or process) or now differ
+  ///    from what the prompt started against (-> cancelled: the prompt
+  ///    ended without a usable verdict).
   /// A REJECTION is always counted against the current counters, so a
-  /// stale prompt can never reduce counting either.
+  /// stale prompt can never reduce counting either. NF-NS-1: the checks
+  /// are repeated on the fresh state of every commit attempt.
   Future<Result<AuthAttemptResult>> _evaluateLatestAndPersist(
     bool matches,
     AuthType type,
@@ -653,34 +821,38 @@ class DefaultCredentialManager implements CredentialManager {
     required SecuritySettings promptBasis,
     required int basisEpoch,
   }) =>
-      _lock.run(() async {
-        final Result<SecuritySettings> loaded = await _settings.getSettings();
-        if (loaded.isFailure) {
-          return Result<AuthAttemptResult>.failure(loaded.errorOrNull!);
-        }
-        final SecuritySettings s = loaded.valueOrNull!;
-        final CredentialState state = _stateFrom(s);
-        if (matches) {
-          if (s.biometricOptions == null || !s.hasAnyCredential) {
-            return Result<AuthAttemptResult>.success(
-              const AuthFailure(
-                reason: AuthFailureReason.notConfigured,
-                remainingAttempts: 0,
-              ),
-            );
-          }
-          if (basisEpoch != _biometricBasisEpoch ||
-              _biometricBasisOf(promptBasis) != _biometricBasisOf(s)) {
-            return Result<AuthAttemptResult>.success(
-              AuthFailure(
-                reason: AuthFailureReason.cancelled,
-                remainingAttempts: _remainingAttempts(state),
-              ),
-            );
-          }
-        }
-        return _evaluateAndPersist(s, state, matches, type, context);
-      });
+      _lock.run(
+        () => _commitVerdict(
+          first: null, // re-read under the lock
+          matches: matches,
+          type: type,
+          context: context,
+          revalidate: (SecuritySettings s) {
+            if (!matches) {
+              return null;
+            }
+            if (s.biometricOptions == null || !s.hasAnyCredential) {
+              return Result<AuthAttemptResult>.success(
+                const AuthFailure(
+                  reason: AuthFailureReason.notConfigured,
+                  remainingAttempts: 0,
+                ),
+              );
+            }
+            if (basisEpoch != _biometricBasisEpoch ||
+                s.credentialEpoch != promptBasis.credentialEpoch ||
+                _biometricBasisOf(promptBasis) != _biometricBasisOf(s)) {
+              return Result<AuthAttemptResult>.success(
+                AuthFailure(
+                  reason: AuthFailureReason.cancelled,
+                  remainingAttempts: _remainingAttempts(_stateFrom(s)),
+                ),
+              );
+            }
+            return null;
+          },
+        ),
+      );
 
   /// What a biometric prompt authorizes against: the enrolled credential
   /// material, the biometric options and the primary method. Compared as
@@ -695,48 +867,182 @@ class DefaultCredentialManager implements CredentialManager {
     });
   }
 
+  static bool _sameJson(Object? a, Object? b) =>
+      jsonEncode(a) == jsonEncode(b);
+
   /// Runs the state machine and persists the resulting counters. Always
   /// called under [_lock]. This is the ONE place a counted verdict exists,
   /// so it is the one place the [_observer] hears about it — after the
   /// counter write, so a lost event can never mean a lost counter.
-  Future<Result<AuthAttemptResult>> _evaluateAndPersist(
-    SecuritySettings s,
-    CredentialState state,
-    bool matches,
-    AuthType type,
-    AuthAttemptContext context,
-  ) async {
-    final DateTime now = _now();
-    final (CredentialState next, AuthAttemptResult result) = _machine.evaluate(
-      state: state,
-      credentialMatches: matches,
-      attemptType: type,
-      now: now,
-    );
-    final Result<void> saved = await _settings.saveSettings(
-      s.copyWith(
+  ///
+  /// NF-NS-1 (T1/T2/T7/T8): [first] is the state the verification started
+  /// from (null = read now). Every write is a conditional save of a next
+  /// state derived from that exact document. A conflict means another
+  /// writer committed in between: the state is re-read, [revalidate]
+  /// re-checked (T4: credential changed -> no verdict) and the verdict
+  /// re-evaluated from scratch, so a concurrent failure is never lost and
+  /// escalation is computed from the newest counters. At most
+  /// [maxCommitAttempts]; after that, or on any other save failure
+  /// (including an unconfirmed outcome), NO verdict is released.
+  /// [verdictRegression] refuses any next state that would weaken the
+  /// state it was derived from.
+  Future<Result<AuthAttemptResult>> _commitVerdict({
+    required SecuritySettings? first,
+    required bool matches,
+    required AuthType type,
+    required AuthAttemptContext context,
+    required Result<AuthAttemptResult>? Function(SecuritySettings s)
+        revalidate,
+    void Function(int secretEpoch)? onCommitted,
+  }) async {
+    SecuritySettings? current = first;
+    for (int attempt = 1;; attempt++) {
+      if (current == null) {
+        final Result<SecuritySettings> loaded = await _settings.getSettings();
+        if (loaded.isFailure) {
+          return Result<AuthAttemptResult>.failure(loaded.errorOrNull!);
+        }
+        current = loaded.valueOrNull!;
+      }
+      final SecuritySettings s = current;
+      final Result<AuthAttemptResult>? stop = revalidate(s);
+      if (stop != null) {
+        return stop;
+      }
+      final DateTime now = _now();
+      // T3: a lockout that started meanwhile (fresh state) refuses the
+      // attempt, as the pre-verification check would: no write.
+      final AuthLockedOut? lockedNow = _activeLockout(_stateFrom(s), now);
+      if (lockedNow != null) {
+        return Result<AuthAttemptResult>.success(lockedNow);
+      }
+      final (CredentialState next, AuthAttemptResult result) =
+          _machine.evaluate(
+        state: _stateFrom(s),
+        credentialMatches: matches,
+        attemptType: type,
+        now: now,
+      );
+      final SecuritySettings nextDoc = s.copyWith(
         failedAttempts: next.failedAttempts,
         lockedOutUntil: next.lockedOutUntil,
         clearLockout: next.lockedOutUntil == null,
         lockoutStreak: next.lockoutStreak,
-      ),
-    );
-    _notifyObserver(
-      VerifiedAttempt(
-        verificationId: '$_instanceNonce:${++_verificationSequence}',
-        type: type,
-        matched: matches,
-        result: result,
-        counterPersisted: saved.isSuccess,
-        lockoutStreak: next.lockoutStreak,
-        context: context,
-        at: now,
-      ),
-    );
-    if (saved.isFailure) {
-      return Result.failure(saved.errorOrNull!);
+      );
+      final String? regression =
+          verdictRegression(s, nextDoc, matches: matches, now: now);
+      if (regression != null) {
+        return Result<AuthAttemptResult>.failure(
+          CredentialStateRegression(regression),
+        );
+      }
+      final Result<void> saved = await _settings.saveSettings(nextDoc);
+      if (saved.isFailure &&
+          saved.errorOrNull is SettingsWriteConflict &&
+          attempt < maxCommitAttempts) {
+        current = null; // re-read and re-evaluate from scratch
+        continue;
+      }
+      _notifyObserver(
+        VerifiedAttempt(
+          verificationId: '$_instanceNonce:${++_verificationSequence}',
+          type: type,
+          matched: matches,
+          result: result,
+          counterPersisted: saved.isSuccess,
+          lockoutStreak: next.lockoutStreak,
+          context: context,
+          at: now,
+        ),
+      );
+      if (saved.isFailure) {
+        final Object error = saved.errorOrNull!;
+        return Result<AuthAttemptResult>.failure(
+          switch (error) {
+            SettingsWriteConflict() => const CredentialStateConflict(),
+            SettingsWriteUnknown() => const CredentialStateUnknown(),
+            _ => error,
+          },
+        );
+      }
+      onCommitted?.call(s.secretEpoch);
+      return Result<AuthAttemptResult>.success(result);
     }
-    return Result.success(result);
+  }
+
+  /// Maps an unconfirmed write to [CredentialStateUnknown] (fail closed).
+  static Result<void> _mapUnknown(Result<void> saved) =>
+      saved.errorOrNull is SettingsWriteUnknown
+          ? Result<void>.failure(const CredentialStateUnknown())
+          : saved;
+
+  /// NF-NS-1 monotonicity guard for writes that carry no verdict: the
+  /// basis is kept and, unless [allowCounterReset] (Clear All: defaults by
+  /// definition), the lockout counters are untouched.
+  static String? updateRegression(
+    SecuritySettings basis,
+    SecuritySettings next, {
+    required bool allowCounterReset,
+  }) {
+    if (!identical(next.storedBasis, basis.storedBasis)) {
+      return 'basis';
+    }
+    if (allowCounterReset) {
+      return null;
+    }
+    return next.failedAttempts == basis.failedAttempts &&
+            next.lockoutStreak == basis.lockoutStreak &&
+            next.lockedOutUntil == basis.lockedOutUntil
+        ? null
+        : 'counters';
+  }
+
+  /// NF-NS-1 monotonicity guard (defence in depth): returns the violated
+  /// rule, or null when [next] — derived from [basis] for ONE verdict at
+  /// [now] — never weakens it.
+  ///
+  ///  * a verdict keeps the basis and never touches the credential set;
+  ///  * during an active lockout nothing changes (the attempt is refused);
+  ///  * a rejection counts: the streak never drops, the attempt counter
+  ///    strictly grows from its effective value (an expired lockout starts
+  ///    a fresh count, as the established policy defines) and any new
+  ///    lockout ends in the future;
+  ///  * only a match may reset counters (outside an active lockout).
+  static String? verdictRegression(
+    SecuritySettings basis,
+    SecuritySettings next, {
+    required bool matches,
+    required DateTime now,
+  }) {
+    if (!identical(next.storedBasis, basis.storedBasis)) {
+      return 'basis';
+    }
+    if (basis.credentialFingerprint != next.credentialFingerprint) {
+      return 'credential';
+    }
+    final DateTime? until = basis.lockedOutUntil;
+    if (until != null && now.isBefore(until)) {
+      return next.failedAttempts == basis.failedAttempts &&
+              next.lockedOutUntil == until &&
+              next.lockoutStreak == basis.lockoutStreak
+          ? null
+          : 'lockout';
+    }
+    if (matches) {
+      return null;
+    }
+    if (next.lockoutStreak < basis.lockoutStreak) {
+      return 'streak';
+    }
+    final int effective = until != null ? 0 : basis.failedAttempts;
+    if (next.failedAttempts <= effective) {
+      return 'count';
+    }
+    final DateTime? newUntil = next.lockedOutUntil;
+    if (newUntil != null && !newUntil.isAfter(now)) {
+      return 'lockout';
+    }
+    return null;
   }
 
   /// Observe-only: synchronous, never awaited, never allowed to throw into
@@ -788,8 +1094,40 @@ final class _SerialLock {
 
 /// CR-3: registry entry backing a live [CredentialChangeAuthorization].
 final class _ChangeGrant {
-  const _ChangeGrant({required this.issuedAt, required this.epoch});
+  const _ChangeGrant({
+    required this.issuedAt,
+    required this.epoch,
+    required this.secretEpoch,
+  });
 
   final DateTime issuedAt;
+
+  /// This instance's in-memory epoch at issue.
   final int epoch;
+
+  /// NF-NS-1 / owner decision 1b: the DURABLE credential-SECRET epoch the
+  /// verification committed under. Never reused, so it can never match
+  /// again once it has moved; a biometric-options change does not move it
+  /// (CR-3: a pending grant survives the F4 flow).
+  final int secretEpoch;
+}
+
+/// CR-3 / NF-NS-1: outcome of admitting a credential change.
+final class _ChangeGate {
+  const _ChangeGate({required this.epoch, required this.replacement})
+      : denied = null;
+
+  _ChangeGate.denied(CredentialChangeDenial denial)
+      : denied = CredentialChangeNotAuthorized(denial),
+        epoch = -1,
+        replacement = true;
+
+  /// Non-null when the change is refused.
+  final CredentialChangeNotAuthorized? denied;
+
+  /// Durable credential-SECRET epoch every commit attempt must still see.
+  final int epoch;
+
+  /// True when an existing credential is being replaced (lockout gates it).
+  final bool replacement;
 }

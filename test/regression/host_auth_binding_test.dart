@@ -23,6 +23,7 @@ import 'package:smart_app_lock/app/app_container.dart';
 import 'package:smart_app_lock/data/models/app_security_level.dart';
 import 'package:smart_app_lock/data/models/protected_app.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/security/storage/impl/in_memory_secret_store.dart';
 import 'package:smart_app_lock/design_system/design_system.dart';
 import 'package:smart_app_lock/protection/impl/default_access_controller.dart';
@@ -70,6 +71,23 @@ class _GatedDb extends InMemoryLocalDatabase {
       await gate.future;
     }
     await super.setSetting(key, value);
+  }
+
+  // P13/M3 NF-NS-1: settings writes are compare-and-set now; the same
+  // interception applies to them (CAS-G2: never inherit an un-intercepted
+  // CAS).
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    final Completer<void>? gate = _gate;
+    if (gate != null && key == 'security_settings') {
+      held++;
+      await gate.future;
+    }
+    return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 }
 

@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import '../../security/credentials/auth_type.dart';
 import '../../security/credentials/biometric_options.dart';
 import '../../security/credentials/credential_hash.dart';
@@ -30,6 +32,8 @@ class SecuritySettings {
     this.lockoutStreak = 0,
     this.randomizedKeypadEnabled = false,
     this.patternVisibilityEnabled = true,
+    this.storedBasis,
+    this.startsNewCredentialEpoch = false,
   });
 
   /// Factory-default settings (nothing configured yet).
@@ -95,6 +99,106 @@ class SecuritySettings {
   /// privacy (anti-shoulder-surfing).
   final bool patternVisibilityEnabled;
 
+  /// P13/M3 NF-NS-1: the durable document this value was read from (null =
+  /// not read from storage, e.g. [defaults] or a freshly built value).
+  ///
+  /// Never serialized by [toJson]: the repository keeps the revision fields
+  /// in its own envelope and uses this basis to make every save a
+  /// compare-and-set against the exact document the caller read. Preserved
+  /// by [copyWith], so a read-modify-write keeps its basis.
+  final StoredSettingsBasis? storedBasis;
+
+  /// Transient (never serialized, not kept by [copyWith]): the next save
+  /// moves the durable credential epoch even if the credential set looks
+  /// unchanged (Clear All, design A T6). Moves [secretEpoch] too.
+  final bool startsNewCredentialEpoch;
+
+  /// Durable document revision of [storedBasis] (0 = absent or legacy).
+  int get revision => storedBasis?.revision ?? 0;
+
+  /// Durable credential-set epoch of [storedBasis] (0 = absent or legacy).
+  /// Strictly increases whenever the stored credential set changes; it is
+  /// never reset, so a grant or prompt bound to an older epoch can never
+  /// match again.
+  int get credentialEpoch => storedBasis?.credentialEpoch ?? 0;
+
+  /// Canonical form of the credential set (hashes, biometric options,
+  /// primary method, PIN length): a committed change of it moves the
+  /// durable [credentialEpoch]. Never logged.
+  String get credentialFingerprint {
+    final Map<String, dynamic> j = toJson();
+    return jsonEncode(<String, dynamic>{
+      'pinHash': j['pinHash'],
+      'patternHash': j['patternHash'],
+      'biometricOptions': j['biometricOptions'],
+      'primaryAuthType': j['primaryAuthType'],
+      'pinLength': j['pinLength'],
+    });
+  }
+
+  /// Durable credential-SECRET epoch of [storedBasis] (0 = absent or
+  /// legacy). Owner decision 1b (CR-3): strictly increases whenever the
+  /// credential secret or its authorization policy changes (PIN hash,
+  /// pattern hash, primary method, PIN length, attempt policy) and on Clear
+  /// All — but NOT on a biometric-options change. Credential-change grants
+  /// are bound to it; biometric verdicts keep validating the full
+  /// [credentialEpoch] basis. Never reset, so it can never match again once
+  /// it has moved.
+  int get secretEpoch => storedBasis?.secretEpoch ?? 0;
+
+  /// Canonical form of the credential secret and its authorization policy:
+  /// a committed change of it moves the durable [secretEpoch]. Never logged.
+  String get secretFingerprint {
+    final Map<String, dynamic> j = toJson();
+    return jsonEncode(<String, dynamic>{
+      'pinHash': j['pinHash'],
+      'patternHash': j['patternHash'],
+      'primaryAuthType': j['primaryAuthType'],
+      'pinLength': j['pinLength'],
+      'maxFailedAttempts': j['maxFailedAttempts'],
+      'lockoutDurationSeconds': j['lockoutDurationSeconds'],
+    });
+  }
+
+  /// This value with [basis]'s [storedBasis]: used to REPLACE a document
+  /// wholesale (Clear All) while still conditioning the write on the exact
+  /// document that was read. [newCredentialEpoch] forces the epoch move.
+  SecuritySettings rebasedOn(
+    SecuritySettings basis, {
+    bool newCredentialEpoch = false,
+  }) =>
+      _withBasis(basis.storedBasis, newCredentialEpoch: newCredentialEpoch);
+
+  /// Attaches the storage basis (repository use only).
+  SecuritySettings withStoredBasis(StoredSettingsBasis basis) =>
+      _withBasis(basis);
+
+  SecuritySettings _withBasis(
+    StoredSettingsBasis? basis, {
+    bool newCredentialEpoch = false,
+  }) =>
+      SecuritySettings(
+        pinHash: pinHash,
+        patternHash: patternHash,
+        biometricOptions: biometricOptions,
+        primaryAuthType: primaryAuthType,
+        intruderSelfieEnabled: intruderSelfieEnabled,
+        breakInAlertsEnabled: breakInAlertsEnabled,
+        stealthModeEnabled: stealthModeEnabled,
+        uninstallProtectionEnabled: uninstallProtectionEnabled,
+        maxFailedAttempts: maxFailedAttempts,
+        lockoutDuration: lockoutDuration,
+        unlockSessionWindow: unlockSessionWindow,
+        failedAttempts: failedAttempts,
+        lockedOutUntil: lockedOutUntil,
+        pinLength: pinLength,
+        lockoutStreak: lockoutStreak,
+        randomizedKeypadEnabled: randomizedKeypadEnabled,
+        patternVisibilityEnabled: patternVisibilityEnabled,
+        storedBasis: basis,
+        startsNewCredentialEpoch: newCredentialEpoch,
+      );
+
   /// True once a PIN credential exists (the original primary secret).
   bool get hasPin => pinHash != null;
 
@@ -156,6 +260,7 @@ class SecuritySettings {
           randomizedKeypadEnabled ?? this.randomizedKeypadEnabled,
       patternVisibilityEnabled:
           patternVisibilityEnabled ?? this.patternVisibilityEnabled,
+      storedBasis: storedBasis,
     );
   }
 
@@ -232,4 +337,41 @@ class SecuritySettings {
       'pattern=${hasPattern ? 'set' : 'not set'}, '
       'primary=${primaryAuthType?.name ?? 'none'}, '
       'intruderSelfie=$intruderSelfieEnabled, stealth=$stealthModeEnabled)';
+}
+
+/// P13/M3 NF-NS-1: identity of one durable settings document.
+///
+/// [raw] is the exact stored string (ciphertext in production) the value
+/// was decoded from; the repository's compare-and-set uses it as the
+/// expected value. [revision] strictly increases on every committed write
+/// and [credentialEpoch] on every committed credential-set change; neither
+/// is ever reset. Never persisted on its own and never logged.
+final class StoredSettingsBasis {
+  const StoredSettingsBasis({
+    required this.raw,
+    required this.revision,
+    required this.credentialEpoch,
+    required this.credentialFingerprint,
+    required this.secretEpoch,
+    required this.secretFingerprint,
+  });
+
+  final String raw;
+  final int revision;
+  final int credentialEpoch;
+
+  /// Owner decision 1b: epoch of the credential secret + authorization
+  /// policy only (see [SecuritySettings.secretEpoch]).
+  final int secretEpoch;
+
+  /// Canonical form of the stored credential secret + policy.
+  final String secretFingerprint;
+
+  /// Canonical form of the stored credential set (hashes, biometric
+  /// options, primary method, PIN length); a change bumps the epoch.
+  final String credentialFingerprint;
+
+  @override
+  String toString() => 'StoredSettingsBasis(rev=$revision, '
+      'credEpoch=$credentialEpoch, secEpoch=$secretEpoch)';
 }

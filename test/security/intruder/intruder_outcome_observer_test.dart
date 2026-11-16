@@ -11,6 +11,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/security/credentials/verified_attempt.dart';
 import 'package:smart_app_lock/security/encryption/settings_cipher.dart';
 import 'package:smart_app_lock/security/encryption/settings_cipher_impl.dart';
@@ -665,5 +666,18 @@ class _CountDb extends InMemoryLocalDatabase {
   Future<void> setSetting(String key, String value) {
     calls++;
     return super.setSetting(key, value);
+  }
+
+  // P13/M3 NF-NS-1: settings writes are compare-and-set now; the same
+  // interception applies to them (CAS-G2: never inherit an un-intercepted
+  // CAS).
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    calls++;
+    return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 }

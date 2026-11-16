@@ -20,6 +20,20 @@ import '../security_settings_repository.dart';
 /// only the PBKDF2 [PinHash] (see `security/pin_hasher.dart`), and that
 /// document is encrypted with a master key that lives exclusively in the
 /// Android Keystore-backed [SecretStore].
+///
+/// P13/M3 NF-NS-1: every save is a compare-and-set
+/// ([LocalDatabase.compareAndSetSetting]) against the exact stored string the
+/// caller's value was read from ([SecuritySettings.storedBasis]), so a writer
+/// holding an older document — another manager, engine or process — can
+/// never overwrite a newer one. The document envelope adds three keys next
+/// to [SecuritySettings.toJson]: `_schema` (2), `_rev` (strictly increasing
+/// per committed write) and `_credEpoch` (strictly increasing per committed
+/// credential-set change). Neither counter is ever reset, so equal stored
+/// strings imply the same committed write (anti-ABA, even in plaintext test
+/// mode). Older builds ignore the extra keys; a document without them reads
+/// as revision 0 / epoch 0 / schema 1 and is migrated by its next commit
+/// (lazy, in the same atomic write). Encryption happens before the single
+/// compare-and-set statement: no transaction or lock is held across it.
 class SecuritySettingsRepositoryImpl implements SecuritySettingsRepository {
   SecuritySettingsRepositoryImpl(
     this._database, {
@@ -28,6 +42,18 @@ class SecuritySettingsRepositoryImpl implements SecuritySettingsRepository {
 
   static const String _storageKey = 'security_settings';
   static const String _encryptedPrefix = 'enc:v1:';
+
+  /// Envelope keys (never produced by [SecuritySettings.toJson]).
+  static const String revisionKey = '_rev';
+  static const String credentialEpochKey = '_credEpoch';
+
+  /// Owner decision 1b: durable credential-SECRET epoch (grant binding).
+  static const String secretEpochKey = '_secEpoch';
+  static const String schemaKey = '_schema';
+
+  /// Schema written by this build. A stored document with a higher schema
+  /// is never decoded as defaults and never overwritten.
+  static const int schemaVersion = 2;
 
   final LocalDatabase _database;
   final SettingsCipher? _cipher;
@@ -59,9 +85,31 @@ class SecuritySettingsRepositoryImpl implements SecuritySettingsRepository {
       }
 
       final Map<String, dynamic> json =
-          jsonDecode(jsonText) as Map<String, dynamic>;
+          (jsonDecode(jsonText) as Map<String, dynamic>).cast<String, dynamic>();
+      final int schema = json[schemaKey] as int? ?? 1;
+      if (schema > schemaVersion) {
+        return Result.failure(UnsupportedSettingsSchema(schema));
+      }
+      final int revision = json[revisionKey] as int? ?? 0;
+      final int epoch = json[credentialEpochKey] as int? ?? 0;
+      final int secretEpoch = json[secretEpochKey] as int? ?? 0;
+      if (revision < 0 || epoch < 0 || secretEpoch < 0 || schema < 1) {
+        return Result.failure(
+          const FormatException('Corrupt settings revision fields.'),
+        );
+      }
+      final SecuritySettings settings = SecuritySettings.fromJson(json);
       return Result.success(
-        SecuritySettings.fromJson(json.cast<String, dynamic>()),
+        settings.withStoredBasis(
+          StoredSettingsBasis(
+            raw: raw,
+            revision: revision,
+            credentialEpoch: epoch,
+            credentialFingerprint: settings.credentialFingerprint,
+            secretEpoch: secretEpoch,
+            secretFingerprint: settings.secretFingerprint,
+          ),
+        ),
       );
     } catch (e) {
       // Includes tamper-detection failures from the cipher (GCM auth).
@@ -71,17 +119,67 @@ class SecuritySettingsRepositoryImpl implements SecuritySettingsRepository {
 
   @override
   Future<Result<void>> saveSettings(SecuritySettings settings) async {
+    final StoredSettingsBasis? basis = settings.storedBasis;
+    final String stored;
     try {
-      final String json = jsonEncode(settings.toJson());
+      final String fingerprint = settings.credentialFingerprint;
+      final String basisFingerprint = basis?.credentialFingerprint ??
+          SecuritySettings.defaults.credentialFingerprint;
+      final Map<String, dynamic> document = <String, dynamic>{
+        ...settings.toJson(),
+        schemaKey: schemaVersion,
+        revisionKey: (basis?.revision ?? 0) + 1,
+        credentialEpochKey: (basis?.credentialEpoch ?? 0) +
+            (fingerprint == basisFingerprint &&
+                    !settings.startsNewCredentialEpoch
+                ? 0
+                : 1),
+        secretEpochKey: (basis?.secretEpoch ?? 0) +
+            (settings.secretFingerprint ==
+                        (basis?.secretFingerprint ??
+                            SecuritySettings.defaults.secretFingerprint) &&
+                    !settings.startsNewCredentialEpoch
+                ? 0
+                : 1),
+      };
+      final String json = jsonEncode(document);
       final SettingsCipher? cipher = _cipher;
-      final String stored = cipher == null
+      stored = cipher == null
           ? json // only used by legacy/plaintext tests — production always encrypts
           : '$_encryptedPrefix${await cipher.encryptString(json)}';
-      await _database.setSetting(_storageKey, stored);
-      return Result.success(null);
     } catch (e) {
-      return Result.failure(e);
+      return Result.failure(e); // nothing was written
     }
+
+    final CasOutcome outcome;
+    try {
+      // ONE statement; a value never read from storage (no basis) may only
+      // create the document (insert-if-absent), never replace one.
+      outcome = await _database.compareAndSetSetting(
+        _storageKey,
+        expected: basis?.raw,
+        next: stored,
+      );
+    } on CasUnknownOutcome catch (unknown) {
+      return _reconcile(stored, SettingsWriteUnknown(unknown.code.name));
+    } catch (e) {
+      // Any other storage error is ambiguous too: confirm by one read.
+      return _reconcile(stored, e);
+    }
+    return outcome == CasOutcome.committed
+        ? Result.success(null)
+        : Result.failure(const SettingsWriteConflict());
+  }
+
+  /// [stored] is unique (strictly increasing revision, fresh cipher nonce),
+  /// so finding it durable proves THIS write landed; anything else stays a
+  /// failure (never reported as saved).
+  Future<Result<void>> _reconcile(String stored, Object error) async {
+    final CasReconciliation r =
+        await reconcileCompareAndSet(_database, _storageKey, stored);
+    return r == CasReconciliation.confirmedCommitted
+        ? Result.success(null)
+        : Result.failure(error);
   }
 
   @override

@@ -21,6 +21,7 @@ import 'package:smart_app_lock/data/models/app_security_level.dart';
 import 'package:smart_app_lock/data/models/protected_app.dart';
 import 'package:smart_app_lock/data/repositories/impl/lock_settings_repository_impl.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/design_system/design_system.dart';
 import 'package:smart_app_lock/protection/health/protection_health_engine.dart';
 import 'package:smart_app_lock/protection/health/protection_health_monitor.dart';
@@ -82,6 +83,21 @@ class _Db extends InMemoryLocalDatabase {
     final Object? error = settingWriteError;
     if (error != null) return Future<void>.error(error);
     return super.setSetting(key, value);
+  }
+
+  // P13/M3 NF-NS-1: settings writes are compare-and-set now; the same
+  // interception applies to them (CAS-G2: never inherit an un-intercepted
+  // CAS).
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    settingWrites++;
+    final Object? error = settingWriteError;
+    if (error != null) throw error;
+    return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 
   @override
