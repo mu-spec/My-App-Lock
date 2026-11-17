@@ -2,18 +2,27 @@ package com.smartapplock.app
 
 import android.content.ComponentName
 import android.content.Context
+import android.os.Build
+import android.os.Process
 import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import java.lang.ref.WeakReference
 
 /**
- * Phase 14 / M1: notification privacy foundation (user-granted Notification
- * access). M1 only tracks the binding and unbinds itself when no protected
- * app has privacy on (data minimization). It does not inspect, remove or
- * post notifications; the privacy modes act from M2.
+ * Phase 14: notification privacy (user-granted Notification access).
  *
- * Nothing about any notification is stored or logged here.
+ * M1: tracks the binding and unbinds itself when no protected app has privacy
+ * on (data minimization).
+ * M2: hands notification METADATA to [NotificationPrivacyEngine], which
+ * removes eligible originals and shows neutral placeholders.
+ *
+ * Only `key`, `packageName`, `notification.flags`, `user` and (for Smart App
+ * Lock's own notifications only) `tag` are read. Nothing about any
+ * notification is stored or logged here.
  */
 class SalNotificationListenerService : NotificationListenerService() {
+    private val engine by lazy { NotificationPrivacyEngine(Port(this)) }
+
     override fun onListenerConnected() {
         super.onListenerConnected()
         instance = WeakReference(this)
@@ -22,15 +31,86 @@ class SalNotificationListenerService : NotificationListenerService() {
             try {
                 requestUnbind()
             } catch (_: Exception) {
-                // Stays bound; harmless (M1 performs no action).
+                // Stays bound; the engine still decides per notification.
             }
         }
+        guard { engine.onConnected(activeMetadata()) }
     }
 
     override fun onListenerDisconnected() {
         connected = false
         instance = null
+        guard { engine.onDisconnected() }
         super.onListenerDisconnected()
+    }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        if (sbn == null) return
+        guard { engine.onPosted(metadata(sbn)) }
+    }
+
+    /** API 24-25 (no removal reason). On API 26+ the 3-argument overload
+     * below is called instead (it does not call super). */
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        if (sbn == null) return
+        guard { engine.onRemoved(metadata(sbn), NotificationPrivacyEngine.removalCause(Build.VERSION.SDK_INT, null)) }
+    }
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification?, rankingMap: RankingMap?, reason: Int) {
+        if (sbn == null) return
+        guard { engine.onRemoved(metadata(sbn), NotificationPrivacyEngine.removalCause(Build.VERSION.SDK_INT, reason)) }
+    }
+
+    private fun metadata(sbn: StatusBarNotification): NotificationPrivacyEngine.Posted {
+        val own = sbn.packageName == packageName
+        return NotificationPrivacyEngine.Posted(
+            key = sbn.key,
+            packageName = sbn.packageName,
+            flags = sbn.notification?.flags ?: 0,
+            sameUser = sbn.user == Process.myUserHandle(),
+            tag = if (own) sbn.tag else null,
+        )
+    }
+
+    private fun activeMetadata(): List<NotificationPrivacyEngine.Posted> = try {
+        activeNotifications?.map(::metadata) ?: emptyList()
+    } catch (_: Exception) {
+        emptyList()
+    }
+
+    private inline fun guard(block: () -> Unit) {
+        try {
+            block()
+        } catch (_: Exception) {
+            // Never crash the listener; nothing is logged (privacy).
+        }
+    }
+
+    private class Port(private val service: SalNotificationListenerService) : NotificationPrivacyEngine.Port {
+        override fun state() = NotificationPrivacyStore.state(service)
+
+        override fun placeholderTag(packageName: String) =
+            NotificationPrivacyEngine.placeholderTag(NotificationPrivacyStore.placeholderSalt(service), packageName)
+
+        override fun appLabel(packageName: String): String? = try {
+            val pm = service.packageManager
+            pm.getApplicationLabel(pm.getApplicationInfo(packageName, 0)).toString()
+        } catch (_: Exception) {
+            null
+        }
+
+        override fun canPostPlaceholders(mode: NotificationPrivacyPolicy.Mode) =
+            NotificationPlaceholders.canPost(service, mode)
+
+        override fun cancelSource(key: String): Boolean = try {
+            service.cancelNotification(key)
+            true
+        } catch (_: Exception) {
+            false
+        }
+
+        override fun postPlaceholder(placeholder: NotificationPrivacyEngine.Placeholder) =
+            NotificationPlaceholders.post(service, placeholder)
     }
 
     companion object {
@@ -44,14 +124,18 @@ class SalNotificationListenerService : NotificationListenerService() {
         fun component(context: Context): ComponentName =
             ComponentName(context, SalNotificationListenerService::class.java)
 
-        /** Re-evaluates the binding after the configuration changed. */
+        /** Re-evaluates the binding and the active notifications after the
+         * configuration changed. */
         fun refreshBinding(context: Context) {
             val wanted = NotificationPrivacyPolicy.listenerWanted(NotificationPrivacyStore.state(context))
             try {
+                val service = instance?.get()
                 if (wanted && !connected) {
                     requestRebind(component(context))
                 } else if (!wanted && connected) {
-                    instance?.get()?.requestUnbind()
+                    service?.requestUnbind()
+                } else if (wanted && service != null) {
+                    service.guard { service.engine.onConfigurationChanged(service.activeMetadata()) }
                 }
             } catch (_: Exception) {
                 // Access not granted or the service is not ready: nothing to do.

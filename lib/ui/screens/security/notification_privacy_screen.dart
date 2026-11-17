@@ -1,4 +1,6 @@
 // Phase 14 / M1 — per-app notification privacy for protected apps.
+// Phase 14 / M2 — the modes act (native): Android's limits are stated, and a
+// warning appears when placeholders cannot be shown.
 //
 // Viewing needs no verification (no notification content is ever shown).
 // Making a protected app's notifications MORE private needs nothing;
@@ -26,8 +28,20 @@ abstract final class NotificationPrivacyText {
       'Choose how protected apps\u2019 notifications appear';
   static const String intro =
       'Choose how notifications from each protected app appear. Smart App '
-      'Lock only checks which app sent a notification. Notification content '
-      'is never stored, logged or sent anywhere.';
+      'Lock only checks which app sent a notification and whether Android '
+      'lets it be removed. Notification content is never read, stored, '
+      'logged or sent anywhere.';
+  static const String limits =
+      'Android shows a notification before Smart App Lock can replace it, so '
+      'it may briefly appear, sound or reach a connected watch. Ongoing '
+      'notifications (calls, music, downloads, running services) can\u2019t '
+      'be hidden. For the strongest protection, also restrict the app in '
+      'Android\u2019s notification settings.';
+  static const String placeholdersBlocked =
+      'Smart App Lock can\u2019t show notifications. Hidden notifications are '
+      'removed without a placeholder, so you won\u2019t see that they '
+      'arrived.';
+  static const String allowPlaceholders = 'Allow Smart App Lock notifications';
   static const String accessTitle = 'Notification access';
   static const String accessGranted = 'Allowed';
   static const String accessMissing = 'Not allowed';
@@ -117,6 +131,14 @@ class _NotificationPrivacyScreenState extends State<NotificationPrivacyScreen>
     if (!ok && mounted) _say(NotificationPrivacyText.couldNotOpen);
   }
 
+  Future<void> _openOwnSettings() async {
+    final bool ok =
+        (await _c.notificationPrivacyService.openOwnNotificationSettings())
+                .valueOrNull ==
+            true;
+    if (!ok && mounted) _say(NotificationPrivacyText.couldNotOpen);
+  }
+
   Future<void> _openAndroidSettings(String packageName) async {
     final bool ok = (await _c.notificationPrivacyService
                 .openAppNotificationSettings(packageName))
@@ -196,7 +218,33 @@ class _NotificationPrivacyScreenState extends State<NotificationPrivacyScreen>
               padding: const EdgeInsets.all(DsSpacing.lg),
               children: <Widget>[
                 const Text(NotificationPrivacyText.intro),
+                const SizedBox(height: DsSpacing.sm),
+                const Text(NotificationPrivacyText.limits,
+                    key: Key('np_limits')),
                 const SizedBox(height: DsSpacing.md),
+                if (v.status != null &&
+                    v.status!.accessGranted &&
+                    !v.status!.placeholdersAllowed &&
+                    v.apps.any((ProtectedApp a) =>
+                        v.settings.modeFor(a.packageName) !=
+                        NotificationPrivacyMode.off)) ...<Widget>[
+                  DsCard(
+                    key: const Key('np_placeholders_blocked'),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        const Text(NotificationPrivacyText.placeholdersBlocked),
+                        TextButton(
+                          key: const Key('np_allow_placeholders'),
+                          onPressed: _busy ? null : _openOwnSettings,
+                          child: const Text(
+                              NotificationPrivacyText.allowPlaceholders),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: DsSpacing.md),
+                ],
                 if (!v.writable) ...<Widget>[
                   const Text(NotificationPrivacyText.unavailable,
                       key: Key('np_unavailable')),

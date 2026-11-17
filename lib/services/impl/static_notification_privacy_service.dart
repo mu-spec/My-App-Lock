@@ -7,6 +7,8 @@ class StaticNotificationPrivacyService implements NotificationPrivacyService {
   StaticNotificationPrivacyService({this.accessGranted = false});
 
   bool accessGranted;
+  bool placeholdersAllowed = true;
+  int ownSettingsOpened = 0;
   bool failConfigure = false;
   bool failStatus = false;
 
@@ -27,6 +29,7 @@ class StaticNotificationPrivacyService implements NotificationPrivacyService {
       listenerConnected: accessGranted && (native?.isNotEmpty ?? false),
       storeInvalid: false,
       configuredCount: native?.length ?? 0,
+      placeholdersAllowed: placeholdersAllowed,
     ));
   }
 
@@ -51,6 +54,12 @@ class StaticNotificationPrivacyService implements NotificationPrivacyService {
   @override
   Future<Result<bool>> openAppNotificationSettings(String packageName) async {
     appSettingsOpened.add(packageName);
+    return Result.success(true);
+  }
+
+  @override
+  Future<Result<bool>> openOwnNotificationSettings() async {
+    ownSettingsOpened++;
     return Result.success(true);
   }
 }

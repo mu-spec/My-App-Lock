@@ -1,6 +1,8 @@
 package com.smartapplock.app
 
 import android.content.Context
+import android.util.Base64
+import java.security.SecureRandom
 
 /**
  * Phase 14 / M1: native copy of the per-app notification privacy modes so
@@ -40,6 +42,30 @@ object NotificationPrivacyStore {
         }
     } catch (_: Exception) {
         Snapshot(emptyMap(), invalid = true)
+    }
+
+    private const val KEY_SALT = "placeholder_salt"
+
+    /**
+     * Phase 14 / M2: random per-install salt for the opaque placeholder tags
+     * ([NotificationPrivacyEngine.placeholderTag]). Not a secret credential;
+     * it only keeps other notification listeners from mapping a placeholder
+     * tag back to an app.
+     */
+    @Synchronized
+    fun placeholderSalt(context: Context): ByteArray {
+        val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        preferences.getString(KEY_SALT, null)?.let { stored ->
+            try {
+                val bytes = Base64.decode(stored, Base64.NO_WRAP)
+                if (bytes.size == 16) return bytes
+            } catch (_: Exception) {
+                // Replaced below (tags are not persisted anywhere else).
+            }
+        }
+        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        preferences.edit().putString(KEY_SALT, Base64.encodeToString(salt, Base64.NO_WRAP)).commit()
+        return salt
     }
 
     fun state(context: Context): NotificationPrivacyPolicy.State {

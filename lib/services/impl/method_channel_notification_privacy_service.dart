@@ -59,4 +59,9 @@ class MethodChannelNotificationPrivacyService
             <String, Object?>{'packageName': packageName},
           ) ??
           false);
+
+  @override
+  Future<Result<bool>> openOwnNotificationSettings() => _guard(() async =>
+      await _channel.invokeMethod<bool>('openOwnNotificationSettings') ??
+      false);
 }

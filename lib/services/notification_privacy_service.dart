@@ -8,6 +8,7 @@ final class NotificationPrivacyStatus {
     required this.listenerConnected,
     required this.storeInvalid,
     required this.configuredCount,
+    this.placeholdersAllowed = false,
   });
 
   static const NotificationPrivacyStatus unknown = NotificationPrivacyStatus(
@@ -29,6 +30,11 @@ final class NotificationPrivacyStatus {
   /// Apps with a mode other than Off in the native copy.
   final int configuredCount;
 
+  /// M2: Smart App Lock may show its placeholders (notification permission,
+  /// app notifications and the placeholder channels allowed). When false,
+  /// hidden notifications are removed WITHOUT a placeholder. Unknown = false.
+  final bool placeholdersAllowed;
+
   factory NotificationPrivacyStatus.fromMap(Map<dynamic, dynamic> m) =>
       NotificationPrivacyStatus(
         accessGranted: m['accessGranted'] == true,
@@ -36,6 +42,7 @@ final class NotificationPrivacyStatus {
         storeInvalid: m['storeInvalid'] == true,
         configuredCount:
             m['configuredCount'] is int ? m['configuredCount'] as int : 0,
+        placeholdersAllowed: m['placeholdersAllowed'] == true,
       );
 }
 
@@ -53,4 +60,8 @@ abstract interface class NotificationPrivacyService {
   /// Fallback: opens Android's own notification settings for a protected
   /// app. Native refuses packages that are not protected.
   Future<Result<bool>> openAppNotificationSettings(String packageName);
+
+  /// M2: opens Smart App Lock's own notification settings so placeholders
+  /// can be allowed.
+  Future<Result<bool>> openOwnNotificationSettings();
 }

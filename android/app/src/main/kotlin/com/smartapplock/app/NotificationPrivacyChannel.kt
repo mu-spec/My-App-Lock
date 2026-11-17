@@ -30,6 +30,7 @@ object NotificationPrivacyChannel {
                             result.success(mapOf("applied" to applied, "count" to (modes?.size ?: 0)))
                         }
                         "openAccessSettings" -> result.success(openAccessSettings(activity))
+                        "openOwnNotificationSettings" -> result.success(openOwnNotificationSettings(activity))
                         "openAppNotificationSettings" -> result.success(
                             openAppNotificationSettings(activity, call.argument<String>("packageName")),
                         )
@@ -48,6 +49,9 @@ object NotificationPrivacyChannel {
             "listenerConnected" to SalNotificationListenerService.connected,
             "storeInvalid" to snapshot.invalid,
             "configuredCount" to snapshot.modes.size,
+            // M2: placeholders can be shown (POST_NOTIFICATIONS, app
+            // notifications and both placeholder channels enabled).
+            "placeholdersAllowed" to NotificationPlaceholders.canPost(context, null),
         )
     }
 
@@ -81,6 +85,35 @@ object NotificationPrivacyChannel {
                 return true
             } catch (_: Exception) {
                 // Try the next allowlisted screen.
+            }
+        }
+        return false
+    }
+
+    /** M2: Smart App Lock's own notification settings (to allow placeholders). */
+    private fun openOwnNotificationSettings(activity: MainActivity): Boolean =
+        startFirst(activity, appNotificationSettingsIntents(activity.packageName))
+
+    private fun appNotificationSettingsIntents(pkg: String): List<Intent> = buildList {
+        if (Build.VERSION.SDK_INT >= 26) {
+            add(
+                Intent(ProtectionSettingsTargets.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(ProtectionSettingsTargets.EXTRA_APP_PACKAGE, pkg),
+            )
+        }
+        add(
+            Intent(ProtectionSettingsTargets.ACTION_APPLICATION_DETAILS_SETTINGS)
+                .setData(Uri.fromParts("package", pkg, null)),
+        )
+    }
+
+    private fun startFirst(activity: MainActivity, attempts: List<Intent>): Boolean {
+        for (intent in attempts) {
+            try {
+                activity.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                return true
+            } catch (_: Exception) {
+                // Fall back to App info.
             }
         }
         return false
