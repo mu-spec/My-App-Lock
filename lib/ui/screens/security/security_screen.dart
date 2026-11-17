@@ -19,6 +19,7 @@ import '../../../services/capability_monitor.dart';
 import '../../../services/installed_apps_service.dart';
 import '../../../services/overlay_lock_service.dart';
 import '../../../utilities/result.dart';
+import '../../widgets/secure_storage_unavailable.dart';
 import 'app_credential_verification.dart';
 import 'intruder_settings_screen.dart';
 import 'security_center_section.dart';
@@ -143,6 +144,8 @@ class _SecurityScreenState extends State<SecurityScreen>
   bool? _randomized;
   bool? _patternVisible;
   bool _hasPin = false;
+  // F-KEY-1 G-7: the last credential-state read failed.
+  bool _credentialUnavailable = false;
   bool _hasPattern = false;
   bool _biometricEnrolled = false;
 
@@ -269,8 +272,17 @@ class _SecurityScreenState extends State<SecurityScreen>
     final PreferencesStore preferences = container.preferences;
     final LockSettingsRepository lockSettings = container.lockSettings;
 
-    final state = (await auth.status()).valueOrNull;
-    if (!mounted || state == null) {
+    final Result<CredentialState> statusResult = await auth.status();
+    if (!mounted) {
+      return;
+    }
+    // F-KEY-1 G-7: an unreadable credential state is shown as such (never
+    // as "no PIN / no pattern").
+    if (_credentialUnavailable != statusResult.isFailure) {
+      setState(() => _credentialUnavailable = statusResult.isFailure);
+    }
+    final CredentialState? state = statusResult.valueOrNull;
+    if (state == null) {
       return;
     }
     // Phase 4B: usage-access capability state, read from the SAME shared
@@ -795,13 +807,18 @@ class _SecurityScreenState extends State<SecurityScreen>
       return;
     }
 
-    final state = (await auth.status()).valueOrNull;
+    final Result<CredentialState> statusResult = await auth.status();
+    final CredentialState? state = statusResult.valueOrNull;
     if (state == null || !state.hasAnyCredential) {
       if (!mounted) {
         return;
       }
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Set up a PIN or pattern first.')),
+        SnackBar(
+          content: Text(statusResult.isFailure
+              ? SecureStorageUnavailableText.message
+              : 'Set up a PIN or pattern first.'),
+        ),
       );
       return;
     }
@@ -930,6 +947,10 @@ class _SecurityScreenState extends State<SecurityScreen>
             ),
           ),
           const SizedBox(height: DsSpacing.lg),
+          if (_credentialUnavailable) ...<Widget>[
+            const SecureStorageUnavailableBanner(),
+            const SizedBox(height: DsSpacing.lg),
+          ],
           SecurityCenterSection(
             isActive: widget.isActive,
             onNavigate: widget.onNavigate,

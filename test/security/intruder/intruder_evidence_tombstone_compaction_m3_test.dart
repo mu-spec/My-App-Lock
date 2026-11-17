@@ -358,16 +358,21 @@ void main() {
     });
 
     for (final Object bad in <Object>[-2, 'x', 1.5]) {
-      test('invalid hw ($bad) is quarantined, never trusted', () async {
+      // F-KEY-1 G-3: formerly "quarantined"; now unreadable and untouched.
+      test('invalid hw ($bad) is never trusted: unreadable, kept '
+          'byte-identical, never quarantined or replaced', () async {
         final IntruderEvidenceStore s = open();
         await writeRaw(<String, Object?>{
           'v': 1,
           'items': const <Object?>[],
           'hw': bad,
         });
+        final String? raw = await db.getSetting(IntruderEvidenceStore.indexKey);
         expect(await s.list(), isEmpty);
+        expect(await s.health(), EvidenceIndexHealth.unreadable);
+        expect(await db.getSetting(IntruderEvidenceStore.indexKey), raw);
         expect(await db.getSetting(IntruderEvidenceStore.quarantineKey),
-            isNotNull);
+            isNull);
       });
     }
   });

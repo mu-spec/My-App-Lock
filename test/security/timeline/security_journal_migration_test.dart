@@ -332,10 +332,29 @@ void main() {
         return (c, bad);
       }
 
+      // FLIPPED (F-KEY-1 Batch 1; previously "quarantine empty: quarantined
+      // first, reinitialized with journalRecovered"): a GCM failure is
+      // indistinguishable from an unavailable/wrong master key, so the row
+      // is UNREADABLE and keeps its exact bytes even with an empty slot.
       test(
-          'quarantine empty: quarantined first, reinitialized with '
-          'journalRecovered', () async {
+          'quarantine empty: GCM tamper is unreadable — neither quarantined '
+          'nor reinitialized (F-KEY-1 Batch 1)', () async {
         final (SettingsCipher c, String bad) = await tampered();
+        final SecurityEventJournal j = journal(cipher: c);
+        await j.startup();
+        await j.idle();
+        expect(await db.getSetting(_key), bad);
+        expect(await db.getSetting(_qKey), isNull);
+        expect(j.quarantinedCorruptJournal, isFalse);
+        expect(j.health, SecurityJournalHealth.storageError);
+      });
+
+      test(
+          'decryptable but unparsable (key proven) with quarantine empty: '
+          'quarantined first, reinitialized with journalRecovered', () async {
+        final SettingsCipher c = AesGcmSettingsCipher(InMemorySecretStore());
+        final String bad = 'enc:v1:${await c.encryptString('not json')}';
+        await db.setSetting(_key, bad);
         final SecurityEventJournal j = journal(cipher: c);
         await j.startup();
         await j.idle();

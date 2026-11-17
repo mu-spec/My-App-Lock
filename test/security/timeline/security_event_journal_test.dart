@@ -286,7 +286,12 @@ void main() {
       expect(d.events.single.type, SecurityJournalEventType.journalRecovered);
     });
 
-    test('GCM-tampered row is corrupt (A1-3)', () async {
+    // FLIPPED (F-KEY-1 Batch 1; previously A1-3 "GCM-tampered row is
+    // corrupt" -> quarantine + journalRecovered): a GCM failure is
+    // indistinguishable from an unavailable/wrong key, so the row is
+    // UNREADABLE: never quarantined, never replaced.
+    test('GCM-tampered row is unreadable, never corrupt (A1-3 flipped)',
+        () async {
       await journal().read();
       final String raw = (await db.getSetting(_key))!;
       final String flipped = raw.substring(0, raw.length - 3) +
@@ -295,9 +300,29 @@ void main() {
       await db.setSetting(_key, flipped);
       final SecurityEventJournal j = journal();
       await j.startup();
-      expect(await db.getSetting(_qKey), flipped);
-      expect((await stored()).events.single.type,
-          SecurityJournalEventType.journalRecovered);
+      expect(await db.getSetting(_key), flipped, reason: 'bytes untouched');
+      expect(await db.getSetting(_qKey), isNull);
+      expect(j.health, SecurityJournalHealth.storageError);
+      expect(j.quarantinedCorruptJournal, isFalse);
+    });
+
+    test(
+        'NF-B1-1 record(type) with a field-requiring type is lost, never '
+        'stored; the stored journal stays decodable', () async {
+      final SecurityEventJournal j = journal();
+      await j.startup();
+      await j.idle();
+      final int lostBefore = (await j.read()).lost; // creates the journal
+      final String? before = await db.getSetting(_key);
+      expect(before, isNotNull);
+      j.record(SecurityJournalEventType.protectionHealth);
+      await j.idle();
+      expect(await db.getSetting(_key), before);
+      expect((await j.read()).lost, lostBefore + 1);
+      final SecurityEventJournal fresh = journal();
+      await fresh.startup();
+      expect(fresh.health, SecurityJournalHealth.ok);
+      expect(await db.getSetting(_qKey), isNull);
     });
 
     test('only the FIRST corrupt value is quarantined (bounded)', () async {

@@ -1,25 +1,21 @@
-// P13/M3 F-KEY-1 — NEW findings F-KEY-1f / F-KEY-1g (OPEN). Host,
-// SIMULATED: in-memory DB + in-memory secret store; not Android, not device
-// QA. These tests assert the CURRENT UNSAFE behaviour and must FLIP (never be
-// deleted) once the repair is approved and implemented.
+// P13/M3 F-KEY-1f / F-KEY-1g — FLIPPED by Stage A (owner decisions G-3,
+// G-4). Host, SIMULATED (in-memory DB + secret store; not Android).
 //
-// Every encrypted store maps "the cipher could not decrypt" (wrong key, or
-// the key read THROWING) to CORRUPT, not to "unreadable". The corrupt paths
-// were designed for genuinely damaged bytes; under F-KEY-1 the bytes are
-// intact and would decrypt once the right key is back.
+// The ORIGINAL reproducers (asserting the destructive behaviour at
+// 2735356 + P1) are preserved unchanged as historical evidence in
+// Phase13/m3_implementation/E_feature_resumption/F_KEY_1/tests/ with their
+// run log. Here the same IDs assert the repaired, preserving behaviour:
+//  FK-S1  evidence: an undecryptable index (wrong key / key read throws) is
+//         UNREADABLE: index + every blob byte-identical, no quarantine write,
+//         no sweep; the right key recovers every photo.
+//  FK-S2  failure log: occupied quarantine -> overwrite REFUSED; both rows
+//         byte-identical; the record is a counted drop, never notified.
+//  FK-S3  journal: occupied quarantine -> overwrite REFUSED.
+//  FK-S4  control (key read throws): log not overwritten (unchanged).
+//  FK-S5/S6  G-4 interrupted repair: a quarantine that already holds the
+//         EXACT bytes allows the repair; a quarantine read failure refuses.
 //
-//  F-KEY-1f: evidence index corrupt -> quarantine (only if the slot is
-//            empty) + index REMOVED + health reported OK/empty; the startup
-//            sweep (AppContainer L174, unawaited) then deletes EVERY evidence
-//            blob as an orphan. A transient key failure at startup destroys
-//            all evidence photos permanently.
-//  F-KEY-1g: failure log / journal corrupt -> quarantine is insert-if-absent;
-//            when a quarantine already exists the intact ciphertext is
-//            OVERWRITTEN by a fresh document (nothing preserves it).
-//
-// The key is pre-initialized here ON PURPOSE (process 1 wrote data); the
-// first-launch race itself is reproduced in
-// p13_m3_f_key_1_open_reproducer_test.dart (FK-R1..R4).
+// F-KEY-1 itself (key race / mint on absent key) stays OPEN: see FK-R*.
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -28,6 +24,7 @@ import 'package:smart_app_lock/security/credentials/auth_result.dart';
 import 'package:smart_app_lock/security/credentials/auth_type.dart';
 import 'package:smart_app_lock/security/credentials/verified_attempt.dart';
 import 'package:smart_app_lock/security/encryption/settings_cipher_impl.dart';
+import 'package:smart_app_lock/security/intruder/failed_attempt_event.dart';
 import 'package:smart_app_lock/security/intruder/intruder_evidence_store.dart';
 import 'package:smart_app_lock/security/intruder/intruder_failure_log_store.dart';
 import 'package:smart_app_lock/security/intruder/intruder_monitor.dart';
@@ -91,13 +88,46 @@ Map<String, String> _blobs(Map<String, String> all) => <String, String>{
         if (e.key.startsWith(IntruderEvidenceStore.blobPrefix)) e.key: e.value,
     };
 
+class _RecordingListener implements IntruderEventListener {
+  final List<String> vids = <String>[];
+  @override
+  void onFailedAttemptRecorded(FailedAttemptEvent event) =>
+      vids.add(event.verificationId);
+  @override
+  void onOwnerVerified() {}
+}
+
+/// Quarantine reads throw (G-4: refuse when preservation can't be proven).
+class _QuarantineReadFaultDb extends InMemoryLocalDatabase {
+  @override
+  Future<String?> getSetting(String key) async {
+    if (key == IntruderFailureLogStore.quarantineKey ||
+        key == SecurityEventJournalStore.quarantineKey) {
+      throw StateError('quarantine read fault');
+    }
+    return super.getSetting(key);
+  }
+}
+
+Future<(InMemoryLocalDatabase, InMemorySecretStore, String)> _seedLog(
+    [InMemoryLocalDatabase? database]) async {
+  final InMemoryLocalDatabase db = database ?? InMemoryLocalDatabase();
+  final InMemorySecretStore secrets = InMemorySecretStore();
+  final IntruderMonitor m1 = IntruderMonitor(
+      store:
+          IntruderFailureLogStore(db, cipher: AesGcmSettingsCipher(secrets)));
+  m1.onVerifiedAttempt(_fail('a'));
+  m1.onVerifiedAttempt(_fail('b'));
+  await m1.idle();
+  return (db, secrets, (await db.getSetting(IntruderFailureLogStore.storageKey))!);
+}
+
 void main() {
   for (final bool throws in <bool>[true, false]) {
     final String mode = throws ? 'key read throws' : 'wrong key';
-    test(
-        'FK-S1 OPEN F-KEY-1f ($mode): startup maintenance deletes the '
-        'evidence index and EVERY evidence blob; unrecoverable even after '
-        'the right key is back', () async {
+    test('FK-S1 FLIPPED F-KEY-1f ($mode): startup maintenance keeps the '
+        'evidence index and every blob byte-identical; the right key '
+        'recovers all evidence', () async {
       final InMemoryLocalDatabase db = InMemoryLocalDatabase();
       final InMemorySecretStore secrets = InMemorySecretStore();
       final IntruderEvidenceStore p1 =
@@ -110,78 +140,70 @@ void main() {
       final String indexBefore =
           (await db.getSetting(IntruderEvidenceStore.indexKey))!;
 
-      // Process 2: master key unavailable / wrong at startup.
       final _KeyFault fault = _KeyFault(secrets, throws: throws);
       final IntruderEvidenceStore p2 =
           IntruderEvidenceStore(db, AesGcmSettingsCipher(fault));
       await p2.startupMaintenance();
+      expect(await p2.health(), EvidenceIndexHealth.unreadable);
+      expect(await p2.list(), isEmpty, reason: 'unreadable, never trusted');
+      expect(await p2.sweepOrphans(), 0);
+      expect(await p2.enforceRetention(), 0);
+      expect(await p2.save(seq: 3, jpeg: jpeg),
+          EvidenceSaveResult.storageFailed);
+      expect(await p2.delete(1), EvidenceDeleteResult.storageFailed);
 
-      // CURRENT UNSAFE behaviour (must flip after the repair):
-      expect(await db.getSetting(IntruderEvidenceStore.indexKey), isNull,
-          reason: 'index removed');
-      expect(_blobs(await db.getAllSettings()), isEmpty,
-          reason: 'every evidence blob swept as an orphan');
-      expect(
-          await db.getSetting(IntruderEvidenceStore.quarantineKey), indexBefore,
-          reason: 'only the index bytes survive (slot was empty)');
+      expect(await db.getSetting(IntruderEvidenceStore.indexKey), indexBefore);
+      expect(_blobs(await db.getAllSettings()), blobsBefore);
+      expect(await db.getSetting(IntruderEvidenceStore.quarantineKey), isNull);
       expect(fault.keyWrites, 0);
 
-      // The right key is back: the photos are gone for good.
       final IntruderEvidenceStore p3 =
           IntruderEvidenceStore(db, AesGcmSettingsCipher(secrets));
-      expect(await p3.list(), isEmpty);
-      expect(await p3.readImage(1), isNull);
-      expect(await p3.readImage(2), isNull);
+      expect((await p3.list()).map((EvidenceItem e) => e.seq), <int>[1, 2]);
+      expect(await p3.readImage(1), isNotNull);
+      expect(await p3.readImage(2), isNotNull);
     });
   }
 
-  test(
-      'FK-S2 OPEN F-KEY-1g (wrong key): with a quarantine already present, '
-      'the intact failure-log ciphertext is overwritten', () async {
-    final InMemoryLocalDatabase db = InMemoryLocalDatabase();
-    final InMemorySecretStore secrets = InMemorySecretStore();
-    final IntruderMonitor m1 = IntruderMonitor(
-        store:
-            IntruderFailureLogStore(db, cipher: AesGcmSettingsCipher(secrets)));
-    m1.onVerifiedAttempt(_fail('a'));
-    m1.onVerifiedAttempt(_fail('b'));
-    await m1.idle();
-    final String good =
-        (await db.getSetting(IntruderFailureLogStore.storageKey))!;
+  test('FK-S2 FLIPPED F-KEY-1g (wrong key): occupied quarantine -> the '
+      'failure-log overwrite is refused; nothing claimed persisted', () async {
+    final (InMemoryLocalDatabase db, InMemorySecretStore secrets, String good) =
+        await _seedLog();
     await db.setSetting(IntruderFailureLogStore.quarantineKey, 'earlier');
 
+    final _RecordingListener l = _RecordingListener();
     final IntruderMonitor m2 = IntruderMonitor(
         store: IntruderFailureLogStore(db,
-            cipher: AesGcmSettingsCipher(_KeyFault(secrets))));
+            cipher: AesGcmSettingsCipher(_KeyFault(secrets))))
+      ..listener = l;
     m2.onVerifiedAttempt(_fail('c'));
     await m2.idle();
 
+    expect(await db.getSetting(IntruderFailureLogStore.storageKey), good);
     expect(
-        await db.getSetting(IntruderFailureLogStore.quarantineKey), 'earlier',
-        reason: 'insert-if-absent: the good bytes were NOT kept');
-    final String now =
-        (await db.getSetting(IntruderFailureLogStore.storageKey))!;
-    expect(now, isNot(good), reason: 'intact ciphertext overwritten');
-    final Map<String, String> all = await db.getAllSettings();
-    expect(all.values.where((String v) => v == good), isEmpty,
-        reason: 'the original bytes exist nowhere any more');
-    // Right key back: events a/b are lost.
-    final IntruderLogRead r =
-        await IntruderFailureLogStore(db, cipher: AesGcmSettingsCipher(secrets))
-            .read();
-    expect(r, isA<IntruderLogCorrupt>(),
-        reason: 'the replacement is under the wrong key; a/b unrecoverable');
+        await db.getSetting(IntruderFailureLogStore.quarantineKey), 'earlier');
+    expect(l.vids, isEmpty, reason: 'never notified');
+    expect(m2.status.droppedFailureRecords, 1);
+    // Batch 1: an undecryptable log is UNREADABLE (never corrupt), so the
+    // corrupt/quarantine path is not even reached.
+    expect(m2.status.corruptUnpreserved, 0);
+    expect(m2.status.health, IntruderMonitorHealth.storageError);
+    expect(await m2.snapshot(), isNull, reason: 'unavailable, not empty');
+    final IntruderLogRead r = await IntruderFailureLogStore(db,
+            cipher: AesGcmSettingsCipher(secrets))
+        .read();
+    expect((r as IntruderLogLoaded).log.events.map((e) => e.verificationId),
+        <String>['a', 'b'], reason: 'right key recovers the history');
   });
 
-  test(
-      'FK-S3 OPEN F-KEY-1g (wrong key): with a quarantine already present, '
-      'journal startup overwrites the intact journal ciphertext', () async {
+  test('FK-S3 FLIPPED F-KEY-1g (wrong key): occupied quarantine -> the '
+      'journal overwrite is refused', () async {
     final InMemoryLocalDatabase db = InMemoryLocalDatabase();
     final InMemorySecretStore secrets = InMemorySecretStore();
     final SecurityEventJournal j1 = SecurityEventJournal(
         store: SecurityEventJournalStore(db,
             cipher: AesGcmSettingsCipher(secrets)));
-    j1.record(SecurityJournalEventType.protectionHealth);
+    j1.record(SecurityJournalEventType.journalRecovered);
     await j1.idle();
     final String good =
         (await db.getSetting(SecurityEventJournalStore.storageKey))!;
@@ -191,36 +213,150 @@ void main() {
         store: SecurityEventJournalStore(db,
             cipher: AesGcmSettingsCipher(_KeyFault(secrets))));
     await j2.startup();
-    j2.record(SecurityJournalEventType.protectionHealth);
+    j2.record(SecurityJournalEventType.journalRecovered);
     await j2.idle();
 
+    expect(await db.getSetting(SecurityEventJournalStore.storageKey), good);
     expect(await db.getSetting(SecurityEventJournalStore.quarantineKey),
         'earlier');
-    final Map<String, String> all = await db.getAllSettings();
-    expect(all.values.where((String v) => v == good), isEmpty,
-        reason: 'intact journal ciphertext overwritten, preserved nowhere');
+    expect(j2.corruptUnpreserved, 0, reason: 'unreadable, never corrupt');
+    expect(j2.health, SecurityJournalHealth.storageError);
+    expect(j2.quarantinedCorruptJournal, isFalse);
   });
 
-  test(
-      'FK-S4 control (key read throws): failure log and journal are NOT '
-      'overwritten (re-encryption also fails); evidence is (FK-S1)', () async {
-    final InMemoryLocalDatabase db = InMemoryLocalDatabase();
-    final InMemorySecretStore secrets = InMemorySecretStore();
-    final IntruderMonitor m1 = IntruderMonitor(
-        store:
-            IntruderFailureLogStore(db, cipher: AesGcmSettingsCipher(secrets)));
-    m1.onVerifiedAttempt(_fail('a'));
-    await m1.idle();
-    final String good =
-        (await db.getSetting(IntruderFailureLogStore.storageKey))!;
+  // R9 FLIPPED (Batch 1). The ORIGINAL FK-S4 asserted that the intact bytes
+  // were quarantined as corrupt; it is preserved verbatim in the sealed
+  // Phase13/.../F_KEY_1/tests/ copy as historical evidence.
+  test('FK-S4 FLIPPED R9 (key read throws): the failure log is NOT '
+      'overwritten and the intact bytes are NOT quarantined', () async {
+    final (InMemoryLocalDatabase db, InMemorySecretStore secrets, String good) =
+        await _seedLog();
     final IntruderMonitor m2 = IntruderMonitor(
         store: IntruderFailureLogStore(db,
             cipher: AesGcmSettingsCipher(_KeyFault(secrets, throws: true))));
-    m2.onVerifiedAttempt(_fail('b'));
+    m2.onVerifiedAttempt(_fail('c'));
     await m2.idle();
     expect(await db.getSetting(IntruderFailureLogStore.storageKey), good);
-    // Misclassification (documented): the transient key failure was
-    // reported as CORRUPT and the intact bytes were quarantined.
-    expect(await db.getSetting(IntruderFailureLogStore.quarantineKey), good);
+    expect(await db.getSetting(IntruderFailureLogStore.quarantineKey), isNull);
+    expect(m2.status.health, IntruderMonitorHealth.storageError);
+  });
+
+  for (final bool throws in <bool>[true, false]) {
+    final String mode = throws ? 'key read throws' : 'wrong key';
+    test('FK-S7 Batch 1 empty-quarantine fix ($mode): with an EMPTY '
+        'quarantine slot the log and journal are neither quarantined nor '
+        'replaced; the right key recovers both', () async {
+      final (InMemoryLocalDatabase db, InMemorySecretStore secrets, String good) =
+          await _seedLog();
+      final SecurityEventJournal j1 = SecurityEventJournal(
+          store: SecurityEventJournalStore(db,
+              cipher: AesGcmSettingsCipher(secrets)));
+      j1.record(SecurityJournalEventType.journalRecovered);
+      await j1.idle();
+      final String goodJ =
+          (await db.getSetting(SecurityEventJournalStore.storageKey))!;
+      expect(await db.getSetting(IntruderFailureLogStore.quarantineKey), isNull);
+      expect(
+          await db.getSetting(SecurityEventJournalStore.quarantineKey), isNull);
+
+      final _KeyFault fault = _KeyFault(secrets, throws: throws);
+      final _RecordingListener l = _RecordingListener();
+      final IntruderMonitor m2 = IntruderMonitor(
+          store: IntruderFailureLogStore(db,
+              cipher: AesGcmSettingsCipher(fault)))
+        ..listener = l;
+      m2.onVerifiedAttempt(_fail('c'));
+      await m2.idle();
+      final SecurityEventJournal j2 = SecurityEventJournal(
+          store: SecurityEventJournalStore(db,
+              cipher: AesGcmSettingsCipher(fault)));
+      await j2.startup();
+      j2.record(SecurityJournalEventType.journalRecovered);
+      await j2.idle();
+
+      expect(await db.getSetting(IntruderFailureLogStore.storageKey), good);
+      expect(await db.getSetting(IntruderFailureLogStore.quarantineKey), isNull);
+      expect(await db.getSetting(SecurityEventJournalStore.storageKey), goodJ);
+      expect(
+          await db.getSetting(SecurityEventJournalStore.quarantineKey), isNull);
+      expect(fault.keyWrites, 0);
+      expect(l.vids, isEmpty, reason: 'nothing claimed persisted');
+      expect(m2.status.droppedFailureRecords, 1);
+      expect(m2.status.corruptUnpreserved, 0);
+      expect(m2.status.health, IntruderMonitorHealth.storageError);
+      expect(await m2.snapshot(), isNull, reason: 'unavailable, not empty');
+      expect(j2.health, SecurityJournalHealth.storageError);
+      expect(j2.quarantinedCorruptJournal, isFalse);
+
+      // The right key recovers both histories, byte-for-byte.
+      final IntruderLogRead r = await IntruderFailureLogStore(db,
+              cipher: AesGcmSettingsCipher(secrets))
+          .read();
+      expect((r as IntruderLogLoaded).log.events.map((e) => e.verificationId),
+          <String>['a', 'b']);
+      expect(
+          await SecurityEventJournalStore(db,
+                  cipher: AesGcmSettingsCipher(secrets))
+              .read(),
+          isA<SecurityJournalLoaded>());
+    });
+  }
+
+  test('FK-S5 G-4 interrupted repair: a quarantine already holding the EXACT '
+      'bytes lets the log and journal repair proceed (bytes preserved)',
+      () async {
+    final InMemoryLocalDatabase db = InMemoryLocalDatabase();
+    await db.setSetting(IntruderFailureLogStore.storageKey, 'damaged-log');
+    await db.setSetting(IntruderFailureLogStore.quarantineKey, 'damaged-log');
+    final IntruderMonitor m = IntruderMonitor(store: IntruderFailureLogStore(db));
+    m.onVerifiedAttempt(_fail('x'));
+    await m.idle();
+    expect(m.status.corruptUnpreserved, 0);
+    expect(m.status.droppedFailureRecords, 0);
+    expect(await db.getSetting(IntruderFailureLogStore.quarantineKey),
+        'damaged-log');
+    expect(await db.getSetting(IntruderFailureLogStore.storageKey),
+        isNot('damaged-log'));
+
+    await db.setSetting(SecurityEventJournalStore.storageKey, 'damaged-j');
+    await db.setSetting(SecurityEventJournalStore.quarantineKey, 'damaged-j');
+    final SecurityEventJournal j =
+        SecurityEventJournal(store: SecurityEventJournalStore(db));
+    j.record(SecurityJournalEventType.journalRecovered);
+    await j.idle();
+    expect(j.corruptUnpreserved, 0);
+    expect(j.health, SecurityJournalHealth.ok);
+    expect(await db.getSetting(SecurityEventJournalStore.quarantineKey),
+        'damaged-j');
+    expect(await db.getSetting(SecurityEventJournalStore.storageKey),
+        isNot('damaged-j'));
+  });
+
+  test('FK-S6 G-4 quarantine read failure (slot occupied) refuses the '
+      'overwrite for log and journal', () async {
+    final _QuarantineReadFaultDb db = _QuarantineReadFaultDb();
+    await db.setSetting(IntruderFailureLogStore.storageKey, 'damaged-log');
+    await db.setSetting(IntruderFailureLogStore.quarantineKey, 'other');
+    final IntruderMonitor m = IntruderMonitor(store: IntruderFailureLogStore(db));
+    m.onVerifiedAttempt(_fail('x'));
+    await m.idle();
+    expect(m.status.corruptUnpreserved, 1);
+    expect((await db.getAllSettings())[IntruderFailureLogStore.storageKey],
+        'damaged-log');
+    // Health must report the refusal (never a neutral/ok state) and the
+    // record is a counted drop, never claimed persisted.
+    expect(m.status.health, IntruderMonitorHealth.storageError);
+    expect(m.status.droppedFailureRecords, 1);
+    expect(await m.snapshot(), isNull, reason: 'unavailable, not empty');
+
+    await db.setSetting(SecurityEventJournalStore.storageKey, 'damaged-j');
+    final SecurityEventJournal j =
+        SecurityEventJournal(store: SecurityEventJournalStore(db));
+    j.record(SecurityJournalEventType.journalRecovered);
+    await j.idle();
+    expect(j.corruptUnpreserved, 1);
+    expect((await db.getAllSettings())[SecurityEventJournalStore.storageKey],
+        'damaged-j');
+    expect(j.health, SecurityJournalHealth.storageError);
   });
 }

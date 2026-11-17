@@ -35,8 +35,10 @@ final class IntruderLogLoaded extends IntruderLogRead {
   final String raw;
 }
 
-/// Undecryptable (GCM tamper), unparsable or schema-invalid. [raw] is the
-/// stored value so it can be quarantined before reinitialization.
+/// Decrypted (or plaintext) but unparsable or schema-invalid, or plaintext
+/// where ciphertext belongs. [raw] is the stored value so it can be
+/// quarantined before reinitialization. An UNDECRYPTABLE value is never
+/// corrupt: it is [IntruderLogUnreadable] (F-KEY-1, Batch 1).
 final class IntruderLogCorrupt extends IntruderLogRead {
   const IntruderLogCorrupt(this.raw);
   final String raw;
@@ -52,8 +54,9 @@ final class IntruderLogUnsupported extends IntruderLogRead {
   final String raw;
 }
 
-/// Storage could not be read (or encrypted data without a cipher): nothing
-/// is known, so nothing may be overwritten.
+/// Storage could not be read, the value could not be decrypted (missing,
+/// wrong or unreadable master key, or damaged ciphertext), or encrypted data
+/// without a cipher: nothing is known, so nothing may be overwritten.
 final class IntruderLogUnreadable extends IntruderLogRead {
   const IntruderLogUnreadable({required this.permanent});
 
@@ -92,7 +95,14 @@ class IntruderFailureLogStore {
         jsonText =
             await cipher.decryptString(raw.substring(_encryptedPrefix.length));
       } catch (_) {
-        return IntruderLogCorrupt(raw);
+        // F-KEY-1 empty-quarantine fix (Batch 1): AES-GCM authenticates, so a
+        // decrypt failure (missing/wrong master key, key read error, or
+        // damaged ciphertext) cannot be told apart from intact data under
+        // an unavailable key. It is UNREADABLE, never corrupt: nothing is
+        // quarantined, replaced or reinitialized; the exact bytes stay put
+        // and health reports a storage error. Only content that decrypts
+        // (key proven by the GCM tag) and still fails to parse is corrupt.
+        return const IntruderLogUnreadable(permanent: false);
       }
     } else if (_cipher == null) {
       jsonText = raw; // plaintext is only ever written without a cipher
@@ -188,6 +198,10 @@ class IntruderFailureLogStore {
     );
     return outcome == CasOutcome.committed;
   }
+
+  /// F-KEY-1 G-4: the quarantined bytes, or null when the slot is empty.
+  /// Throws on storage failure.
+  Future<String?> readQuarantine() => _database.getSetting(quarantineKey);
 }
 
 /// Q-ENG-1 (contract A §3): result of [IntruderFailureLogStore

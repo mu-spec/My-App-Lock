@@ -15,14 +15,29 @@ import '../secret_store.dart';
 ///  * data encryption: AES/GCM/NoPadding;
 ///  * supported from API 23+.
 ///
-/// `AndroidOptions()` therefore needs no extra flags to be secure — every
-/// value is encrypted with a device-bound key that never leaves the OS
-/// keystore, and nothing is written to disk in plaintext.
+/// Every value is encrypted with a device-bound key that never leaves the
+/// OS keystore, and nothing is written to disk in plaintext.
+///
+/// F-KEY-1 owner decision G-2: `resetOnError` is explicitly **false**. The
+/// Dart-side default (true) makes the plugin delete the entry (read/write
+/// failure), all entries (any method failure, or a failed key migration
+/// via `deleteAllDataAndKeys`) and report success or "absent" — which let
+/// the settings cipher mint a replacement master key over recoverable
+/// ciphertext. With false, every such failure surfaces as an exception
+/// and nothing is deleted. `migrateOnAlgorithmChange` stays at its default
+/// (true): it only runs when the stored algorithm markers differ from the
+/// current ones, and with resetOnError=false a failed migration reports an
+/// error instead of deleting.
 class FlutterSecureSecretStore implements SecretStore {
   FlutterSecureSecretStore()
       : _storage = const FlutterSecureStorage(
-          aOptions: AndroidOptions(),
+          aOptions: androidOptions,
         );
+
+  /// The exact options sent with every call (pinned by tests).
+  static const AndroidOptions androidOptions = AndroidOptions(
+    resetOnError: false,
+  );
 
   final FlutterSecureStorage _storage;
 

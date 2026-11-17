@@ -319,13 +319,17 @@ void main() {
         }
       ),
     ]) {
-      test('corrupt guard fields ($name) are quarantined, not trusted',
-          () async {
+      // F-KEY-1 G-3: formerly "quarantined"; now unreadable and untouched.
+      test('corrupt guard fields ($name) are not trusted: unreadable, kept '
+          'byte-identical, never quarantined or replaced', () async {
         await writeRawIndex(idx);
+        final String? raw = await db.getSetting(IntruderEvidenceStore.indexKey);
         final IntruderEvidenceStore s = store();
         expect(await s.list(), isEmpty);
+        expect(await s.health(), EvidenceIndexHealth.unreadable);
+        expect(await db.getSetting(IntruderEvidenceStore.indexKey), raw);
         expect(await db.getSetting(IntruderEvidenceStore.quarantineKey),
-            isNotNull);
+            isNull);
       });
     }
 

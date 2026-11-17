@@ -10,9 +10,12 @@ import '../../../security/credentials/auth_type.dart';
 import '../../../security/credentials/credential_manager.dart';
 import '../../../security/credentials/pattern_policy.dart';
 import '../../widgets/entry_shake.dart';
+import '../../../security/credentials/credential_state.dart';
+import '../../../utilities/result.dart';
+import '../../widgets/secure_storage_unavailable.dart';
 
 /// Internal presentation states of the pattern unlock screen.
-enum _UnlockView { loading, ready, noCredential, lockedOut }
+enum _UnlockView { loading, ready, noCredential, storageUnavailable, lockedOut }
 
 /// Full-screen pattern authentication (Phase 2I).
 ///
@@ -115,10 +118,17 @@ class _PatternUnlockScreenState extends State<PatternUnlockScreen>
   /// Reads the credential configuration once when the screen opens:
   /// whether a pattern is enrolled, and any lockout already active.
   Future<void> _loadStatus() async {
-    final state = (await _manager.status()).valueOrNull;
+    final Result<CredentialState> statusResult = await _manager.status();
     if (!mounted) {
       return;
     }
+    // F-KEY-1 G-7: an UNREADABLE credential state is not "no credential":
+    // never offer setup/reset here; only retry or leave.
+    if (statusResult.isFailure) {
+      setState(() => _view = _UnlockView.storageUnavailable);
+      return;
+    }
+    final CredentialState? state = statusResult.valueOrNull;
     if (state == null || !state.hasEnrolled(AuthType.pattern)) {
       setState(() => _view = _UnlockView.noCredential);
       return;
@@ -386,6 +396,7 @@ class _PatternUnlockScreenState extends State<PatternUnlockScreen>
                 child: CircularProgressIndicator(),
               ),
             _UnlockView.noCredential => _buildNoCredential(),
+            _UnlockView.storageUnavailable => _buildStorageUnavailable(),
             _UnlockView.lockedOut => _buildLockedOut(),
             _UnlockView.ready => _buildEntry(),
           },
@@ -555,6 +566,51 @@ class _PatternUnlockScreenState extends State<PatternUnlockScreen>
             variant: DsButtonVariant.ghost,
             onPressed: () => _completeRoute(false),
           ),
+        ),
+      ],
+    );
+  }
+
+  /// F-KEY-1 G-7: neutral "secure storage unavailable" view. No setup,
+  /// no reset, no access: retry the read, or leave (route result false).
+  Widget _buildStorageUnavailable() {
+    final ThemeData theme = Theme.of(context);
+    return ListView(
+      padding: DsInsets.screen,
+      children: <Widget>[
+        const SizedBox(height: DsSpacing.xxl),
+        const Center(child: Icon(Icons.lock_outline, size: 44)),
+        const SizedBox(height: DsSpacing.xl),
+        Center(
+          child: Text(
+            SecureStorageUnavailableText.title,
+            key: const ValueKey<String>('secure_storage_unavailable'),
+            style: theme.textTheme.headlineSmall,
+          ),
+        ),
+        const SizedBox(height: DsSpacing.sm),
+        const Center(
+          child: Text(
+            SecureStorageUnavailableText.message,
+            textAlign: TextAlign.center,
+          ),
+        ),
+        const SizedBox(height: DsSpacing.xxl),
+        DsButton(
+          key: const ValueKey<String>('secure_storage_retry'),
+          label: SecureStorageUnavailableText.retryLabel,
+          expand: true,
+          onPressed: () {
+            setState(() => _view = _UnlockView.loading);
+            _loadStatus();
+          },
+        ),
+        const SizedBox(height: DsSpacing.md),
+        DsButton(
+          label: PatternUnlockScreen.backLabel,
+          variant: DsButtonVariant.outline,
+          expand: true,
+          onPressed: () => _completeRoute(false),
         ),
       ],
     );

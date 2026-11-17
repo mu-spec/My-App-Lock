@@ -305,16 +305,14 @@ class IntruderEvidenceStore {
       return _Index(items, EvidenceIndexHealth.ok,
           floor: floor, tombs: tombs, highWater: (h as int?) ?? -1);
     } catch (_) {
-      // Corrupt: keep the first corrupt value for diagnosis, start empty.
-      try {
-        if (await _database.getSetting(quarantineKey) == null) {
-          await _database.setSetting(quarantineKey, raw);
-        }
-        await _database.removeSetting(indexKey);
-      } catch (_) {
-        return const _Index(<EvidenceItem>[], EvidenceIndexHealth.unreadable);
-      }
-      return const _Index(<EvidenceItem>[], EvidenceIndexHealth.ok);
+      // F-KEY-1 owner decision G-3: an index that cannot be decrypted or
+      // decoded is UNREADABLE, never a valid empty index. A decrypt failure
+      // may be a missing/wrong master key (bytes intact and recoverable) and
+      // is indistinguishable here from genuine damage, so nothing is
+      // written, quarantined, removed or swept: the index and every blob
+      // keep their exact bytes. All mutating paths (save, delete, clearAll,
+      // sweep, retention) already refuse a non-ok index.
+      return const _Index(<EvidenceItem>[], EvidenceIndexHealth.unreadable);
     }
   }
 

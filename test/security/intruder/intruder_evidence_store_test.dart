@@ -204,21 +204,30 @@ void main() {
           isFalse);
     });
 
-    test('a corrupt index is quarantined once and the store starts empty',
-        () async {
-      await db.setSetting(IntruderEvidenceStore.indexKey, 'enc:v1:garbage');
-      final IntruderEvidenceStore s = store();
-      expect(await s.list(), isEmpty);
-      expect(await db.getSetting(IntruderEvidenceStore.quarantineKey),
-          'enc:v1:garbage');
-      expect(await s.save(seq: 1, jpeg: jpegWithMetadata()),
-          EvidenceSaveResult.saved);
-      await db.setSetting(IntruderEvidenceStore.indexKey, 'plaintext-corrupt');
-      expect(await s.list(), isEmpty);
-      expect(await db.getSetting(IntruderEvidenceStore.quarantineKey),
-          'enc:v1:garbage',
-          reason: 'first quarantine is kept');
-    });
+    // F-KEY-1 owner decision G-3 (reverses the former "quarantined once and
+    // the store starts empty" behaviour): a corrupt index is UNREADABLE —
+    // never trusted, never replaced, removed, quarantined or swept.
+    for (final String bad in <String>['enc:v1:garbage', 'plaintext-corrupt']) {
+      test('G-3 a corrupt index ($bad) is unreadable and kept byte-identical; '
+          'no quarantine write, no save, no sweep', () async {
+        await db.setSetting(IntruderEvidenceStore.indexKey, bad);
+        await db.setSetting(IntruderEvidenceStore.blobKey(1), 'enc:v1:blob');
+        final IntruderEvidenceStore s = store();
+        expect(await s.list(), isEmpty, reason: 'never trusted');
+        expect(await s.health(), EvidenceIndexHealth.unreadable);
+        expect(await s.save(seq: 2, jpeg: jpegWithMetadata()),
+            EvidenceSaveResult.storageFailed);
+        expect(await s.sweepOrphans(), 0);
+        await s.startupMaintenance();
+        expect(await s.enforceRetention(), 0);
+        expect(await db.getSetting(IntruderEvidenceStore.indexKey), bad);
+        expect(await db.getSetting(IntruderEvidenceStore.blobKey(1)),
+            'enc:v1:blob');
+        expect(await db.getSetting(IntruderEvidenceStore.blobKey(2)), isNull);
+        expect(await db.getSetting(IntruderEvidenceStore.quarantineKey),
+            isNull);
+      });
+    }
 
     test('a NEWER schema is read-only: never overwritten, swept or appended',
         () async {

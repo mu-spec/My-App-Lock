@@ -164,6 +164,7 @@ class SecurityEventJournal
   bool _readOnly = false;
   bool _storageError = false;
   bool _quarantined = false;
+  int _corruptUnpreserved = 0;
   bool _unsupported = false;
 
   /// Losses not yet added to the persisted `lost` counter.
@@ -185,6 +186,11 @@ class SecurityEventJournal
   /// Whether this instance quarantined a corrupt journal row.
   bool get quarantinedCorruptJournal => _quarantined;
 
+  /// F-KEY-1 G-4: damaged/undecryptable journals NOT replaced because their
+  /// exact bytes could not be preserved (occupied quarantine / storage
+  /// failure).
+  int get corruptUnpreserved => _corruptUnpreserved;
+
   /// This session's losses not yet persisted.
   int get pendingLost => _pendingLost;
 
@@ -193,6 +199,16 @@ class SecurityEventJournal
   @override
   void record(SecurityJournalEventType type) {
     try {
+      // NF-B1-1 (Batch 1): every v2 event type except the field-less markers
+      // REQUIRES typed fields; persisting one without them would write a
+      // document this build's own strict decoder rejects, and the next
+      // fresh read would quarantine and reinitialize the whole journal.
+      // Such input is counted as lost and never stored.
+      if (type != SecurityJournalEventType.journalStarted &&
+          type != SecurityJournalEventType.journalRecovered) {
+        _addLost(1);
+        return;
+      }
       final DateTime at = _now(); // "detected at" = when it was observed
       if (_pending >= maxPending) {
         _addLost(1);
@@ -634,8 +650,15 @@ class SecurityEventJournal
         return _initialize(SecurityJournalEventType.journalStarted);
       case SecurityJournalCorrupt(:final String raw):
         // Quarantine FIRST; if that fails, nothing is overwritten.
-        if (await _store.quarantine(raw)) {
-          _quarantined = true;
+        // F-KEY-1 owner decision G-4: the bytes may be intact ciphertext
+        // under a missing/wrong key. They are replaced only once provably
+        // preserved: this call quarantined them, or the slot already holds
+        // exactly these bytes. An occupied slot holding other bytes refuses
+        // the overwrite (both rows keep their exact bytes); this is reported
+        // like a transient storage failure: nothing is claimed persisted.
+        if (!await _preserveCorrupt(raw)) {
+          _corruptUnpreserved++;
+          throw StateError('security journal damaged; not preserved');
         }
         return _initialize(SecurityJournalEventType.journalRecovered);
       case SecurityJournalUnsupported():
@@ -648,6 +671,22 @@ class SecurityEventJournal
           return null;
         }
         throw StateError('security journal unreadable');
+    }
+  }
+
+  Future<bool> _preserveCorrupt(String raw) async {
+    try {
+      if (await _store.quarantine(raw)) {
+        _quarantined = true;
+        return true;
+      }
+      if (await _store.readQuarantine() == raw) {
+        _quarantined = true;
+        return true;
+      }
+      return false;
+    } catch (_) {
+      return false;
     }
   }
 

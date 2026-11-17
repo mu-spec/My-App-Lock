@@ -459,7 +459,10 @@ void main() {
       expect(await db.getSetting(_qKey), '{not json');
     });
 
-    test('a tampered ciphertext is treated as corrupt (GCM)', () async {
+    // FLIPPED (F-KEY-1 Batch 1): a GCM failure cannot be told apart from an
+    // unavailable/wrong key, so it is UNREADABLE (never corrupt): nothing is
+    // quarantined or replaced. (Previously: treated as corrupt.)
+    test('a tampered ciphertext is unreadable, never corrupt (GCM)', () async {
       final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore());
       final IntruderFailureLogStore enc =
           IntruderFailureLogStore(db, cipher: cipher);
@@ -471,7 +474,25 @@ void main() {
       final String flipped =
           raw.replaceRange(i, i + 1, raw[i] == 'A' ? 'B' : 'A');
       await db.setSetting(_key, flipped);
-      expect(await enc.read(), isA<IntruderLogCorrupt>());
+      final IntruderLogRead r = await enc.read();
+      expect(r, isA<IntruderLogUnreadable>());
+      expect((r as IntruderLogUnreadable).permanent, isFalse);
+      final IntruderMonitor m2 = build(s: enc);
+      m2.onVerifiedAttempt(_attempt());
+      await m2.idle();
+      expect(await db.getSetting(_key), flipped, reason: 'bytes untouched');
+      expect(await db.getSetting(IntruderFailureLogStore.quarantineKey),
+          isNull);
+      expect(m2.status.health, IntruderMonitorHealth.storageError);
+    });
+
+    test('a decryptable but unparsable value is corrupt (key proven)',
+        () async {
+      final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore());
+      await db.setSetting(
+          _key, 'enc:v1:${await cipher.encryptString('not json')}');
+      expect(await IntruderFailureLogStore(db, cipher: cipher).read(),
+          isA<IntruderLogCorrupt>());
     });
 
     test('plaintext where ciphertext belongs is treated as corrupt', () async {

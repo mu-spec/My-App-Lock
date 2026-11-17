@@ -28,8 +28,10 @@ final class SecurityJournalLoaded extends SecurityJournalRead {
   final SecurityJournalDocument document;
 }
 
-/// Undecryptable (GCM tamper), unparsable or schema-invalid. [raw] is kept
-/// only so it can be quarantined before reinitialization.
+/// Decrypted (or plaintext) but unparsable or schema-invalid, or plaintext
+/// where ciphertext belongs. [raw] is kept only so it can be quarantined
+/// before reinitialization. An UNDECRYPTABLE value is never corrupt: it is
+/// [SecurityJournalUnreadable] (F-KEY-1, Batch 1).
 final class SecurityJournalCorrupt extends SecurityJournalRead {
   const SecurityJournalCorrupt(this.raw);
 
@@ -82,7 +84,14 @@ class SecurityEventJournalStore {
         jsonText =
             await cipher.decryptString(raw.substring(_encryptedPrefix.length));
       } catch (_) {
-        return SecurityJournalCorrupt(raw);
+        // F-KEY-1 empty-quarantine fix (Batch 1): AES-GCM authenticates, so a
+        // decrypt failure (missing/wrong master key, key read error, or
+        // damaged ciphertext) cannot be told apart from intact data under
+        // an unavailable key. It is UNREADABLE, never corrupt: nothing is
+        // quarantined, replaced or reinitialized; the exact bytes stay put
+        // and health reports a storage error. Only content that decrypts
+        // (key proven by the GCM tag) and still fails to parse is corrupt.
+        return const SecurityJournalUnreadable(permanent: false);
       }
     } else if (_cipher == null) {
       jsonText = raw; // plaintext is only ever written without a cipher
@@ -133,6 +142,10 @@ class SecurityEventJournalStore {
     await _database.setSetting(quarantineKey, raw);
     return true;
   }
+
+  /// F-KEY-1 G-4: the quarantined bytes, or null when the slot is empty.
+  /// Throws on storage failure.
+  Future<String?> readQuarantine() => _database.getSetting(quarantineKey);
 
   /// Presence of a quarantined (damaged) earlier journal. Throws on storage
   /// failure (the caller reports "integrity unknown").

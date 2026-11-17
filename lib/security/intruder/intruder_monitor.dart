@@ -83,6 +83,7 @@ final class IntruderMonitorStatus {
     this.snapshotsRejected = 0,
     this.conflictDrops = 0,
     this.unknownOutcomes = 0,
+    this.corruptUnpreserved = 0,
   });
 
   final IntruderMonitorHealth health;
@@ -120,6 +121,12 @@ final class IntruderMonitorStatus {
   /// reconciliation read failed: neither saved nor known to be lost. Never
   /// counted as saved and never counted in [droppedFailureRecords].
   final int unknownOutcomes;
+
+  /// F-KEY-1 G-4: times a corrupt/undecryptable stored log was NOT replaced
+  /// because its exact bytes could not be preserved (quarantine slot
+  /// occupied by other bytes, or a storage failure). The stored log and the
+  /// quarantine keep their exact bytes; affected records count as dropped.
+  final int corruptUnpreserved;
 }
 
 /// Q-ENG-1 (contract A §4.3): last log this monitor read or committed,
@@ -221,6 +228,9 @@ class IntruderMonitor implements VerifiedAttemptObserver {
   bool _readOnly = false;
   bool _storageError = false;
   bool _quarantined = false;
+  // F-KEY-1 G-4: overwrites refused because the corrupt bytes could not be
+  // preserved (occupied quarantine slot / storage failure).
+  int _corruptUnpreserved = 0;
   int _dropped = 0;
   int _conflictDrops = 0;
   int _unknownOutcomes = 0;
@@ -239,6 +249,7 @@ class IntruderMonitor implements VerifiedAttemptObserver {
         snapshotsRejected: _snapshotsRejected,
         conflictDrops: _conflictDrops,
         unknownOutcomes: _unknownOutcomes,
+        corruptUnpreserved: _corruptUnpreserved,
       );
 
   /// Q-ENG-1: the last durably observed log, flagged stale (null when none
@@ -435,14 +446,17 @@ class IntruderMonitor implements VerifiedAttemptObserver {
       case IntruderLogMissing():
         return const _Base(IntruderFailureLog.empty, null);
       case IntruderLogCorrupt(:final String raw):
-        // Preserve the damaged value once (insert-if-absent), then replace
-        // ONLY these exact bytes with a fresh log (a racing repairer makes
-        // this a conflict and the loser rebases on the winner).
-        try {
-          await _store.quarantineOnce(raw);
-          _quarantined = true;
-        } catch (_) {
-          // Quarantine is best effort; reinitialization still proceeds.
+        // F-KEY-1 owner decision G-4: the stored bytes may be intact
+        // ciphertext under a missing/wrong key. They are replaced (CAS on
+        // these exact bytes) ONLY once they are provably preserved in the
+        // quarantine slot. An occupied slot holding other bytes, or any
+        // storage failure, refuses the overwrite: both rows keep their
+        // exact bytes, nothing is reported persisted (the record is a
+        // counted drop) and health reports a storage error.
+        if (!await _preserveCorrupt(raw)) {
+          _storageError = true;
+          _corruptUnpreserved++;
+          return null;
         }
         return _Base(IntruderFailureLog.empty, raw);
       case IntruderLogUnsupported():
@@ -455,6 +469,25 @@ class IntruderMonitor implements VerifiedAttemptObserver {
           _storageError = true;
         }
         return null;
+    }
+  }
+
+  /// True only when [raw] is durably held in the quarantine slot: either
+  /// this call inserted it, or the slot already holds exactly these bytes
+  /// (e.g. a quarantine that committed before an interrupted repair).
+  Future<bool> _preserveCorrupt(String raw) async {
+    try {
+      if (await _store.quarantineOnce(raw)) {
+        _quarantined = true;
+        return true;
+      }
+      if (await _store.readQuarantine() == raw) {
+        _quarantined = true;
+        return true;
+      }
+      return false;
+    } catch (_) {
+      return false;
     }
   }
 
