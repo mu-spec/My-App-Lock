@@ -17,6 +17,7 @@ import 'package:flutter/material.dart';
 import '../../../app/app_container.dart';
 import '../../../design_system/design_system.dart';
 import '../../../security/credentials/auth_type.dart';
+import '../../../security/history/history_retention_service.dart';
 import '../../../security/intruder/intruder_defense_settings.dart';
 import '../../../security/intruder/intruder_evidence_service.dart';
 import '../../../security/intruder/intruder_evidence_store.dart';
@@ -40,6 +41,19 @@ abstract final class IntruderSettingsText {
       'Changing these settings or deleting photos never resets attempt '
       'counters or lock-out timers. Lock-outs always end after at most 10 '
       'minutes.';
+  // Batch 5: history retention.
+  static const String historyRetentionTitle = 'Keep security history for';
+  static const String historyRetentionNote =
+      'Applies to failed unlock attempts and security events. Older events '
+      'are removed automatically and the timeline notes it. Intruder photos '
+      'keep their own 30-day limit.';
+  static const String historyRetentionInvalid =
+      'The saved history period could not be read, so 30 days is used. '
+      'Choose a period to fix this.';
+  static const String shortenTitle = 'Keep history for less time?';
+  static String shortenBody(int days) =>
+      'Events older than $days days will be deleted now.';
+  static String historyRetentionLabel(int days) => '$days days';
   static const String switchesHint =
       'Turn intruder photo and alarm on or off on the Security screen.';
 }
@@ -137,6 +151,77 @@ class _IntruderSettingsScreenState extends State<IntruderSettingsScreen>
       if (saved == null) _say(IntruderSettingsText.couldNotSave);
       // A threshold-only change never aborts a pending capture or alarm;
       // the coordinator reads the new value for the next event.
+    } finally {
+      if (mounted) setState(() => _busy = false);
+      if (mounted) await _load(); // always show the persisted value
+    }
+  }
+
+  /// Batch 5: confirm (when shortening), then a FRESH owner verification,
+  /// then the serialized settings update and its application.
+  Future<void> _setHistoryRetention(int? value) async {
+    final IntruderSettingsRead? current = _settings;
+    if (value == null ||
+        _busy ||
+        current == null ||
+        !current.writable ||
+        (value == current.settings.historyRetentionDays &&
+            !current.settings.retentionInvalid)) {
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final bool shortening = value < current.settings.historyRetentionDays;
+      if (shortening) {
+        final bool? ok = await showDialog<bool>(
+          context: context,
+          builder: (BuildContext ctx) => AlertDialog(
+            title: const Text(IntruderSettingsText.shortenTitle),
+            content: Text(IntruderSettingsText.shortenBody(value)),
+            actions: <Widget>[
+              TextButton(
+                key: const Key('history_retention_shorten_cancel'),
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                key: const Key('history_retention_shorten_confirm'),
+                onPressed: () => Navigator.of(ctx).pop(true),
+                child: const Text('Delete older events'),
+              ),
+            ],
+          ),
+        );
+        if (!mounted) return;
+        if (ok != true) {
+          _say(IntruderSettingsText.notChanged);
+          return;
+        }
+      }
+      final AuthType? method =
+          await verifyIntruderOwner(Navigator.of(context), _c.auth);
+      if (!mounted) return;
+      if (method == null) {
+        _say(IntruderSettingsText.notChanged);
+        return;
+      }
+      final RetentionChangeOutcome r = await _c.historyRetention.change(
+        value,
+        stillValid: () => mounted,
+        shorteningConfirmed: shortening,
+      );
+      if (!mounted) return;
+      switch (r) {
+        case RetentionChangeOutcome.changed:
+        case RetentionChangeOutcome.unchanged:
+          break;
+        case RetentionChangeOutcome.needsConfirmation:
+        case RetentionChangeOutcome.cancelled:
+          _say(IntruderSettingsText.notChanged);
+        case RetentionChangeOutcome.refused:
+        case RetentionChangeOutcome.failed:
+          _say(IntruderSettingsText.couldNotSave);
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
       if (mounted) await _load(); // always show the persisted value
@@ -263,6 +348,48 @@ class _IntruderSettingsScreenState extends State<IntruderSettingsScreen>
                             ),
                         ],
                       ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: DsSpacing.lg),
+                DsCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Row(
+                        children: <Widget>[
+                          const Expanded(
+                            child: Text(
+                                IntruderSettingsText.historyRetentionTitle),
+                          ),
+                          DropdownButton<int>(
+                            key: const Key('history_retention_dropdown'),
+                            value: s.historyRetentionDays,
+                            onChanged: writable && !_busy
+                                ? _setHistoryRetention
+                                : null,
+                            items: <DropdownMenuItem<int>>[
+                              for (final int d in IntruderDefenseSettings
+                                  .historyRetentionChoices)
+                                DropdownMenuItem<int>(
+                                  key: ValueKey<String>('history_retention_$d'),
+                                  value: d,
+                                  child: Text(IntruderSettingsText
+                                      .historyRetentionLabel(d)),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                      if (s.retentionInvalid) ...<Widget>[
+                        const SizedBox(height: DsSpacing.sm),
+                        const Text(
+                          IntruderSettingsText.historyRetentionInvalid,
+                          key: Key('history_retention_invalid'),
+                        ),
+                      ],
+                      const SizedBox(height: DsSpacing.sm),
+                      const Text(IntruderSettingsText.historyRetentionNote),
                     ],
                   ),
                 ),

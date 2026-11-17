@@ -1,0 +1,8 @@
+Verbatim copies of the pre-Batch-5 build, used only to prove downgrade behaviour:
+  security_journal_event.dart, security_event_journal_store.dart  — Batch 4 tree
+    14d768b4de1fb931709710cdcd7652591d46b256 (rebuilt chain 2f12889 + b4_wip_vs_6067015.patch)
+  intruder_defense_settings.dart — commit 2f12889 (unchanged by Batch 4)
+Only relative package import paths were rewritten to package: imports. Original blob SHA-256 (before rewrite):
+c9af427ec56c8e061ca67c479560c165f6a6b1330ee1abc388f9d7dae5dd4050  security_journal_event.dart
+c92e6d7fb7a28372fad00aec88b6d4b9f8395e8c85147b1f34b2c4133b878b1e  security_event_journal_store.dart
+c21a44c3e40581062056b911e62a2c846cb9b9e0c9079535360866e665ce27be  intruder_defense_settings.dart

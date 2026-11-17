@@ -369,8 +369,9 @@ void main() {
 
     test('newer schema is read-only and NEVER overwritten (A1-3)', () async {
       // Batch 3: v3 is now current. Batch 4 (disclosed re-baseline): v4 is
-      // readable (v3 + clear marker); v5 = "newer".
-      final String newer = '{"schema":"sal.security_journal","v":5,'
+      // readable (v3 + clear marker); v5 = "newer". Batch 5 (disclosed
+      // re-baseline): v5 is readable (retention events); v6 = "newer".
+      final String newer = '{"schema":"sal.security_journal","v":6,'
           '"nextSeq":9,"events":[{"seq":1,"futureField":true}]}';
       await db.setSetting(_key, newer);
       final SecurityEventJournal j = journal(plaintext: true);
@@ -500,7 +501,28 @@ void main() {
       now = _t0.add(const Duration(days: 31));
       final SecurityEventJournal j2 = journal();
       final SecurityJournalView v = await j2.read();
-      expect(v.events.map((SecurityJournalEvent e) => e.seq), <int>[1]);
+      // Batch 5 (disclosed, R-06): the age purge is also disclosed by ONE
+      // coalesced `historyExpired` marker (n = 2, span of the purged rows);
+      // every other expectation is unchanged.
+      expect(
+          v.events
+              .where((SecurityJournalEvent e) =>
+                  e.type != SecurityJournalEventType.historyExpired)
+              .map((SecurityJournalEvent e) => e.seq),
+          <int>[1]);
+      final HistoryExpiredFields x = v.events
+          .singleWhere((SecurityJournalEvent e) =>
+              e.type == SecurityJournalEventType.historyExpired)
+          .fields! as HistoryExpiredFields;
+      expect((
+        x.n,
+        x.from,
+        x.to
+      ), (
+        2,
+        _t0.subtract(const Duration(days: 1)).millisecondsSinceEpoch,
+        _t0.millisecondsSinceEpoch
+      ));
       expect(v.discarded, 2);
       expect((await stored()).discarded, 2);
     });

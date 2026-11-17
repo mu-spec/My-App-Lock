@@ -682,7 +682,8 @@ void main() {
       expect(a.journal.casExhausted + b.journal.casExhausted, 0);
     });
 
-    test('ENG-03 evidence: concurrent saves picking the same blob id -> no '
+    test(
+        'ENG-03 evidence: concurrent saves picking the same blob id -> no '
         'blob overwritten, both listed with distinct ids and their own image',
         () async {
       final _World a = await _seed();
@@ -690,7 +691,10 @@ void main() {
       final (Completer<void> held, Completer<void> release) =
           holdFirst(a.db, IntruderEvidenceStore.indexKey);
       final Future<EvidenceSaveResult> sa = a.evidence.save(
-          seq: 3, gen: _g1, currentGen: _g1, jpeg: jpegWithMetadata(fill: 0x0A));
+          seq: 3,
+          gen: _g1,
+          currentGen: _g1,
+          jpeg: jpegWithMetadata(fill: 0x0A));
       await held.future; // A's blob is placed, its index write is held
       expect(
           await b.evidence.save(
@@ -715,10 +719,12 @@ void main() {
           .keys
           .where((String k) => k.startsWith(IntruderEvidenceStore.blob2Prefix))
           .toSet();
-      expect(blobs.length, items.where((EvidenceItem e) => e.bid != null).length);
+      expect(
+          blobs.length, items.where((EvidenceItem e) => e.bid != null).length);
     });
 
-    test('ENG-04e evidence: a late save in B races A\'s photo clear -> B '
+    test(
+        'ENG-04e evidence: a late save in B races A\'s photo clear -> B '
         're-reads the cleared index and is refused; nothing resurrected',
         () async {
       final _World a = await _seed();
@@ -726,8 +732,8 @@ void main() {
       await a.fails(1); // attempt seq 3 exists before the clear
       final (Completer<void> held, Completer<void> release) =
           holdFirst(a.db, IntruderEvidenceStore.indexKey);
-      final Future<EvidenceSaveResult> late = b.evidence.save(
-          seq: 3, gen: _g1, currentGen: _g1, jpeg: jpegWithMetadata());
+      final Future<EvidenceSaveResult> late = b.evidence
+          .save(seq: 3, gen: _g1, currentGen: _g1, jpeg: jpegWithMetadata());
       await held.future; // B's index write (stale base) is held
       a.db.gate = null;
       expect(await a.service.clear(photos: true, stillValid: _valid),
@@ -742,7 +748,8 @@ void main() {
           isEmpty);
     });
 
-    test('ENG-05 persistent contention: bounded attempts, then a storage '
+    test(
+        'ENG-05 persistent contention: bounded attempts, then a storage '
         'error; nothing written, the loss is disclosed', () async {
       final _World w = await _seed();
       await w.journal.read();
@@ -758,8 +765,7 @@ void main() {
       await w.outcome(8); // next write succeeds and folds in the loss
       final SecurityJournalDocument d = await w.doc();
       expect(d.lost, 1);
-      expect(
-          d.events.where((SecurityJournalEvent e) => e.fields?.trig == 7),
+      expect(d.events.where((SecurityJournalEvent e) => e.fields?.trig == 7),
           isEmpty);
       final String? idx = await w.db.getSetting(IntruderEvidenceStore.indexKey);
       w.db.forceConflicts[IntruderEvidenceStore.indexKey] = 3;
@@ -772,9 +778,12 @@ void main() {
       expect(
           (await w.db.getAllSettings())
               .keys
-              .where((String k) => k.startsWith(IntruderEvidenceStore.blob2Prefix))
+              .where(
+                  (String k) => k.startsWith(IntruderEvidenceStore.blob2Prefix))
               .length,
-          (await w.evidence.list()).where((EvidenceItem e) => e.bid != null).length,
+          (await w.evidence.list())
+              .where((EvidenceItem e) => e.bid != null)
+              .length,
           reason: 'the losing blob row is removed');
     });
   });

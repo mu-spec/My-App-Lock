@@ -177,6 +177,14 @@ abstract final class SecurityTimelineText {
           ? 'History and intruder photos cleared'
           : 'History cleared';
 
+  /// Batch 5.
+  static String retentionDays(int? d) => '${d ?? '?'} days';
+
+  static String day(DateTime? d) => d == null
+      ? '?'
+      : '${d.year}-${d.month.toString().padLeft(2, '0')}-'
+          '${d.day.toString().padLeft(2, '0')}';
+
   static String attempts(int n) =>
       '$n failed ${n == 1 ? 'attempt' : 'attempts'}';
 
@@ -300,6 +308,18 @@ abstract final class SecurityTimelineText {
             e.clearPending
                 ? 'on $time · not finished'
                 : 'on $time · Earlier events were removed by the owner.',
+          ),
+        TimelineEntryKind.retentionChanged => (
+            'History retention changed',
+            'on $time · from ${retentionDays(e.retentionOld)} to '
+                '${retentionDays(e.retentionNew)}',
+          ),
+        TimelineEntryKind.historyExpired => (
+            'Older history removed automatically',
+            '${e.expiredCount ?? 0} '
+                '${e.expiredCount == 1 ? 'event' : 'events'} from '
+                '${day(e.expiredFrom)} to ${day(e.expiredTo)} passed the '
+                'retention period · last on $time',
           ),
       };
 
@@ -826,7 +846,9 @@ class _TimelineList extends StatelessWidget {
         case TimelineEntryRow(:final TimelineEntry entry):
           final bool m2 = entry.source == TimelineSource.journal &&
               entry.kind.index > TimelineEntryKind.journalRecovered.index &&
-              entry.kind != TimelineEntryKind.historyCleared;
+              entry.kind != TimelineEntryKind.historyCleared &&
+              entry.kind != TimelineEntryKind.retentionChanged &&
+              entry.kind != TimelineEntryKind.historyExpired;
           rows.add(_EntryTile(
             entry,
             labels: snapshot.labels,
@@ -940,6 +962,8 @@ class _EntryTile extends StatelessWidget {
       TimelineEntryKind.storageRestored =>
         Icons.storage_outlined,
       TimelineEntryKind.historyCleared => Icons.delete_sweep_outlined,
+      TimelineEntryKind.retentionChanged => Icons.schedule_outlined,
+      TimelineEntryKind.historyExpired => Icons.history_toggle_off,
     };
     final String time = _fmtTime(e.at);
     final (String title, String text) = SecurityTimelineText.entryText(e, time);

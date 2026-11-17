@@ -742,7 +742,7 @@ void main() {
       });
       final String jr = jsonEncode(<String, Object?>{
         'schema': SecurityJournalDocument.schema,
-        'v': 5,
+        'v': 6, // Batch 5 (disclosed): v5 is readable; "newer" is v6
       });
       final String ev =
           'enc:v1:${await cipher.encryptString('{"v":3,"items":[]}')}';

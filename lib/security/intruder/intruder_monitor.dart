@@ -224,7 +224,28 @@ class IntruderMonitor implements VerifiedAttemptObserver {
 
   final DateTime Function() _now;
   final int maxEvents;
-  final Duration retention;
+
+  /// Age retention. Batch 5: set from the owner's history retention
+  /// setting inside the queue ([purgeExpired]). Null = not known yet: no
+  /// age purge (capacity / size bounds still apply), so an unknown setting
+  /// can never shorten retention.
+  Duration? retention;
+
+  /// Batch 5: told (after the write committed) how many attempts an age
+  /// purge removed and their time span. Observe-only; a throwing observer
+  /// never affects the log.
+  void Function(int n, DateTime from, DateTime to)? onHistoryExpired;
+
+  void _reportExpired(_Expiry? x) {
+    final void Function(int, DateTime, DateTime)? o = onHistoryExpired;
+    if (x == null || o == null) return;
+    try {
+      o(x.n, x.from, x.to);
+    } catch (_) {
+      // never affects the log
+    }
+  }
+
   final int maxPending;
   final int maxEncodedBytes;
 
@@ -531,6 +552,113 @@ class IntruderMonitor implements VerifiedAttemptObserver {
       }
     }
     return IntruderHistoryClearResult.failed; // contention
+  }
+
+  // -- Batch 5: retention ---------------------------------------------------
+
+  /// Runs in the P-1 queue: [retention], when given, becomes the age
+  /// retention first; then attempts older than the cutoff are removed in ONE
+  /// conditional write (`nextSeq`, the run counter and the generation stay
+  /// byte-identical; future-dated attempts are kept) and reported to
+  /// [onHistoryExpired]. Only a loaded row is ever written: a missing,
+  /// corrupt, unreadable or newer row is never touched. Never throws.
+  Future<IntruderPurgeResult> purgeExpired({Duration? retention}) {
+    final Completer<IntruderPurgeResult> out = Completer<IntruderPurgeResult>();
+    _enqueueTask(() async {
+      if (retention != null) this.retention = retention;
+      try {
+        out.complete(await _purge());
+      } catch (_) {
+        if (!out.isCompleted) out.complete(IntruderPurgeResult.failed);
+        rethrow;
+      }
+    });
+    return out.future;
+  }
+
+  /// Fire-and-forget purge for read paths (timeline open). Coalesced: at
+  /// most ONE such purge waits in the queue, so a stalled queue can never
+  /// grow from repeated opens (P-1 bounds); it is not a snapshot waiter, so
+  /// snapshot admission and busy accounting are unchanged. Queue order
+  /// still puts it before any snapshot requested after this call.
+  void schedulePurge() {
+    if (_purgeScheduled) return;
+    _purgeScheduled = true;
+    _enqueueTask(() async {
+      _purgeScheduled = false;
+      await _purge();
+    });
+  }
+
+  bool _purgeScheduled = false;
+
+  Future<IntruderPurgeResult> _purge() async {
+    final Duration? keep = retention;
+    if (keep == null) return IntruderPurgeResult.nothing;
+    for (int attempt = 1; attempt <= maxCasAttempts; attempt++) {
+      if (_readOnly) return IntruderPurgeResult.refused;
+      final IntruderLogRead read = await _store.read();
+      switch (read) {
+        case IntruderLogMissing():
+          return IntruderPurgeResult.nothing;
+        case IntruderLogLoaded(
+            :final IntruderFailureLog log,
+            :final String raw
+          ):
+          _observe(log);
+          final DateTime cutoff = _now().subtract(keep);
+          _Expiry? expiry;
+          final List<FailedAttemptEvent> kept = <FailedAttemptEvent>[];
+          for (final FailedAttemptEvent e in log.events) {
+            if (e.at.isBefore(cutoff)) {
+              expiry = _Expiry.add(expiry, e.at);
+            } else {
+              kept.add(e);
+            }
+          }
+          if (expiry == null) return IntruderPurgeResult.nothing;
+          // A v1 log adopts a generation first (the same lazy migration any
+          // record performs); no secure generator: nothing written.
+          final IntruderFailureLog? based = _withGeneration(log);
+          if (based == null) return IntruderPurgeResult.failed;
+          final IntruderFailureLog next = IntruderFailureLog(
+            nextSeq: based.nextSeq,
+            consecutiveFailures: based.consecutiveFailures,
+            events: List<FailedAttemptEvent>.unmodifiable(kept),
+            gen: based.gen,
+          );
+          final IntruderWriteResult w =
+              await _store.writeIfUnchanged(next, expectedRaw: raw);
+          switch (w) {
+            case IntruderWriteCommitted():
+              _committed(next);
+              _reportExpired(expiry);
+              return IntruderPurgeResult.purged;
+            case IntruderWriteConflict():
+              continue;
+            case IntruderWriteUnknown(:final String? attemptedRaw):
+              final (_, String? durableRaw, bool readOk) =
+                  await _reconcileRead();
+              if (readOk &&
+                  attemptedRaw != null &&
+                  durableRaw == attemptedRaw) {
+                _committed(next);
+                _reportExpired(expiry);
+                return IntruderPurgeResult.purged;
+              }
+              if (!readOk) _unknownOutcomes++;
+              _storageError = true;
+              return IntruderPurgeResult.failed;
+          }
+        case IntruderLogUnsupported():
+          _readOnly = true;
+          return IntruderPurgeResult.refused;
+        case IntruderLogCorrupt():
+        case IntruderLogUnreadable():
+          return IntruderPurgeResult.refused;
+      }
+    }
+    return IntruderPurgeResult.failed; // contention
   }
 
   // -- queue ----------------------------------------------------------------
@@ -853,10 +981,12 @@ class IntruderMonitor implements VerifiedAttemptObserver {
         counterPersisted: attempt.counterPersisted,
         logGen: log.gen,
       );
+      final (List<FailedAttemptEvent>, _Expiry?) bounded =
+          _bounded(<FailedAttemptEvent>[...log.events, event]);
       final IntruderFailureLog next = IntruderFailureLog(
         nextSeq: log.nextSeq + 1,
         consecutiveFailures: run,
-        events: _bounded(<FailedAttemptEvent>[...log.events, event]),
+        events: bounded.$1,
         gen: log.gen,
       );
       final IntruderWriteResult written =
@@ -864,6 +994,7 @@ class IntruderMonitor implements VerifiedAttemptObserver {
       switch (written) {
         case IntruderWriteCommitted():
           _committed(next);
+          _reportExpired(bounded.$2);
           _recorded(vid, event, ownerEpoch, resetFirst);
           return;
         case IntruderWriteConflict():
@@ -886,6 +1017,7 @@ class IntruderMonitor implements VerifiedAttemptObserver {
             return;
           }
           _committed(durable!); // durably confirmed by verificationId
+          _reportExpired(bounded.$2);
           _recorded(vid, landed, ownerEpoch, resetFirst);
           return;
       }
@@ -915,10 +1047,23 @@ class IntruderMonitor implements VerifiedAttemptObserver {
   }
 
   /// Retention (age, future-dated kept), capacity, then encoded-size bound.
-  List<FailedAttemptEvent> _bounded(List<FailedAttemptEvent> events) {
-    final DateTime cutoff = _now().subtract(retention);
-    List<FailedAttemptEvent> kept =
-        events.where((FailedAttemptEvent e) => !e.at.isBefore(cutoff)).toList();
+  /// Batch 5: also returns what the AGE purge removed (null when nothing).
+  (List<FailedAttemptEvent>, _Expiry?) _bounded(
+      List<FailedAttemptEvent> events) {
+    final Duration? keep = retention;
+    List<FailedAttemptEvent> kept = events;
+    _Expiry? expiry;
+    if (keep != null) {
+      final DateTime cutoff = _now().subtract(keep);
+      kept = <FailedAttemptEvent>[];
+      for (final FailedAttemptEvent e in events) {
+        if (e.at.isBefore(cutoff)) {
+          expiry = _Expiry.add(expiry, e.at);
+        } else {
+          kept.add(e);
+        }
+      }
+    }
     if (kept.length > maxEvents) {
       kept = kept.sublist(kept.length - maxEvents);
     }
@@ -934,9 +1079,26 @@ class IntruderMonitor implements VerifiedAttemptObserver {
             maxEncodedBytes) {
       kept = kept.sublist(1);
     }
-    return List<FailedAttemptEvent>.unmodifiable(kept);
+    return (List<FailedAttemptEvent>.unmodifiable(kept), expiry);
   }
 }
+
+/// Batch 5: what one age purge removed.
+final class _Expiry {
+  const _Expiry(this.n, this.from, this.to);
+
+  final int n;
+  final DateTime from;
+  final DateTime to;
+
+  static _Expiry add(_Expiry? x, DateTime at) => x == null
+      ? _Expiry(1, at, at)
+      : _Expiry(x.n + 1, at.isBefore(x.from) ? at : x.from,
+          at.isAfter(x.to) ? at : x.to);
+}
+
+/// Batch 5: result of [IntruderMonitor.purgeExpired].
+enum IntruderPurgeResult { purged, nothing, refused, failed }
 
 /// Batch 4: the fixed cut of a Clear History (see
 /// [IntruderMonitor.prepareHistoryClear]). [gen] null: no generation-bearing

@@ -47,6 +47,13 @@ enum TimelineEntryKind {
 
   /// Batch 4: the owner cleared history (one marker; never removable).
   historyCleared,
+
+  /// Batch 5: the owner changed the history retention period.
+  retentionChanged,
+
+  /// Batch 5: older events were removed automatically (one coalesced
+  /// marker).
+  historyExpired,
 }
 
 /// Metadata-only timeline row (no credential material, no pixels).
@@ -75,6 +82,11 @@ final class TimelineEntry {
     this.clockBack = false,
     this.clearScope,
     this.clearPending = false,
+    this.retentionOld,
+    this.retentionNew,
+    this.expiredCount,
+    this.expiredFrom,
+    this.expiredTo,
   });
 
   final TimelineSource source;
@@ -118,6 +130,16 @@ final class TimelineEntry {
   /// whether clearing is still unfinished.
   final HistoryClearScope? clearScope;
   final bool clearPending;
+
+  /// Batch 5 ([TimelineEntryKind.retentionChanged] only): days before/after.
+  final int? retentionOld;
+  final int? retentionNew;
+
+  /// Batch 5 ([TimelineEntryKind.historyExpired] only): how many events
+  /// were removed by age retention and the span of their times.
+  final int? expiredCount;
+  final DateTime? expiredFrom;
+  final DateTime? expiredTo;
 
   /// Recorded while the wall clock was behind the previous event.
   final bool clockBack;
@@ -357,6 +379,11 @@ class SecurityTimelineReader {
   Future<(TimelineSourceStatus, IntruderMonitorStatus, IntruderFailureLog?)>
       _loadFailures(List<TimelineEntry> out) async {
     IntruderFailureLog? log;
+    // Batch 5: retention also applies on open. Scheduled (not awaited) so
+    // the busy proof below is unchanged; queue order runs it before this
+    // load's snapshot, and its expiry report reaches the journal before the
+    // journal read that follows. Never throws.
+    _monitor.schedulePurge();
     // Request-local busy proof (M2): the counter has exactly one increment
     // site, inside the synchronous rejection branch of snapshot(); these
     // three statements run with no await in between.
@@ -510,6 +537,10 @@ class SecurityTimelineReader {
           TimelineEntryKind.storageRestored,
         SecurityJournalEventType.historyCleared =>
           TimelineEntryKind.historyCleared,
+        SecurityJournalEventType.retentionChanged =>
+          TimelineEntryKind.retentionChanged,
+        SecurityJournalEventType.historyExpired =>
+          TimelineEntryKind.historyExpired,
       },
       trig: f?.trig,
       tgen: f?.tgen,
@@ -522,6 +553,15 @@ class SecurityTimelineReader {
       storageKind: f is StorageUnavailableFields ? f.kind : null,
       clearScope: f is HistoryClearedFields ? f.scope : null,
       clearPending: f is HistoryClearedFields && f.pending,
+      retentionOld: f is RetentionChangedFields ? f.oldDays : null,
+      retentionNew: f is RetentionChangedFields ? f.newDays : null,
+      expiredCount: f is HistoryExpiredFields ? f.n : null,
+      expiredFrom: f is HistoryExpiredFields
+          ? DateTime.fromMillisecondsSinceEpoch(f.from)
+          : null,
+      expiredTo: f is HistoryExpiredFields
+          ? DateTime.fromMillisecondsSinceEpoch(f.to)
+          : null,
     );
   }
 }

@@ -229,10 +229,12 @@ void main() {
     test('v3 row: unsupported, 0 writes, no quarantine, outcomes lost',
         () async {
       // Batch 3: v3 is now current. Batch 4 (disclosed re-baseline): v4 is
-      // readable (v3 + clear marker); the "newer" row is v5.
+      // readable (v3 + clear marker); the "newer" row is v5. Batch 5
+      // (disclosed re-baseline): v5 is readable (retention events); the
+      // "newer" row is v6.
       final String v3 = jsonEncode(<String, Object?>{
         'schema': SecurityJournalDocument.schema,
-        'v': 5,
+        'v': 6,
         'nextSeq': 1,
         'whatever': true,
         'events': <Object?>[],
@@ -432,7 +434,8 @@ void main() {
               jsonEncode(<String, Object?>{
                 'schema': SecurityJournalDocument.schema,
                 // Batch 4: v4 readable (v3 + clear marker); v5 = "newer".
-                'v': 5,
+                // Batch 5 (disclosed): v5 readable too; v6 = "newer".
+                'v': 6,
                 'nextSeq': 0,
                 'events': <Object?>[],
               }));

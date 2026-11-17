@@ -161,7 +161,12 @@ class SecurityEventJournal
   final SecurityEventJournalStore _store;
   final DateTime Function() _now;
   final int maxEvents;
-  final Duration retention;
+
+  /// Age retention. Batch 5: set from the owner's history retention
+  /// setting (inside the queue: [startup] / [changeRetention]). Null = not
+  /// known yet: no age purge runs (count / size caps still apply), so an
+  /// unknown setting can never shorten retention.
+  Duration? retention;
   final int maxPending;
   final int maxEncodedBytes;
 
@@ -308,9 +313,13 @@ class SecurityEventJournal
   /// (nothing is written at startup unless integrity or retention requires
   /// it); the row and its start marker are created by the first [record] or
   /// [read]. Never throws.
-  Future<void> startup() {
+  ///
+  /// Batch 5: [retention], when given, becomes the age retention before the
+  /// bounds are applied (queue-ordered).
+  Future<void> startup({Duration? retention}) {
     final Completer<void> done = Completer<void>();
     _enqueue(() async {
+      if (retention != null) this.retention = retention;
       try {
         final SecurityJournalDocument? doc =
             await _ensureLoaded(createIfMissing: false);
@@ -364,6 +373,108 @@ class SecurityEventJournal
     final Completer<void> waiter = Completer<void>();
     _idleWaiters.add(waiter);
     return waiter.future;
+  }
+
+  // -- Batch 5: Retention ---------------------------------------------------
+
+  /// The owner changed history retention ([oldDays] -> [newDays], effective
+  /// values; the setting is already saved). In the queue: the new retention
+  /// takes effect, then ONE write appends `retentionChanged` and applies it
+  /// (events older than the new cutoff are removed and folded into the
+  /// expiry marker). Returns true when that write committed; otherwise the
+  /// event is counted as lost (the retention still applies). Never throws.
+  Future<bool> changeRetention(int oldDays, int newDays) {
+    final RetentionChangedFields fields =
+        RetentionChangedFields(oldDays: oldDays, newDays: newDays);
+    if (!fields.isValid) return Future<bool>.value(false);
+    final Completer<bool> out = Completer<bool>();
+    _enqueue(() async {
+      retention = Duration(days: newDays);
+      try {
+        _cache = null; // re-read: never written from a cached copy
+        final SecurityJournalDocument? doc = await _ensureLoaded();
+        if (doc == null) {
+          _addLost(1);
+          out.complete(false);
+          return;
+        }
+        await _persistBounded(_withEvent(
+            doc, SecurityJournalEventType.retentionChanged, fields, _now()));
+        out.complete(true);
+      } on _JournalConflict {
+        rethrow;
+      } catch (_) {
+        if (!out.isCompleted) {
+          _addLost(1);
+          out.complete(false);
+        }
+        rethrow;
+      }
+    });
+    return out.future;
+  }
+
+  /// Failed-unlock history purged by age retention: [n] attempts stamped
+  /// [from]..[to]. Folded into the ONE `historyExpired` marker (n
+  /// saturating, range widened). Synchronous, only enqueues, never throws;
+  /// invalid input, a full queue or a failed write counts as lost.
+  void recordHistoryExpired(int n, DateTime from, DateTime to) {
+    try {
+      final HistoryExpiredFields f = HistoryExpiredFields(
+        n: n,
+        from: from.millisecondsSinceEpoch,
+        to: to.millisecondsSinceEpoch,
+      );
+      if (!f.isValid) {
+        _addLost(1);
+        return;
+      }
+      _enqueueBounded(() async {
+        try {
+          final SecurityJournalDocument? doc = await _ensureLoaded();
+          if (doc == null) {
+            _addLost(1);
+            return;
+          }
+          final SecurityJournalDocument base = _withUpgradeMarker(doc);
+          final List<SecurityJournalEvent> events =
+              List<SecurityJournalEvent>.of(base.events);
+          final int nextSeq =
+              _foldExpiry(events, base.nextSeq, f.n, f.from, f.to);
+          await _persistBounded(
+              base.copyWith(nextSeq: nextSeq, events: events));
+        } on _JournalConflict {
+          rethrow;
+        } catch (_) {
+          _addLost(1);
+          rethrow;
+        }
+      });
+    } catch (_) {
+      _addLost(1);
+    }
+  }
+
+  /// Replaces the expiry marker in [events] (if any) by one at seq
+  /// [nextSeq] covering it plus [n] events stamped [from]..[to] (epoch ms).
+  /// Returns the new `nextSeq`.
+  int _foldExpiry(
+      List<SecurityJournalEvent> events, int nextSeq, int n, int from, int to) {
+    HistoryExpiredFields merged =
+        HistoryExpiredFields(n: n, from: from, to: to);
+    final int i = events.indexWhere((SecurityJournalEvent e) =>
+        e.type == SecurityJournalEventType.historyExpired);
+    if (i >= 0) {
+      merged = (events.removeAt(i).fields! as HistoryExpiredFields)
+          .merge(n, from, to);
+    }
+    events.add(SecurityJournalEvent(
+      seq: nextSeq,
+      at: _now(),
+      type: SecurityJournalEventType.historyExpired,
+      fields: merged,
+    ));
+    return nextSeq + 1;
   }
 
   // -- Batch 4: Clear History -----------------------------------------------
@@ -973,15 +1084,35 @@ class SecurityEventJournal
     // Age retention drops only events OLDER than the cutoff. Events stamped
     // in the future (clock moved backwards) are kept, never purged.
     // Batch 4: the clear marker is exempt from age, count and size bounds.
+    // Batch 5: so is the expiry marker; every age purge is folded into it
+    // (no age purge at all while the retention setting is not known).
     bool exempt(SecurityJournalEvent e) =>
-        e.type == SecurityJournalEventType.historyCleared;
+        e.type == SecurityJournalEventType.historyCleared ||
+        e.type == SecurityJournalEventType.historyExpired;
     int oldestBounded() =>
         events.indexWhere((SecurityJournalEvent e) => !exempt(e));
-    final DateTime cutoff = _now().subtract(retention);
-    final int before = events.length;
-    events.removeWhere(
-        (SecurityJournalEvent e) => !exempt(e) && e.at.isBefore(cutoff));
-    dropped += before - events.length;
+    int nextSeq = doc.nextSeq;
+    final Duration? keep = retention;
+    if (keep != null) {
+      final DateTime cutoff = _now().subtract(keep);
+      bool expired(SecurityJournalEvent e) =>
+          !exempt(e) && e.at.isBefore(cutoff);
+      int n = 0;
+      int from = 0;
+      int to = 0;
+      for (final SecurityJournalEvent e in events) {
+        if (!expired(e)) continue;
+        final int ms = e.at.millisecondsSinceEpoch;
+        if (n == 0 || ms < from) from = ms;
+        if (n == 0 || ms > to) to = ms;
+        n++;
+      }
+      if (n > 0) {
+        events.removeWhere(expired);
+        dropped += n;
+        nextSeq = _foldExpiry(events, nextSeq, n, from, to);
+      }
+    }
     // M2 health quota: the oldest protection-health events go first.
     int health = events
         .where((SecurityJournalEvent e) =>
@@ -998,6 +1129,7 @@ class SecurityEventJournal
       dropped++;
     }
     SecurityJournalDocument next() => doc.copyWith(
+          nextSeq: nextSeq,
           discarded:
               SecurityJournalDocument.saturatingAdd(doc.discarded, dropped),
           lost: SecurityJournalDocument.saturatingAdd(doc.lost, committedLost),

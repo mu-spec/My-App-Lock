@@ -195,6 +195,78 @@ void main() {
     });
 
     testWidgets(
+        'P13/M3 Batch 5: history retention — shortening needs confirmation '
+        'AND a fresh PIN; cancel at either step writes nothing; lengthening '
+        'needs only the PIN; the persisted value is shown',
+        (WidgetTester tester) async {
+      await c.auth.enrollPin(_pin);
+      await pumpSettings(tester);
+      expect(find.text('30 days'), findsOneWidget);
+
+      Future<void> pick(String label) async {
+        await tapKey(tester, 'history_retention_dropdown');
+        await tester.tap(find.text(label).last);
+        await tester.pumpAndSettle();
+      }
+
+      // 30 -> 7: confirmation cancelled -> no verification, nothing saved.
+      await pick('7 days');
+      expect(find.text(IntruderSettingsText.shortenBody(7)), findsOneWidget);
+      await tapKey(tester, 'history_retention_shorten_cancel');
+      expect(find.byType(PinUnlockScreen), findsNothing);
+      expect((await c.intruderDefenseSettings.read()).health,
+          IntruderSettingsHealth.missing);
+
+      // Confirmed, verification cancelled -> nothing saved.
+      await pick('7 days');
+      await tapKey(tester, 'history_retention_shorten_confirm');
+      await cancelVerification(tester);
+      expect((await c.intruderDefenseSettings.read()).health,
+          IntruderSettingsHealth.missing,
+          reason: 'nothing written without verification');
+      expect(find.text(IntruderSettingsText.notChanged), findsOneWidget);
+      expect(find.text('30 days'), findsOneWidget);
+
+      // Confirmed + PIN -> saved and shown.
+      await pick('7 days');
+      await tapKey(tester, 'history_retention_shorten_confirm');
+      await typePin(tester, _pin);
+      expect(
+          (await c.intruderDefenseSettings.read())
+              .settings
+              .historyRetentionDays,
+          7);
+      expect(find.text('7 days'), findsOneWidget);
+
+      // 7 -> 90 (lengthening): no confirmation dialog, PIN only.
+      await pick('90 days');
+      expect(find.text(IntruderSettingsText.shortenTitle), findsNothing);
+      await typePin(tester, _pin);
+      expect(
+          (await c.intruderDefenseSettings.read())
+              .settings
+              .historyRetentionDays,
+          90);
+      expect(find.text('90 days'), findsOneWidget);
+      expect((await c.intruderDefenseSettings.read()).settings.threshold, 3,
+          reason: 'no other field changed');
+    });
+
+    testWidgets(
+        'P13/M3 Batch 5: an invalid stored history period shows 30 days and '
+        'a notice', (WidgetTester tester) async {
+      await c.auth.enrollPin(_pin);
+      await db.setSetting(
+          IntruderDefenseSettingsStore.storageKey,
+          await rawEncrypted(
+              '{"v":1,"evidence":false,"alarm":false,"threshold":3,"hr":14}'));
+      await pumpSettings(tester);
+      expect(find.text('30 days'), findsOneWidget);
+      expect(
+          find.byKey(const Key('history_retention_invalid')), findsOneWidget);
+    });
+
+    testWidgets(
         'a locked-out owner cannot change anything and the lockout is '
         'unchanged (no bypass via settings)', (WidgetTester tester) async {
       await c.auth.enrollPin(_pin);

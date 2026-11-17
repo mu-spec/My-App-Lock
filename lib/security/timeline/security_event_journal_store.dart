@@ -118,10 +118,10 @@ class SecurityEventJournalStore {
       return SecurityJournalCorrupt(raw);
     }
     final int? declared = SecurityJournalDocument.declaredVersion(decoded);
-    // Newer than this build (above version 4): never decoded, never
+    // Newer than this build (above version 5): never decoded, never
     // overwritten.
     if (declared != null &&
-        declared > SecurityJournalDocument.markerVersion &&
+        declared > SecurityJournalDocument.newestVersion &&
         decoded is Map &&
         decoded['schema'] == SecurityJournalDocument.schema) {
       return SecurityJournalUnsupported(declared);

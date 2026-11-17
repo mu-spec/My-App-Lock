@@ -47,6 +47,7 @@ import '../security/intruder/intruder_evidence_store.dart';
 import '../security/intruder/intruder_monitor.dart';
 import '../security/intruder/intruder_owner_session.dart';
 import '../security/history/history_clear_service.dart';
+import '../security/history/history_retention_service.dart';
 import '../security/timeline/security_event_journal.dart';
 import '../security/timeline/security_event_journal_store.dart';
 import '../security/timeline/intruder_outcome_journal_adapter.dart';
@@ -159,6 +160,9 @@ class AppContainer {
     // completed verifications from the manager and can never change one.
     intruderMonitor = IntruderMonitor(
       store: IntruderFailureLogStore(_database, cipher: settingsCipher),
+      // Batch 5: no age purge until the owner's retention setting is read
+      // (historyRetention.startup); an unknown setting never shortens it.
+      retention: null,
     );
     // Phase 12 / M2: owner opt-in evidence + alarm. Observe-only listener
     // on the monitor (called after an event is persisted); it never sees
@@ -185,7 +189,8 @@ class AppContainer {
     // blocks startup and never fails.
     securityJournalStore =
         SecurityEventJournalStore(_database, cipher: settingsCipher);
-    securityJournal = SecurityEventJournal(store: securityJournalStore);
+    securityJournal =
+        SecurityEventJournal(store: securityJournalStore, retention: null);
     // Phase 13 / M2: capture/alarm outcomes reach the journal only through
     // the adapter (sync O(1) call -> microtask -> bounded journal queue).
     intruderDefense.outcomeObserver =
@@ -206,8 +211,17 @@ class AppContainer {
       evidence: intruderEvidence,
       liveGen: () => intruderDefense.currentGen,
     );
-    securityJournalStartup =
-        securityJournal.startup().catchError((Object _) {});
+    // P13/M3 Batch 5: history retention (owner setting; 30 days by default
+    // and on any problem). Startup reads it, then runs journal maintenance
+    // and the failure-log purge with it; failure-log purges are disclosed in
+    // the journal's coalesced expiry marker.
+    historyRetention = HistoryRetentionService(
+      settings: intruderDefenseSettings,
+      monitor: intruderMonitor,
+      journal: securityJournal,
+    );
+    intruderMonitor.onHistoryExpired = securityJournal.recordHistoryExpired;
+    securityJournalStartup = historyRetention.startup();
     unawaited(securityJournalStartup);
     auth = DefaultCredentialManager(
       settings: securitySettings,
@@ -473,6 +487,9 @@ class AppContainer {
 
   /// P13/M3 Batch 4 — owner Clear History (Security timeline action only).
   late final HistoryClearService historyClear;
+
+  /// P13/M3 Batch 5 — owner history retention (Intruder settings).
+  late final HistoryRetentionService historyRetention;
 
   /// Phase 13 / M2 — failed-unlock history storage sampler (provable
   /// transitions only; feeds the journal).

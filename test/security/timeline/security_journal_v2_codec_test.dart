@@ -450,6 +450,10 @@ void main() {
             // Batch 4 (disclosed): one APPENDED type, decodable only in a v4
             // journal (= v3 + exactly one clear marker); nothing above moved.
             'historyCleared',
+            // Batch 5 (disclosed): two APPENDED types, decodable only in a
+            // v5 journal; nothing above moved.
+            'retentionChanged',
+            'historyExpired',
           ]);
       expect(CaptureWhy.values.map((CaptureWhy e) => e.name).toList(), <String>[
         'permission',
@@ -571,11 +575,13 @@ void main() {
           database: InMemoryLocalDatabase());
       final SecurityEventJournalStore store =
           SecurityEventJournalStore(db, cipher: null);
-      await db.setSetting(SecurityEventJournalStore.storageKey,
-          jsonEncode(<String, Object?>{...doc2(<Object?>[]), 'v': 5}));
+      await db.setSetting(
+          SecurityEventJournalStore.storageKey,
+          // Batch 5 (disclosed): v5 is readable; "newer" is v6.
+          jsonEncode(<String, Object?>{...doc2(<Object?>[]), 'v': 6}));
       final SecurityJournalRead r = await store.read();
       expect(r, isA<SecurityJournalUnsupported>());
-      expect((r as SecurityJournalUnsupported).version, 5);
+      expect((r as SecurityJournalUnsupported).version, 6);
       expect(c, isNotNull);
     });
   });

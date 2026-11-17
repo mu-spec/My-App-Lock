@@ -272,7 +272,7 @@ void main() {
     final String newer =
         'enc:v1:${await c.settingsCipher.encryptString(jsonEncode(<String, Object?>{
           'schema': SecurityJournalDocument.schema,
-          'v': 5,
+          'v': 6, // Batch 5 (disclosed): v5 is readable; "newer" is v6
         }))}';
     await db.setSetting(SecurityEventJournalStore.storageKey, newer);
     final String? logRow =

@@ -24,12 +24,19 @@ final class IntruderDefenseSettings {
     this.evidenceEnabled = false,
     this.alarmEnabled = false,
     this.threshold = defaultThreshold,
+    this.historyRetentionDays = defaultHistoryRetentionDays,
+    this.invalidRetention,
   });
 
   static const int schemaVersion = 1;
   static const int defaultThreshold = 3;
   static const int minThreshold = 1;
   static const int maxThreshold = 10;
+
+  /// Batch 5 (F-2): history retention choices, in days, and the default
+  /// (today's behaviour). Evidence retention is separate and fixed.
+  static const List<int> historyRetentionChoices = <int>[7, 30, 90];
+  static const int defaultHistoryRetentionDays = 30;
 
   static const IntruderDefenseSettings disabled = IntruderDefenseSettings();
 
@@ -42,15 +49,33 @@ final class IntruderDefenseSettings {
   /// Consecutive verified failures that trigger evidence / alarm.
   final int threshold;
 
+  /// Batch 5: history retention in days (always one of
+  /// [historyRetentionChoices]). Stored as the optional `hr` only when not
+  /// the default, so a default record stays byte-identical to Phase 12.
+  final int historyRetentionDays;
+
+  /// Batch 5: a stored `hr` that is not a valid choice. Such a value means
+  /// the default (30 — never the shortest), raises [retentionInvalid] and
+  /// is written back unchanged by unrelated updates (never silently
+  /// replaced); only an explicit retention choice replaces it.
+  final InvalidRetentionValue? invalidRetention;
+
+  bool get retentionInvalid => invalidRetention != null;
+
   IntruderDefenseSettings copyWith({
     bool? evidenceEnabled,
     bool? alarmEnabled,
     int? threshold,
+    int? historyRetentionDays,
   }) =>
       IntruderDefenseSettings(
         evidenceEnabled: evidenceEnabled ?? this.evidenceEnabled,
         alarmEnabled: alarmEnabled ?? this.alarmEnabled,
         threshold: threshold ?? this.threshold,
+        historyRetentionDays: historyRetentionDays ?? this.historyRetentionDays,
+        // An explicit retention choice replaces an invalid stored value.
+        invalidRetention:
+            historyRetentionDays == null ? invalidRetention : null,
       );
 
   Map<String, Object?> toJson() => <String, Object?>{
@@ -58,6 +83,10 @@ final class IntruderDefenseSettings {
         'evidence': evidenceEnabled,
         'alarm': alarmEnabled,
         'threshold': threshold,
+        if (historyRetentionDays != defaultHistoryRetentionDays)
+          'hr': historyRetentionDays
+        else if (invalidRetention != null)
+          'hr': invalidRetention!.raw,
       };
 
   /// Strict decode; throws [FormatException] on anything unexpected.
@@ -73,10 +102,17 @@ final class IntruderDefenseSettings {
     if (t < minThreshold || t > maxThreshold) {
       throw const FormatException('threshold out of range');
     }
+    // Batch 5: optional `hr`; absent -> 30; invalid -> 30 + health flag
+    // (the record itself stays valid: an older build ignores `hr`).
+    final Object? hr = raw['hr'];
+    final bool hrValid = hr is int && historyRetentionChoices.contains(hr);
     return IntruderDefenseSettings(
       evidenceEnabled: raw['evidence'] as bool,
       alarmEnabled: raw['alarm'] as bool,
       threshold: t,
+      historyRetentionDays: hrValid ? hr : defaultHistoryRetentionDays,
+      invalidRetention:
+          raw.containsKey('hr') && !hrValid ? InvalidRetentionValue(hr) : null,
     );
   }
 
@@ -85,10 +121,29 @@ final class IntruderDefenseSettings {
       other is IntruderDefenseSettings &&
       other.evidenceEnabled == evidenceEnabled &&
       other.alarmEnabled == alarmEnabled &&
-      other.threshold == threshold;
+      other.threshold == threshold &&
+      other.historyRetentionDays == historyRetentionDays &&
+      other.invalidRetention == invalidRetention;
 
   @override
-  int get hashCode => Object.hash(evidenceEnabled, alarmEnabled, threshold);
+  int get hashCode => Object.hash(evidenceEnabled, alarmEnabled, threshold,
+      historyRetentionDays, invalidRetention);
+}
+
+/// Batch 5: an invalid stored `hr`, kept verbatim so it is written back
+/// unchanged by unrelated settings updates.
+final class InvalidRetentionValue {
+  const InvalidRetentionValue(this.raw);
+
+  final Object? raw;
+
+  @override
+  bool operator ==(Object other) =>
+      other is InvalidRetentionValue &&
+      jsonEncode(other.raw) == jsonEncode(raw);
+
+  @override
+  int get hashCode => jsonEncode(raw).hashCode;
 }
 
 /// Why the stored settings are (or are not) in effect.

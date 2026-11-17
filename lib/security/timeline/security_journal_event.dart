@@ -22,6 +22,13 @@
 // v3, so a Batch-3 build is affected only after a clear, and then reads the
 // journal as unsupported (read-only, never overwritten), never as corrupt.
 //
+// P13/M3 Batch 5 (Retention Controls) — version 5 = version 4's content
+// rules plus the retention events `retentionChanged {old, new}` and the
+// coalesced `historyExpired {n, from, to}` (at most one; exempt from
+// retention and caps). A journal is written as v5 only while it holds at
+// least one of them (at most one `historyCleared` is still allowed); any
+// earlier build reads it as unsupported (read-only, never overwritten).
+//
 // Privacy (TL-4 / correction F): anomalies only. There is deliberately no
 // type for successful unlocks or routine usage, and no field may carry
 // credential material, pixels, package names or free-form text. Every
@@ -67,7 +74,17 @@ enum SecurityJournalEventType {
 
   /// Batch 4: the owner cleared history (exactly one in a v4 journal;
   /// exempt from age retention and caps; replaced by the next clear).
-  historyCleared;
+  historyCleared,
+
+  /// Batch 5: the owner changed the history retention period (v5 only).
+  retentionChanged,
+
+  /// Batch 5: events were removed automatically by age retention (one
+  /// coalesced marker; v5 only; exempt from age retention and caps).
+  historyExpired;
+
+  /// Batch 5: types that require a version-5 document.
+  bool get inV5Only => this == retentionChanged || this == historyExpired;
 
   /// Types a version-1 document may contain.
   bool get inV1 => this == journalStarted || this == journalRecovered;
@@ -77,7 +94,8 @@ enum SecurityJournalEventType {
       this == journalStarted ||
       this == journalRecovered ||
       this == journalUpgraded ||
-      this == historyCleared;
+      this == historyCleared ||
+      this == historyExpired;
 
   /// Intruder-response outcomes (carry `trig`; `(type, trig)` is unique in
   /// a journal — E-5).
@@ -229,6 +247,7 @@ sealed class SecurityEventFields {
     Object? raw, {
     bool v3 = false,
     bool v4 = false,
+    bool v5 = false,
   }) {
     final bool needed = switch (type) {
       SecurityJournalEventType.journalStarted ||
@@ -326,6 +345,25 @@ sealed class SecurityEventFields {
               ? _intIn(raw['bc'], securityJournalMaxSafeInt, 'bc')
               : null,
         );
+      case SecurityJournalEventType.retentionChanged:
+        if (!v5) throw const FormatException('retentionChanged before v5');
+        _exactKeys(raw, const <String>{'old', 'new'});
+        final RetentionChangedFields rc = RetentionChangedFields(
+          oldDays: _intIn(raw['old'], 90, 'old'),
+          newDays: _intIn(raw['new'], 90, 'new'),
+        );
+        if (!rc.isValid) throw const FormatException('retention invalid');
+        return rc;
+      case SecurityJournalEventType.historyExpired:
+        if (!v5) throw const FormatException('historyExpired before v5');
+        _exactKeys(raw, const <String>{'n', 'from', 'to'});
+        final HistoryExpiredFields he = HistoryExpiredFields(
+          n: _intIn(raw['n'], SecurityJournalDocument.maxCounter, 'n'),
+          from: _intIn(raw['from'], securityJournalMaxAtMillis, 'from'),
+          to: _intIn(raw['to'], securityJournalMaxAtMillis, 'to'),
+        );
+        if (!he.isValid) throw const FormatException('expiry invalid');
+        return he;
     }
   }
 
@@ -389,6 +427,69 @@ final class JournalUpgradedFields extends SecurityEventFields {
 
   @override
   Map<String, Object?> toJson() => <String, Object?>{'from': 1};
+}
+
+/// Batch 5: history retention periods the owner can choose (days).
+const Set<int> historyRetentionDays = <int>{7, 30, 90};
+
+/// Batch 5: the owner changed history retention from [oldDays] to
+/// [newDays] (effective values; both in [historyRetentionDays]).
+final class RetentionChangedFields extends SecurityEventFields {
+  const RetentionChangedFields({required this.oldDays, required this.newDays});
+
+  final int oldDays;
+  final int newDays;
+
+  @override
+  SecurityJournalEventType get type =>
+      SecurityJournalEventType.retentionChanged;
+
+  @override
+  bool get isValid =>
+      historyRetentionDays.contains(oldDays) &&
+      historyRetentionDays.contains(newDays) &&
+      oldDays != newDays;
+
+  @override
+  Map<String, Object?> toJson() =>
+      <String, Object?>{'old': oldDays, 'new': newDays};
+}
+
+/// Batch 5: [n] events (journal and failed-unlock history together;
+/// saturating) were removed by age retention; their times span
+/// [[from], [to]] (epoch milliseconds). Coalesced: one marker, widened.
+final class HistoryExpiredFields extends SecurityEventFields {
+  const HistoryExpiredFields(
+      {required this.n, required this.from, required this.to});
+
+  final int n;
+  final int from;
+  final int to;
+
+  /// This marker with a purge of [count] events spanning [[start], [end]]
+  /// folded in (n saturating, range
+  /// widened).
+  HistoryExpiredFields merge(int count, int start, int end) =>
+      HistoryExpiredFields(
+        n: SecurityJournalDocument.saturatingAdd(n, count),
+        from: start < from ? start : from,
+        to: end > to ? end : to,
+      );
+
+  @override
+  SecurityJournalEventType get type => SecurityJournalEventType.historyExpired;
+
+  @override
+  bool get isValid =>
+      n >= 1 &&
+      n <= SecurityJournalDocument.maxCounter &&
+      from >= 0 &&
+      from <= to &&
+      to <= securityJournalMaxAtMillis;
+
+  @override
+  Map<String, Object?> toJson() =>
+      <String, Object?>{'n': n, 'from': from, 'to': to};
 }
 
 /// Batch 4 (Clear History). The cleared set C is fixed when the marker is
@@ -734,7 +835,7 @@ final class SecurityJournalEvent {
       at: DateTime.fromMillisecondsSinceEpoch(at),
       type: t,
       fields: SecurityEventFields.fromJson(t, raw.containsKey('f'), raw['f'],
-          v3: version >= 3, v4: version >= 4),
+          v3: version >= 3, v4: version >= 4, v5: version >= 5),
       clockBack: clockBack,
     );
   }
@@ -802,6 +903,13 @@ final class SecurityJournalDocument {
   /// only then) as version 4. The highest version this build reads.
   static const int markerVersion = 4;
 
+  /// Batch 5: a journal holding a retention event (`retentionChanged` or
+  /// `historyExpired`) is written (and only then) as version 5.
+  static const int retentionVersion = 5;
+
+  /// Newest version this build decodes; anything above is unsupported.
+  static const int newestVersion = retentionVersion;
+
   /// Decoder hard limit (well above the retention cap).
   static const int maxDecodableEvents = 1000;
 
@@ -854,8 +962,22 @@ final class SecurityJournalDocument {
     return null;
   }
 
-  /// The version this document is written as (4 only with the marker).
-  int get encodedVersion => historyMarker == null ? version : markerVersion;
+  /// Batch 5: the coalesced expiry marker, if any (at most one).
+  SecurityJournalEvent? get expiryMarker {
+    for (final SecurityJournalEvent e in events) {
+      if (e.type == SecurityJournalEventType.historyExpired) return e;
+    }
+    return null;
+  }
+
+  /// The version this document is written as: 5 with a retention event,
+  /// else 4 with the clear marker, else 3.
+  int get encodedVersion =>
+      events.any((SecurityJournalEvent e) => e.type.inV5Only)
+          ? retentionVersion
+          : historyMarker == null
+              ? version
+              : markerVersion;
 
   static int saturatingAdd(int a, int b) {
     final int s = a + b;
@@ -942,7 +1064,11 @@ final class SecurityJournalDocument {
     }
     final Object? v = raw['v'];
     if (raw['schema'] != schema ||
-        (v != 1 && v != 2 && v != version && v != markerVersion)) {
+        (v != 1 &&
+            v != 2 &&
+            v != version &&
+            v != markerVersion &&
+            v != retentionVersion)) {
       throw const FormatException('journal schema/version mismatch');
     }
     final int declared = v as int;
@@ -975,6 +1101,8 @@ final class SecurityJournalDocument {
     final Set<String> outcomes = <String>{};
     int upgraded = 0;
     int markers = 0;
+    int retentionEvents = 0;
+    int expiries = 0;
     int lastSeq = -1;
     for (final Object? item in list) {
       final SecurityJournalEvent e =
@@ -990,6 +1118,8 @@ final class SecurityJournalDocument {
       }
       if (e.type == SecurityJournalEventType.journalUpgraded) upgraded++;
       if (e.type == SecurityJournalEventType.historyCleared) markers++;
+      if (e.type.inV5Only) retentionEvents++;
+      if (e.type == SecurityJournalEventType.historyExpired) expiries++;
       events.add(e);
     }
     if (declared == 1) {
@@ -1010,7 +1140,16 @@ final class SecurityJournalDocument {
       throw const FormatException('journal upgrade marker invalid');
     }
     // Batch 4: v4 <=> exactly one clear marker (canonical).
-    if ((declared == markerVersion) != (markers == 1) || markers > 1) {
+    // Batch 5: v5 <=> at least one retention event (canonical); at most one
+    // clear marker and at most one expiry marker.
+    if (markers > 1 || expiries > 1) {
+      throw const FormatException('journal marker duplicated');
+    }
+    if (declared == retentionVersion) {
+      if (retentionEvents == 0) {
+        throw const FormatException('journal v5 without retention event');
+      }
+    } else if ((declared == markerVersion) != (markers == 1)) {
       throw const FormatException('journal clear marker invalid');
     }
     final Map<StorageSource, StoreState> storage =
