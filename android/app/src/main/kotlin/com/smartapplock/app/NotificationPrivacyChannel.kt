@@ -44,6 +44,7 @@ object NotificationPrivacyChannel {
 
     private fun status(context: Context): Map<String, Any> {
         val snapshot = NotificationPrivacyStore.read(context)
+        val state = NotificationPrivacyStore.state(context)
         return mapOf(
             "accessGranted" to accessGranted(context),
             "listenerConnected" to SalNotificationListenerService.connected,
@@ -52,6 +53,9 @@ object NotificationPrivacyChannel {
             // M2: placeholders can be shown (POST_NOTIFICATIONS, app
             // notifications and both placeholder channels enabled).
             "placeholdersAllowed" to NotificationPlaceholders.canPost(context, null),
+            // M3: protected package -> mode id, where an active profile or
+            // rule is stricter than the per-app mode right now.
+            "raisedNow" to NotificationPrivacyPolicy.raisedNow(state).mapValues { it.value.id },
         )
     }
 

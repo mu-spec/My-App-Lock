@@ -48,6 +48,8 @@ import 'package:smart_app_lock/services/impl/static_overlay_lock_service.dart';
 import 'package:smart_app_lock/ui/screens/pattern/pattern_unlock_screen.dart';
 import 'package:smart_app_lock/ui/screens/pin/pin_unlock_screen.dart';
 
+import '../support/credential_leak_scan.dart';
+
 const String _app = 'com.whatsapp';
 
 /// A database whose intruder-log row can neither be read nor written —
@@ -580,12 +582,14 @@ void main() {
       final InMemoryLocalDatabase db = InMemoryLocalDatabase();
       final AppContainer c = AppContainer.inMemory(database: db);
       await c.auth.enrollPin('2580');
+      final DateTime before = DateTime.now();
       await AuthAttemptContext.protectedAppChallenge(
         packageName: _app,
         generation: 1,
         challengeSerial: 1,
       ).run(() => c.auth.authenticatePin('9137'));
       await c.intruderMonitor.idle();
+      final DateTime after = DateTime.now();
 
       final String raw =
           (await db.getSetting(IntruderFailureLogStore.storageKey))!;
@@ -597,8 +601,24 @@ void main() {
           jsonDecode(plain) as Map<String, dynamic>;
       expect(doc['v'], 2); // Batch 3: log v2 with a generation id
       expect(LogGeneration.isValid(doc['gen']), isTrue);
-      expect(plain, isNot(contains('9137')));
-      expect(plain, isNot(contains('2580')));
+      // Phase 14 final verification: structural scan instead of a whole-text
+      // substring test, which failed when the timestamp or a random id
+      // happened to contain the PIN's digits (e.g. at:1794913742731). Every
+      // key and value is still substring-checked; only these three generated
+      // fields are validated strictly instead (credential_leak_scan.dart;
+      // leak detection proven in p14_credential_leak_scan_test.dart).
+      const List<String> secrets = <String>['9137', '2580'];
+      final List<Object?> events = doc['events'] as List<Object?>;
+      expect(events, hasLength(1), reason: 'non-vacuous: one stored attempt');
+      expect((events.single as Map<String, dynamic>)['at'], isA<int>());
+      expect(
+        findCredentialLeaks(plain, secrets, opaque: <String, OpaqueValidator>{
+          'gen': LogGeneration.isValid,
+          'events[].vid': verificationId(secrets),
+          'events[].at': timestampWithin(before, after),
+        }),
+        isEmpty,
+      );
       final String settingsJson = jsonEncode(
         (await c.securitySettings.getSettings()).valueOrNull!.toJson(),
       );

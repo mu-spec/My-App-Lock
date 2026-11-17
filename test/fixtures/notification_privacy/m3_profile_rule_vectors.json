@@ -1,0 +1,92 @@
+{
+  "_comment": "Phase 14 / M3 notification-privacy floors from profiles and rules (owner decision: linked to levels; Critical -> maximum, Sensitive -> hide_content; never weaker than the per-app mode). Kotlin executes every vector (NotificationPrivacyM3Test); Dart proves each 'profile' vector's transport is exactly what SecurityProfilePolicy.nativeTransport sends (p14_m3_notification_privacy_profiles_rules_test).",
+  "protected": ["com.bank.app", "com.kids.game", "org.chat.app"],
+  "perApp": {"com.bank.app": "maximum", "org.chat.app": "hide_content"},
+  "vectors": [
+    {
+      "name": "normal profile: per-app modes only",
+      "profile": {"kind": "normal"},
+      "transport": [],
+      "checks": [
+        {"day": 3, "minute": 600, "floors": {}, "effective": {"com.bank.app": "maximum", "com.kids.game": "off", "org.chat.app": "hide_content"}}
+      ]
+    },
+    {
+      "name": "guest profile: every protected app maximum",
+      "profile": {"kind": "guest"},
+      "transport": [
+        {"level": "critical", "days": [1, 2, 3, 4, 5, 6, 7], "allDay": true, "start": 0, "end": 0, "targets": ["com.bank.app", "com.kids.game", "org.chat.app"]}
+      ],
+      "checks": [
+        {"day": 1, "minute": 0, "floors": {"com.bank.app": "maximum", "com.kids.game": "maximum", "org.chat.app": "maximum"}, "effective": {"com.bank.app": "maximum", "com.kids.game": "maximum", "org.chat.app": "maximum"}},
+        {"day": 7, "minute": 1439, "floors": {"com.bank.app": "maximum", "com.kids.game": "maximum", "org.chat.app": "maximum"}, "effective": {"com.bank.app": "maximum", "com.kids.game": "maximum", "org.chat.app": "maximum"}}
+      ]
+    },
+    {
+      "name": "kids profile: selected apps only, at their levels",
+      "profile": {"kind": "kids", "appLevels": {"com.kids.game": "sensitive", "org.chat.app": "critical"}},
+      "transport": [
+        {"level": "critical", "days": [1, 2, 3, 4, 5, 6, 7], "allDay": true, "start": 0, "end": 0, "targets": ["org.chat.app"]},
+        {"level": "sensitive", "days": [1, 2, 3, 4, 5, 6, 7], "allDay": true, "start": 0, "end": 0, "targets": ["com.kids.game"]}
+      ],
+      "checks": [
+        {"day": 4, "minute": 720, "floors": {"com.kids.game": "hide_content", "org.chat.app": "maximum"}, "effective": {"com.bank.app": "maximum", "com.kids.game": "hide_content", "org.chat.app": "maximum"}}
+      ]
+    },
+    {
+      "name": "kids profile naming an unprotected app: nothing for it",
+      "profile": {"kind": "kids", "appLevels": {"com.other.app": "critical"}},
+      "transport": [
+        {"level": "critical", "days": [1, 2, 3, 4, 5, 6, 7], "allDay": true, "start": 0, "end": 0, "targets": ["com.other.app"]}
+      ],
+      "checks": [
+        {"day": 2, "minute": 60, "floors": {}, "effective": {"com.bank.app": "maximum", "com.kids.game": "off", "org.chat.app": "hide_content"}}
+      ]
+    },
+    {
+      "name": "weekday Sensitive rule 09:00-17:00: activation and expiry (end exclusive)",
+      "transport": [
+        {"level": "sensitive", "days": [1, 2, 3, 4, 5], "allDay": false, "start": 540, "end": 1020, "targets": ["com.kids.game"]}
+      ],
+      "checks": [
+        {"day": 3, "minute": 539, "floors": {}, "effective": {"com.kids.game": "off"}},
+        {"day": 3, "minute": 540, "floors": {"com.kids.game": "hide_content"}, "effective": {"com.kids.game": "hide_content"}},
+        {"day": 3, "minute": 1019, "floors": {"com.kids.game": "hide_content"}, "effective": {"com.kids.game": "hide_content"}},
+        {"day": 3, "minute": 1020, "floors": {}, "effective": {"com.kids.game": "off"}},
+        {"day": 6, "minute": 600, "floors": {}, "effective": {"com.kids.game": "off"}}
+      ]
+    },
+    {
+      "name": "overnight Critical rule Sunday 22:00-06:00 (after-midnight part belongs to Sunday)",
+      "transport": [
+        {"level": "critical", "days": [7], "allDay": false, "start": 1320, "end": 360, "targets": ["com.kids.game"]}
+      ],
+      "checks": [
+        {"day": 7, "minute": 1380, "floors": {"com.kids.game": "maximum"}, "effective": {"com.kids.game": "maximum"}},
+        {"day": 1, "minute": 300, "floors": {"com.kids.game": "maximum"}, "effective": {"com.kids.game": "maximum"}},
+        {"day": 1, "minute": 360, "floors": {}, "effective": {"com.kids.game": "off"}},
+        {"day": 6, "minute": 1380, "floors": {}, "effective": {"com.kids.game": "off"}}
+      ]
+    },
+    {
+      "name": "conflicting rules: the strictest wins, order-independent",
+      "transport": [
+        {"level": "sensitive", "days": [1, 2, 3, 4, 5, 6, 7], "allDay": true, "start": 0, "end": 0, "targets": ["com.kids.game", "org.chat.app"]},
+        {"level": "critical", "days": [3], "allDay": false, "start": 600, "end": 660, "targets": ["com.kids.game"]}
+      ],
+      "checks": [
+        {"day": 3, "minute": 630, "floors": {"com.kids.game": "maximum", "org.chat.app": "hide_content"}, "effective": {"com.kids.game": "maximum", "org.chat.app": "hide_content"}},
+        {"day": 3, "minute": 700, "floors": {"com.kids.game": "hide_content", "org.chat.app": "hide_content"}, "effective": {"com.kids.game": "hide_content", "org.chat.app": "hide_content"}}
+      ]
+    },
+    {
+      "name": "a weaker rule never weakens the owner's per-app Maximum",
+      "transport": [
+        {"level": "sensitive", "days": [1, 2, 3, 4, 5, 6, 7], "allDay": true, "start": 0, "end": 0, "targets": ["com.bank.app"]}
+      ],
+      "checks": [
+        {"day": 5, "minute": 900, "floors": {"com.bank.app": "hide_content"}, "effective": {"com.bank.app": "maximum"}}
+      ]
+    }
+  ]
+}

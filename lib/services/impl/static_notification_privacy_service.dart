@@ -8,6 +8,8 @@ class StaticNotificationPrivacyService implements NotificationPrivacyService {
 
   bool accessGranted;
   bool placeholdersAllowed = true;
+  Map<String, NotificationPrivacyMode> raisedNow =
+      const <String, NotificationPrivacyMode>{};
   int ownSettingsOpened = 0;
   bool failConfigure = false;
   bool failStatus = false;
@@ -30,6 +32,7 @@ class StaticNotificationPrivacyService implements NotificationPrivacyService {
       storeInvalid: false,
       configuredCount: native?.length ?? 0,
       placeholdersAllowed: placeholdersAllowed,
+      raisedNow: raisedNow,
     ));
   }
 

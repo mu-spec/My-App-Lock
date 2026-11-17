@@ -3,6 +3,7 @@ package com.smartapplock.app
 import android.content.Context
 import android.util.Base64
 import java.security.SecureRandom
+import java.util.Calendar
 
 /**
  * Phase 14 / M1: native copy of the per-app notification privacy modes so
@@ -68,14 +69,36 @@ object NotificationPrivacyStore {
         return salt
     }
 
-    fun state(context: Context): NotificationPrivacyPolicy.State {
+    fun state(context: Context, nowWallMs: Long = System.currentTimeMillis()): NotificationPrivacyPolicy.State {
         val snapshot = read(context)
+        val protectedPackages = ProtectionStateStore.protectedPackages(context)
+        // M3: rule/profile floors at this instant (same clock as the lock).
+        val rules = ProtectionStateStore.smartRules(context)
+        val calendar = Calendar.getInstance().apply { timeInMillis = nowWallMs }
         return NotificationPrivacyPolicy.State(
             ownPackage = context.packageName,
             protectionEnabled = ProtectionStateStore.isEnabled(context),
-            protectedPackages = ProtectionStateStore.protectedPackages(context),
+            protectedPackages = protectedPackages,
             modes = snapshot.modes,
             storeInvalid = snapshot.invalid,
+            ruleFloors = NotificationPrivacyPolicy.ruleFloors(
+                rules.rules,
+                rules.damaged,
+                protectedPackages,
+                SmartRulePolicy.isoDayFromCalendar(calendar.get(Calendar.DAY_OF_WEEK)),
+                calendar.get(Calendar.HOUR_OF_DAY) * 60 + calendar.get(Calendar.MINUTE),
+            ),
+            ruleTargeted = NotificationPrivacyPolicy.ruleTargeted(rules.rules, rules.damaged, protectedPackages),
+        )
+    }
+
+    /** M3: delay until the next rule-window boundary (see the policy). */
+    fun nextRuleCheckDelayMs(context: Context, nowWallMs: Long = System.currentTimeMillis()): Long {
+        val calendar = Calendar.getInstance().apply { timeInMillis = nowWallMs }
+        return NotificationPrivacyPolicy.nextRuleCheckDelayMs(
+            ProtectionStateStore.smartRules(context).rules,
+            calendar.get(Calendar.HOUR_OF_DAY) * 60 + calendar.get(Calendar.MINUTE),
+            (calendar.get(Calendar.SECOND) * 1000 + calendar.get(Calendar.MILLISECOND)).toLong(),
         )
     }
 }

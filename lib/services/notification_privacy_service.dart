@@ -9,6 +9,7 @@ final class NotificationPrivacyStatus {
     required this.storeInvalid,
     required this.configuredCount,
     this.placeholdersAllowed = false,
+    this.raisedNow = const <String, NotificationPrivacyMode>{},
   });
 
   static const NotificationPrivacyStatus unknown = NotificationPrivacyStatus(
@@ -35,6 +36,26 @@ final class NotificationPrivacyStatus {
   /// hidden notifications are removed WITHOUT a placeholder. Unknown = false.
   final bool placeholdersAllowed;
 
+  /// M3: protected apps whose notifications are handled more strictly than
+  /// their per-app mode right now, because an active Security Profile or
+  /// Smart Rule raised the app (Critical -> Maximum privacy, Sensitive ->
+  /// Hide content). Display only; native decides. Malformed entries are
+  /// dropped (unknown = nothing raised).
+  final Map<String, NotificationPrivacyMode> raisedNow;
+
+  static Map<String, NotificationPrivacyMode> _raised(Object? raw) {
+    if (raw is! Map) return const <String, NotificationPrivacyMode>{};
+    final Map<String, NotificationPrivacyMode> out =
+        <String, NotificationPrivacyMode>{};
+    raw.forEach((Object? k, Object? v) {
+      final NotificationPrivacyMode? m = NotificationPrivacyMode.fromId(v);
+      if (k is String && m != null && m != NotificationPrivacyMode.off) {
+        out[k] = m;
+      }
+    });
+    return Map<String, NotificationPrivacyMode>.unmodifiable(out);
+  }
+
   factory NotificationPrivacyStatus.fromMap(Map<dynamic, dynamic> m) =>
       NotificationPrivacyStatus(
         accessGranted: m['accessGranted'] == true,
@@ -43,6 +64,7 @@ final class NotificationPrivacyStatus {
         configuredCount:
             m['configuredCount'] is int ? m['configuredCount'] as int : 0,
         placeholdersAllowed: m['placeholdersAllowed'] == true,
+        raisedNow: _raised(m['raisedNow']),
       );
 }
 

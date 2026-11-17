@@ -3,6 +3,8 @@ package com.smartapplock.app
 import android.content.ComponentName
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
@@ -15,6 +17,10 @@ import java.lang.ref.WeakReference
  * on (data minimization).
  * M2: hands notification METADATA to [NotificationPrivacyEngine], which
  * removes eligible originals and shows neutral placeholders.
+ * M3: profile/rule floors (see [NotificationPrivacyPolicy.State]). A profile
+ * switch arrives through `configureProtection` ([refreshBinding]); a rule
+ * window starting/ending is re-checked by a main-looper timer set to the next
+ * boundary (no alarm, no wake lock; capped at 15 min).
  *
  * Only `key`, `packageName`, `notification.flags`, `user` and (for Smart App
  * Lock's own notifications only) `tag` are read. Nothing about any
@@ -22,6 +28,24 @@ import java.lang.ref.WeakReference
  */
 class SalNotificationListenerService : NotificationListenerService() {
     private val engine by lazy { NotificationPrivacyEngine(Port(this)) }
+    private val handler = Handler(Looper.getMainLooper())
+    private val ruleCheck = Runnable { reevaluate() }
+
+    /** Re-checks active notifications and placeholders, then re-arms the
+     * rule-boundary timer while any rule/profile targets a protected app. */
+    private fun reevaluate() {
+        guard { engine.onConfigurationChanged(activeMetadata()) }
+        scheduleRuleCheck()
+    }
+
+    private fun scheduleRuleCheck() {
+        handler.removeCallbacks(ruleCheck)
+        guard {
+            if (connected && NotificationPrivacyStore.state(this).ruleTargeted.isNotEmpty()) {
+                handler.postDelayed(ruleCheck, NotificationPrivacyStore.nextRuleCheckDelayMs(this))
+            }
+        }
+    }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
@@ -35,11 +59,13 @@ class SalNotificationListenerService : NotificationListenerService() {
             }
         }
         guard { engine.onConnected(activeMetadata()) }
+        scheduleRuleCheck()
     }
 
     override fun onListenerDisconnected() {
         connected = false
         instance = null
+        handler.removeCallbacks(ruleCheck)
         guard { engine.onDisconnected() }
         super.onListenerDisconnected()
     }
@@ -135,7 +161,8 @@ class SalNotificationListenerService : NotificationListenerService() {
                 } else if (!wanted && connected) {
                     service?.requestUnbind()
                 } else if (wanted && service != null) {
-                    service.guard { service.engine.onConfigurationChanged(service.activeMetadata()) }
+                    // M3: also a profile switch / rule edit: immediate re-check.
+                    service.reevaluate()
                 }
             } catch (_: Exception) {
                 // Access not granted or the service is not ready: nothing to do.

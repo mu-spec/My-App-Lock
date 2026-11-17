@@ -55,6 +55,9 @@ object WatcherChannel {
                                     ProtectionStateStore.clearPendingChallenge(activity)
                                     ProtectionOverlayController.disarm()
                                 }
+                                // Phase 14 / M3: a profile switch or rule change
+                                // updates notification privacy floors now.
+                                SalNotificationListenerService.refreshBinding(activity)
                             }
                             result.success(outcome.toMap())
                         }

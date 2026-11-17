@@ -64,6 +64,16 @@ abstract final class NotificationPrivacyText {
   static const String couldNotOpen = 'Could not open Android settings.';
   static const String chooseTitle = 'Notifications from';
 
+  static const String profilesNote =
+      'Active profiles and rules can make this stricter: an app raised to '
+      'Critical uses Maximum privacy and one raised to Sensitive uses Hide '
+      'content. They never make it weaker than your choice here.';
+
+  /// M3: an active profile or rule is stricter than [chosen] right now.
+  static String raisedBy(
+          NotificationPrivacyMode chosen, NotificationPrivacyMode now) =>
+      '${chosen.label} \u00b7 ${now.label} now (profile or rule)';
+
   static String saved(String label, NotificationPrivacyMode m) =>
       '$label: ${m.label}';
 
@@ -71,9 +81,11 @@ abstract final class NotificationPrivacyText {
         NotificationPrivacyMode.off => 'Notifications appear normally.',
         NotificationPrivacyMode.hideContent =>
           'Shows the app name and \u201cNew notification\u201d only.',
+        // Matches the native placeholder: posted by Smart App Lock (Android
+        // shows its name in the header), title "New notification", no text.
         NotificationPrivacyMode.maximum =>
-          'Shows \u201cSmart App Lock: new notification\u201d only. Silent '
-              'and hidden on the lock screen.',
+          'Shows a silent \u201cNew notification\u201d from Smart App Lock, '
+              'without the app\u2019s name. Hidden on the lock screen.',
       };
 }
 
@@ -221,6 +233,9 @@ class _NotificationPrivacyScreenState extends State<NotificationPrivacyScreen>
                 const SizedBox(height: DsSpacing.sm),
                 const Text(NotificationPrivacyText.limits,
                     key: Key('np_limits')),
+                const SizedBox(height: 8),
+                const Text(NotificationPrivacyText.profilesNote,
+                    key: Key('np_profiles_note')),
                 const SizedBox(height: DsSpacing.md),
                 if (v.status != null &&
                     v.status!.accessGranted &&
@@ -288,6 +303,7 @@ class _NotificationPrivacyScreenState extends State<NotificationPrivacyScreen>
                           _AppRow(
                             app: app,
                             mode: v.settings.modeFor(app.packageName),
+                            raisedTo: v.status?.raisedNow[app.packageName],
                             showAndroidLink: v.status?.accessGranted != true,
                             onTap: !v.writable || _busy
                                 ? null
@@ -310,6 +326,7 @@ class _AppRow extends StatelessWidget {
   const _AppRow({
     required this.app,
     required this.mode,
+    this.raisedTo,
     required this.showAndroidLink,
     required this.onTap,
     required this.onAndroidSettings,
@@ -317,6 +334,9 @@ class _AppRow extends StatelessWidget {
 
   final ProtectedApp app;
   final NotificationPrivacyMode mode;
+
+  /// M3: stricter mode applied now by an active profile or rule, if any.
+  final NotificationPrivacyMode? raisedTo;
   final bool showAndroidLink;
   final VoidCallback? onTap;
   final VoidCallback? onAndroidSettings;
@@ -329,7 +349,12 @@ class _AppRow extends StatelessWidget {
             key: Key('np_app_${app.packageName}'),
             contentPadding: EdgeInsets.zero,
             title: Text(app.label),
-            subtitle: Text(mode.label),
+            subtitle: Text(
+              raisedTo != null && raisedTo!.rank > mode.rank
+                  ? NotificationPrivacyText.raisedBy(mode, raisedTo!)
+                  : mode.label,
+              key: Key('np_app_mode_${app.packageName}'),
+            ),
             trailing: const Icon(Icons.chevron_right),
             onTap: onTap,
           ),

@@ -250,6 +250,18 @@ object ProtectionStateStore {
         return SmartRulePolicy.effectiveLevel(baseline, ruleLevel)
     }
 
+    /** Phase 14 / M3: the persisted Smart Rules (incl. the profile overlay),
+     * read-only, for the notification privacy floors. */
+    fun smartRules(context: Context): SmartRuleStoreCodec.Decoded {
+        val preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        return synchronized(levelsLock) {
+            SmartRuleStoreCodec.decode(
+                rulesVersionLocked(preferences),
+                preferences.getStringSet(KEY_RULES, null)?.toSet(),
+            )
+        }
+    }
+
     private fun rulesVersionLocked(preferences: SharedPreferences): Int? =
         if (preferences.contains(KEY_RULES_VERSION)) {
             preferences.getInt(KEY_RULES_VERSION, -1)
