@@ -224,7 +224,8 @@ void main() {
       await c.auth.enrollPin(_pin);
       await c.intruderEvidence.save(seq: 1, jpeg: jpegWithMetadata());
       // Simulate a newer app version's index.
-      final String newer = await rawEncrypted('{"v":2,"items":[]}');
+      // Batch 3: v2 is now the current index version; v3 = "newer".
+      final String newer = await rawEncrypted('{"v":3,"items":[]}');
       await db.setSetting(IntruderEvidenceStore.indexKey, newer);
       await pumpSettings(tester);
       expect(find.text(IntruderEvidenceText.unsupported), findsOneWidget);

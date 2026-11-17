@@ -100,11 +100,14 @@ abstract final class IntruderEvidenceText {
 /// when the viewer closes, whatever the reason.
 ///
 /// Phase 13 / M2: [focusSeq] (optional) asks the verified list to open that
-/// photo's detail once, only if it is listed (see `_openFocus`).
+/// photo's detail once, only if it is listed (see `_openFocus`). Batch 3:
+/// the focus is the EID ([focusGen], [focusSeq]); null [focusGen] matches
+/// only a legacy item.
 Future<bool> openIntruderEvidence(
   BuildContext context,
   AppContainer container, {
   int? focusSeq,
+  String? focusGen,
 }) async {
   final NavigatorState navigator = Navigator.of(context);
   final AuthType? method = await verifyIntruderOwner(navigator, container.auth);
@@ -118,6 +121,7 @@ Future<bool> openIntruderEvidence(
         container: container,
         session: session,
         focusSeq: focusSeq,
+        focusGen: focusGen,
       ),
     ));
   } finally {
@@ -132,10 +136,11 @@ Future<bool> openIntruderEvidence(
 Future<bool> openIntruderEvidenceForSeq(
   BuildContext context,
   AppContainer container,
-  int seq,
-) {
+  int seq, {
+  String? gen,
+}) {
   if (seq < 0) return Future<bool>.value(false);
-  return openIntruderEvidence(context, container, focusSeq: seq);
+  return openIntruderEvidence(context, container, focusSeq: seq, focusGen: gen);
 }
 
 /// Owner clear-all (shared by the settings screen and the viewer).
@@ -164,8 +169,14 @@ Future<EvidenceClearResult?> clearAllIntruderEvidence(
     return null;
   }
   container.intruderDefense.onEvidenceCleared();
+  // Batch 3: the floor applies to the coordinator's current generation
+  // (legacy seq floor only when no generation was ever notified).
+  final String? floorGen = container.intruderDefense.currentGen;
   return container.intruderEvidence.clearAll(
-    floorSeq: container.intruderDefense.highestHandledSeq,
+    floorGen: floorGen,
+    floorSeq: floorGen == null
+        ? container.intruderDefense.highestHandledSeq
+        : container.intruderDefense.currentGenHighestSeq,
     stillValid: () => session == null || session.isValid,
   );
 }
@@ -222,6 +233,7 @@ class IntruderEvidenceScreen extends StatefulWidget {
     required this.container,
     required this.session,
     this.focusSeq,
+    this.focusGen,
   });
 
   final AppContainer container;
@@ -229,6 +241,9 @@ class IntruderEvidenceScreen extends StatefulWidget {
 
   /// Phase 13 / M2: photo seq to open once after the first verified load.
   final int? focusSeq;
+
+  /// Batch 3: generation of the focused EID (null = legacy item).
+  final String? focusGen;
 
   @override
   State<IntruderEvidenceScreen> createState() => _IntruderEvidenceScreenState();
@@ -358,7 +373,7 @@ class _IntruderEvidenceScreenState extends State<IntruderEvidenceScreen>
     final int? seq = widget.focusSeq;
     EvidenceItem? found;
     for (final EvidenceItem item in _items ?? const <EvidenceItem>[]) {
-      if (item.seq == seq) {
+      if (seq != null && item.isFor(widget.focusGen, seq)) {
         found = item;
         break;
       }
@@ -487,8 +502,11 @@ class _IntruderEvidenceScreenState extends State<IntruderEvidenceScreen>
                               itemBuilder: (BuildContext _, int i) {
                                 final EvidenceItem e = items[i];
                                 return ListTile(
-                                  key: ValueKey<String>(
-                                      'intruder_evidence_item_${e.seq}'),
+                                  // Batch 3: unique per EID (a legacy and a
+                                  // generation item may share a seq).
+                                  key: ValueKey<String>(e.bid == null
+                                      ? 'intruder_evidence_item_${e.seq}'
+                                      : 'intruder_evidence_item_${e.seq}_b${e.bid}'),
                                   leading:
                                       const Icon(Icons.photo_camera_outlined),
                                   title: Text(_fmtTime(e.at)),
@@ -612,8 +630,8 @@ class _IntruderEvidenceDetailScreenState
       return;
     }
     if (!mounted || !session.isValid || op != _op) return;
-    final Uint8List? bytes =
-        await c.intruderEvidence.readImage(widget.item.seq);
+    final Uint8List? bytes = await c.intruderEvidence
+        .readImage(widget.item.seq, gen: widget.item.gen);
     if (!mounted || !session.isValid || op != _op) {
       _zero(bytes);
       return;
@@ -675,6 +693,7 @@ class _IntruderEvidenceDetailScreenState
       }
       final EvidenceDeleteResult r = await c.intruderEvidence.delete(
         widget.item.seq,
+        gen: widget.item.gen,
         // Commit point: evaluated inside the store's serialized section,
         // immediately before the index rewrite.
         stillValid: () => mounted && session.isValid,

@@ -60,6 +60,8 @@ final class TimelineEntry {
     this.lockoutTriggered = false,
     this.persisted = true,
     this.trig,
+    this.tgen,
+    this.logGen,
     this.captureWhy,
     this.alarmWhy,
     this.healthState,
@@ -89,6 +91,14 @@ final class TimelineEntry {
 
   /// M2 outcomes: the failed-attempt seq the outcome belongs to.
   final int? trig;
+
+  /// Batch 3: outcomes — the failure-log generation of [trig] (null =
+  /// legacy outcome). EID = (tgen, trig).
+  final String? tgen;
+
+  /// Batch 3: failed attempts — the event's generation (null = legacy).
+  /// EID = (logGen, sourceSeq).
+  final String? logGen;
   final CaptureWhy? captureWhy;
   final AlarmWhy? alarmWhy;
   final HState? healthState;
@@ -359,6 +369,7 @@ class SecurityTimelineReader {
         consecutiveFailures: e.consecutiveFailures,
         lockoutTriggered: e.lockoutTriggered,
         persisted: e.counterPersisted,
+        logGen: e.logGen,
       ));
     }
     final int discarded = log.nextSeq - log.events.length;
@@ -448,6 +459,7 @@ class SecurityTimelineReader {
           TimelineEntryKind.storageRestored,
       },
       trig: f?.trig,
+      tgen: f?.tgen,
       captureWhy: f is CaptureNotSavedFields ? f.why : null,
       alarmWhy: f is AlarmNotStartedFields ? f.why : null,
       healthState: f is ProtectionHealthFields ? f.state : null,

@@ -7,6 +7,14 @@
 // older build then reads the newer journal as "unsupported" (read-only,
 // never overwritten) instead of "corrupt".
 //
+// P13/M3 Batch 3 (B2 §3.2) — version 3: an intruder outcome may carry
+// `tgen`, the failure-log generation of its attempt (EID = (tgen, trig)).
+// De-duplication is per (family, tgen, trig); outcomes without `tgen`
+// (v1/v2 era, legacy) keep the (family, trig) rule among themselves and are
+// NEVER matched against generation outcomes. `tgen` is forbidden in v1/v2
+// documents (a v2 build reads a v3 journal as unsupported, read-only). The
+// v2 -> v3 step adds no marker event (journalUpgraded stays `from: 1`).
+//
 // Privacy (TL-4 / correction F): anomalies only. There is deliberately no
 // type for successful unlocks or routine usage, and no field may carry
 // credential material, pixels, package names or free-form text. Every
@@ -182,6 +190,10 @@ sealed class SecurityEventFields {
   /// The failed-attempt seq the event refers to (outcomes only).
   int? get trig => null;
 
+  /// Batch 3: the failure-log generation of [trig] (v3 outcomes only;
+  /// null = legacy outcome).
+  String? get tgen => null;
+
   /// True when every value is in range (producers' input is validated
   /// before it is queued; invalid input is counted as lost).
   bool get isValid;
@@ -189,11 +201,13 @@ sealed class SecurityEventFields {
   Map<String, Object?> toJson();
 
   /// Strict decoder for `f` of [type] ([present]: whether `f` exists).
+  /// [v3]: the document is version 3 (an outcome may carry `tgen`).
   static SecurityEventFields? fromJson(
     SecurityJournalEventType type,
     bool present,
-    Object? raw,
-  ) {
+    Object? raw, {
+    bool v3 = false,
+  }) {
     final bool needed = switch (type) {
       SecurityJournalEventType.journalStarted ||
       SecurityJournalEventType.journalRecovered =>
@@ -216,24 +230,28 @@ sealed class SecurityEventFields {
         if (raw['from'] != 1) throw const FormatException('from invalid');
         return const JournalUpgradedFields();
       case SecurityJournalEventType.captureSaved:
-        _exactKeys(raw, const <String>{'trig'});
+        _exactKeys(raw, const <String>{'trig'}, _tgenKey(v3));
         return CaptureSavedFields(
-            _intIn(raw['trig'], securityJournalMaxSafeInt, 'trig'));
+            _intIn(raw['trig'], securityJournalMaxSafeInt, 'trig'),
+            tgen: _tgenOf(raw));
       case SecurityJournalEventType.captureNotSaved:
-        _exactKeys(raw, const <String>{'trig', 'why'});
+        _exactKeys(raw, const <String>{'trig', 'why'}, _tgenKey(v3));
         return CaptureNotSavedFields(
           _intIn(raw['trig'], securityJournalMaxSafeInt, 'trig'),
           _enumByName(CaptureWhy.values, raw['why'], 'capture reason'),
+          tgen: _tgenOf(raw),
         );
       case SecurityJournalEventType.alarmStarted:
-        _exactKeys(raw, const <String>{'trig'});
+        _exactKeys(raw, const <String>{'trig'}, _tgenKey(v3));
         return AlarmStartedFields(
-            _intIn(raw['trig'], securityJournalMaxSafeInt, 'trig'));
+            _intIn(raw['trig'], securityJournalMaxSafeInt, 'trig'),
+            tgen: _tgenOf(raw));
       case SecurityJournalEventType.alarmNotStarted:
-        _exactKeys(raw, const <String>{'trig', 'why'});
+        _exactKeys(raw, const <String>{'trig', 'why'}, _tgenKey(v3));
         return AlarmNotStartedFields(
           _intIn(raw['trig'], securityJournalMaxSafeInt, 'trig'),
           _enumByName(AlarmWhy.values, raw['why'], 'alarm reason'),
+          tgen: _tgenOf(raw),
         );
       case SecurityJournalEventType.alarmStopped:
         _exactKeys(raw, const <String>{});
@@ -293,6 +311,27 @@ sealed class SecurityEventFields {
 
 bool _trigOk(int trig) => trig >= 0 && trig <= securityJournalMaxSafeInt;
 
+/// Batch 3: same rule as `LogGeneration.isValid` (the timeline layer does
+/// not import the intruder code).
+final RegExp _tgenPattern = RegExp(r'^[A-Za-z0-9_-]{22}$');
+bool _tgenOk(String? g) => g == null || _tgenPattern.hasMatch(g);
+
+Set<String> _tgenKey(bool v3) => v3 ? const <String>{'tgen'} : const <String>{};
+
+String? _tgenOf(Map<Object?, Object?> raw) {
+  if (!raw.containsKey('tgen')) return null;
+  final Object? g = raw['tgen'];
+  if (g is! String || !_tgenPattern.hasMatch(g)) {
+    throw const FormatException('tgen invalid');
+  }
+  return g;
+}
+
+/// The outcome's de-duplication identity: (family, tgen, trig). A legacy
+/// outcome (tgen null) can never equal a generation outcome.
+String outcomeIdentity(String family, String? tgen, int trig) =>
+    tgen == null ? 'L:$family:$trig' : 'G:$family:$tgen:$trig';
+
 final class JournalUpgradedFields extends SecurityEventFields {
   const JournalUpgradedFields();
 
@@ -307,9 +346,12 @@ final class JournalUpgradedFields extends SecurityEventFields {
 }
 
 final class CaptureSavedFields extends SecurityEventFields {
-  const CaptureSavedFields(this.failedSeq);
+  const CaptureSavedFields(this.failedSeq, {this.tgen});
 
   final int failedSeq;
+
+  @override
+  final String? tgen;
 
   @override
   SecurityJournalEventType get type => SecurityJournalEventType.captureSaved;
@@ -318,14 +360,18 @@ final class CaptureSavedFields extends SecurityEventFields {
   int get trig => failedSeq;
 
   @override
-  bool get isValid => _trigOk(failedSeq);
+  bool get isValid => _trigOk(failedSeq) && _tgenOk(tgen);
 
   @override
-  Map<String, Object?> toJson() => <String, Object?>{'trig': failedSeq};
+  Map<String, Object?> toJson() =>
+      <String, Object?>{'trig': failedSeq, if (tgen != null) 'tgen': tgen};
 }
 
 final class CaptureNotSavedFields extends SecurityEventFields {
-  const CaptureNotSavedFields(this.failedSeq, this.why);
+  const CaptureNotSavedFields(this.failedSeq, this.why, {this.tgen});
+
+  @override
+  final String? tgen;
 
   final int failedSeq;
   final CaptureWhy why;
@@ -337,17 +383,23 @@ final class CaptureNotSavedFields extends SecurityEventFields {
   int get trig => failedSeq;
 
   @override
-  bool get isValid => _trigOk(failedSeq);
+  bool get isValid => _trigOk(failedSeq) && _tgenOk(tgen);
 
   @override
-  Map<String, Object?> toJson() =>
-      <String, Object?>{'trig': failedSeq, 'why': why.name};
+  Map<String, Object?> toJson() => <String, Object?>{
+        'trig': failedSeq,
+        'why': why.name,
+        if (tgen != null) 'tgen': tgen,
+      };
 }
 
 final class AlarmStartedFields extends SecurityEventFields {
-  const AlarmStartedFields(this.failedSeq);
+  const AlarmStartedFields(this.failedSeq, {this.tgen});
 
   final int failedSeq;
+
+  @override
+  final String? tgen;
 
   @override
   SecurityJournalEventType get type => SecurityJournalEventType.alarmStarted;
@@ -356,14 +408,18 @@ final class AlarmStartedFields extends SecurityEventFields {
   int get trig => failedSeq;
 
   @override
-  bool get isValid => _trigOk(failedSeq);
+  bool get isValid => _trigOk(failedSeq) && _tgenOk(tgen);
 
   @override
-  Map<String, Object?> toJson() => <String, Object?>{'trig': failedSeq};
+  Map<String, Object?> toJson() =>
+      <String, Object?>{'trig': failedSeq, if (tgen != null) 'tgen': tgen};
 }
 
 final class AlarmNotStartedFields extends SecurityEventFields {
-  const AlarmNotStartedFields(this.failedSeq, this.why);
+  const AlarmNotStartedFields(this.failedSeq, this.why, {this.tgen});
+
+  @override
+  final String? tgen;
 
   final int failedSeq;
   final AlarmWhy why;
@@ -375,11 +431,14 @@ final class AlarmNotStartedFields extends SecurityEventFields {
   int get trig => failedSeq;
 
   @override
-  bool get isValid => _trigOk(failedSeq);
+  bool get isValid => _trigOk(failedSeq) && _tgenOk(tgen);
 
   @override
-  Map<String, Object?> toJson() =>
-      <String, Object?>{'trig': failedSeq, 'why': why.name};
+  Map<String, Object?> toJson() => <String, Object?>{
+        'trig': failedSeq,
+        'why': why.name,
+        if (tgen != null) 'tgen': tgen,
+      };
 }
 
 final class AlarmStoppedFields extends SecurityEventFields {
@@ -551,7 +610,8 @@ final class SecurityJournalEvent {
       seq: seq,
       at: DateTime.fromMillisecondsSinceEpoch(at),
       type: t,
-      fields: SecurityEventFields.fromJson(t, raw.containsKey('f'), raw['f']),
+      fields: SecurityEventFields.fromJson(t, raw.containsKey('f'), raw['f'],
+          v3: version >= 3),
       clockBack: clockBack,
     );
   }
@@ -611,7 +671,9 @@ final class SecurityJournalDocument {
   });
 
   static const String schema = 'sal.security_journal';
-  static const int version = 2;
+
+  /// Batch 3: version 3 (generation-qualified outcomes). 1 and 2 are read.
+  static const int version = 3;
 
   /// Decoder hard limit (well above the retention cap).
   static const int maxDecodableEvents = 1000;
@@ -685,7 +747,8 @@ final class SecurityJournalDocument {
         decodedVersion: decodedVersion ?? this.decodedVersion,
       );
 
-  /// Deterministic version-2 encoding: fixed key order; `from`, `hs`,
+  /// Deterministic version-3 encoding (same layout as v2; outcomes may
+  /// carry `tgen`): fixed key order; `from`, `hs`,
   /// `ss` and `sup` omitted when absent or zero.
   Map<String, Object?> toJson() => <String, Object?>{
         'schema': schema,
@@ -731,15 +794,16 @@ final class SecurityJournalDocument {
     'sup',
   };
 
-  /// Strict decoder for versions 1 and 2: throws [FormatException] on any
-  /// invalid content. A version-1 document becomes an in-memory version-2
-  /// document (lossless; `from: 1`; [decodedVersion] 1).
+  /// Strict decoder for versions 1, 2 and 3: throws [FormatException] on
+  /// any invalid content. A version-1 document becomes an in-memory current
+  /// document (lossless; `from: 1`; [decodedVersion] 1); a version-2
+  /// document is read as-is (all its outcomes are legacy).
   static SecurityJournalDocument fromJson(Object? raw) {
     if (raw is! Map) {
       throw const FormatException('journal is not an object');
     }
     final Object? v = raw['v'];
-    if (raw['schema'] != schema || (v != 1 && v != version)) {
+    if (raw['schema'] != schema || (v != 1 && v != 2 && v != version)) {
       throw const FormatException('journal schema/version mismatch');
     }
     final int declared = v as int;
@@ -765,7 +829,7 @@ final class SecurityJournalDocument {
         list.length > maxDecodableEvents) {
       throw const FormatException('journal header invalid');
     }
-    if (declared == version && nextSeq > maxCounter) {
+    if (declared >= 2 && nextSeq > maxCounter) {
       throw const FormatException('journal header invalid');
     }
     final List<SecurityJournalEvent> events = <SecurityJournalEvent>[];
@@ -780,7 +844,8 @@ final class SecurityJournalDocument {
       }
       lastSeq = e.seq;
       if (e.type.isOutcome &&
-          !outcomes.add('${e.type.terminalFamily}:${e.fields!.trig}')) {
+          !outcomes.add(outcomeIdentity(
+              e.type.terminalFamily!, e.fields!.tgen, e.fields!.trig!))) {
         throw const FormatException('duplicate outcome for a trigger');
       }
       if (e.type == SecurityJournalEventType.journalUpgraded) upgraded++;
@@ -829,6 +894,7 @@ final class SecurityJournalDocument {
       storage: Map<StorageSource, StoreState>.unmodifiable(storage),
       suppressed:
           raw.containsKey('sup') ? _intIn(raw['sup'], maxCounter, 'sup') : 0,
+      decodedVersion: declared,
     );
   }
 }

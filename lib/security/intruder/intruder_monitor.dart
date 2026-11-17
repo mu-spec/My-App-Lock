@@ -45,6 +45,7 @@ import '../credentials/auth_type.dart';
 import '../credentials/verified_attempt.dart';
 import 'failed_attempt_event.dart';
 import 'intruder_failure_log_store.dart';
+import 'log_generation.dart';
 
 enum IntruderMonitorHealth {
   /// Recording normally.
@@ -152,8 +153,42 @@ class IntruderMonitor implements VerifiedAttemptObserver {
     this.maxPending = defaultMaxPending,
     this.maxEncodedBytes = defaultMaxEncodedBytes,
     this.maxSnapshotWaiters = defaultMaxSnapshotWaiters,
+    String Function()? mintGeneration,
   })  : _store = store,
-        _now = now ?? DateTime.now;
+        _now = now ?? DateTime.now,
+        _mintGeneration = mintGeneration ?? LogGeneration.mint;
+
+  /// Batch 3 (B2 §2): mints the 128-bit log generation. Throws
+  /// [UnsupportedError] without a secure generator; the write then fails
+  /// closed (storage error, nothing written, no fallback).
+  final String Function() _mintGeneration;
+
+  /// Generations minted by this monitor whose CAS was attempted (tests).
+  int generationsMinted = 0;
+
+  /// Same length as a real id; used ONLY to size documents (never stored).
+  static const String _sizingGen = 'AAAAAAAAAAAAAAAAAAAAAA';
+
+  /// The generation for a write from [log]: the stored one, or (Missing,
+  /// Corrupt-after-quarantine, or v1 lazy migration) a fresh one that only
+  /// becomes real if this write's CAS commits; a losing generation is never
+  /// written anywhere (P4 §1). Null = no secure generator: fail closed.
+  IntruderFailureLog? _withGeneration(IntruderFailureLog log) {
+    if (log.gen != null) return log;
+    final String g;
+    try {
+      g = _mintGeneration();
+    } catch (_) {
+      _storageError = true;
+      return null;
+    }
+    if (!LogGeneration.isValid(g)) {
+      _storageError = true;
+      return null;
+    }
+    generationsMinted++;
+    return log.adoptGeneration(g);
+  }
 
   static const int defaultMaxEvents = 100;
   static const Duration defaultRetention = Duration(days: 30);
@@ -562,15 +597,19 @@ class IntruderMonitor implements VerifiedAttemptObserver {
         if (base == null) {
           return; // unreadable / read-only: intent kept (resetPending)
         }
-        final IntruderFailureLog log = base.log;
-        if (log.consecutiveFailures == 0) {
+        if (base.log.consecutiveFailures == 0) {
           _appliedResetEpoch = target; // nothing to write
           return;
+        }
+        final IntruderFailureLog? log = _withGeneration(base.log);
+        if (log == null) {
+          return; // no secure generator: intent kept (resetPending)
         }
         final IntruderFailureLog next = IntruderFailureLog(
           nextSeq: log.nextSeq,
           consecutiveFailures: 0,
           events: log.events,
+          gen: log.gen,
         );
         final IntruderWriteResult result =
             await _store.writeIfUnchanged(next, expectedRaw: base.raw);
@@ -582,8 +621,7 @@ class IntruderMonitor implements VerifiedAttemptObserver {
           case IntruderWriteConflict():
             continue; // re-read and rebase
           case IntruderWriteUnknown(:final String? attemptedRaw):
-            final (_, String? durableRaw, bool readOk) =
-                await _reconcileRead();
+            final (_, String? durableRaw, bool readOk) = await _reconcileRead();
             if (readOk && attemptedRaw != null && durableRaw == attemptedRaw) {
               _committed(next); // durably confirmed
               _appliedResetEpoch = target;
@@ -620,10 +658,15 @@ class IntruderMonitor implements VerifiedAttemptObserver {
         _dropped++;
         return;
       }
-      final IntruderFailureLog log = base.log;
       if (_seenIds.contains(vid) ||
-          log.events.any((FailedAttemptEvent e) => e.verificationId == vid)) {
+          base.log.events
+              .any((FailedAttemptEvent e) => e.verificationId == vid)) {
         return; // duplicate delivery: already durably recorded
+      }
+      final IntruderFailureLog? log = _withGeneration(base.log);
+      if (log == null) {
+        _dropped++; // no secure generator: nothing written (fail closed)
+        return;
       }
       // P-1: an owner success verified before this failure but not yet
       // reflected in the persisted run restarts the run here.
@@ -648,11 +691,13 @@ class IntruderMonitor implements VerifiedAttemptObserver {
         lockoutTriggered: result is AuthLockedOut,
         lockoutStreak: attempt.lockoutStreak,
         counterPersisted: attempt.counterPersisted,
+        logGen: log.gen,
       );
       final IntruderFailureLog next = IntruderFailureLog(
         nextSeq: log.nextSeq + 1,
         consecutiveFailures: run,
         events: _bounded(<FailedAttemptEvent>[...log.events, event]),
+        gen: log.gen,
       );
       final IntruderWriteResult written =
           await _store.writeIfUnchanged(next, expectedRaw: base.raw);
@@ -723,6 +768,7 @@ class IntruderMonitor implements VerifiedAttemptObserver {
                 nextSeq: 0,
                 consecutiveFailures: 0,
                 events: kept,
+                gen: _sizingGen,
               ),
             ).length >
             maxEncodedBytes) {

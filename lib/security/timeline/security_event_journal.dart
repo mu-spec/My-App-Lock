@@ -466,9 +466,16 @@ class SecurityEventJournal
       final int? trig = fields.trig;
       final String? family = fields.type.terminalFamily;
       if (trig != null && family != null) {
+        // Batch 3: identity (family, tgen, trig); legacy and generation
+        // outcomes never match each other.
+        final String id = outcomeIdentity(family, fields.tgen, trig);
         SecurityJournalEvent? prior;
         for (final SecurityJournalEvent e in doc.events) {
-          if (e.type.terminalFamily == family && e.fields?.trig == trig) {
+          final SecurityEventFields? ef = e.fields;
+          final String? efam = e.type.terminalFamily;
+          if (efam != null &&
+              ef != null &&
+              outcomeIdentity(efam, ef.tgen, ef.trig!) == id) {
             prior = e;
             break;
           }

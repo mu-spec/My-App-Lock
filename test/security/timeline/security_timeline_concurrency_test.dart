@@ -140,7 +140,7 @@ class _Rig {
   _Rig({int maxPending = 8, int journalMaxPending = 64}) {
     db = _GateDb();
     final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore(),
-          database: InMemoryLocalDatabase());
+        database: InMemoryLocalDatabase());
     monitor = _CountingMonitor(
       store: IntruderFailureLogStore(db, cipher: cipher),
       now: () => _t0,
@@ -168,6 +168,9 @@ class _Rig {
       .length;
 }
 
+/// Batch 3: the failure log is v2; a probe document needs a generation.
+const String _tq15Gen = 'AAAAAAAAAAAAAAAAAAAAAA';
+
 void main() {
   // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
   // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
@@ -178,8 +181,10 @@ void main() {
       final _GateDb db = _GateDb()..arm();
       db.gatedWrites.add(IntruderFailureLogStore.storageKey);
       bool done = false;
-      final Future<IntruderWriteResult> w =
-          IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null)..then((_) => done = true);
+      final Future<IntruderWriteResult> w = IntruderFailureLogStore(db)
+          .writeIfUnchanged(IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null)
+        ..then((_) => done = true);
       await Future<void>.delayed(const Duration(milliseconds: 5));
       expect(done, isFalse);
       db.release();

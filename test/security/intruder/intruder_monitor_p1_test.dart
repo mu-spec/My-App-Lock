@@ -86,7 +86,8 @@ class _P1Db extends InMemoryLocalDatabase {
         failNextWrites--;
         throw StateError('write fault (one-shot)');
       }
-      final CasOutcome outcome = await super.compareAndSetSetting(key, expected: expected, next: next);
+      final CasOutcome outcome =
+          await super.compareAndSetSetting(key, expected: expected, next: next);
       if (outcome == CasOutcome.committed) logWrites++;
       return outcome;
     }
@@ -148,6 +149,9 @@ VerifiedAttempt _ok({bool persisted = true}) => VerifiedAttempt(
       at: _t0,
     );
 
+/// Batch 3: the failure log is v2; a probe document needs a generation.
+const String _tq15Gen = 'AAAAAAAAAAAAAAAAAAAAAA';
+
 void main() {
   // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
   // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
@@ -156,10 +160,18 @@ void main() {
   group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
     test('one-shot fault and counters reach the CAS', () async {
       final _P1Db db = _P1Db()..failNextWrites = 1;
-      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteUnknown>());
+      expect(
+          await IntruderFailureLogStore(db).writeIfUnchanged(
+              IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null),
+          isA<IntruderWriteUnknown>());
       expect(db.logWriteAttempts, 1);
       expect(db.logWrites, 0);
-      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteCommitted>());
+      expect(
+          await IntruderFailureLogStore(db).writeIfUnchanged(
+              IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null),
+          isA<IntruderWriteCommitted>());
       expect(db.logWriteAttempts, 2);
       expect(db.logWrites, 1);
     });
@@ -626,7 +638,8 @@ void main() {
         () async {
       final String newer = jsonEncode(<String, Object?>{
         'schema': 'sal.intruder_log',
-        'v': 2,
+        // Batch 3: v2 is now the current log version; v3 models "newer".
+        'v': 3,
         'future': true,
       });
       await db.setSetting(_key, newer);

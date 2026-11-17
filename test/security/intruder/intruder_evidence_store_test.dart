@@ -54,7 +54,7 @@ void main() {
   setUp(() {
     db = InMemoryLocalDatabase();
     cipher = AesGcmSettingsCipher(InMemorySecretStore(),
-          database: InMemoryLocalDatabase());
+        database: InMemoryLocalDatabase());
     now = DateTime(2026, 10, 22, 12);
   });
 
@@ -209,7 +209,8 @@ void main() {
     // the store starts empty" behaviour): a corrupt index is UNREADABLE —
     // never trusted, never replaced, removed, quarantined or swept.
     for (final String bad in <String>['enc:v1:garbage', 'plaintext-corrupt']) {
-      test('G-3 a corrupt index ($bad) is unreadable and kept byte-identical; '
+      test(
+          'G-3 a corrupt index ($bad) is unreadable and kept byte-identical; '
           'no quarantine write, no save, no sweep', () async {
         await db.setSetting(IntruderEvidenceStore.indexKey, bad);
         await db.setSetting(IntruderEvidenceStore.blobKey(1), 'enc:v1:blob');
@@ -225,8 +226,8 @@ void main() {
         expect(await db.getSetting(IntruderEvidenceStore.blobKey(1)),
             'enc:v1:blob');
         expect(await db.getSetting(IntruderEvidenceStore.blobKey(2)), isNull);
-        expect(await db.getSetting(IntruderEvidenceStore.quarantineKey),
-            isNull);
+        expect(
+            await db.getSetting(IntruderEvidenceStore.quarantineKey), isNull);
       });
     }
 
@@ -234,7 +235,8 @@ void main() {
         () async {
       final String newer =
           'enc:v1:${await cipher.encryptString(jsonEncode(<String, Object?>{
-            'v': 2,
+            // Batch 3: v2 is now the current index version; v3 = "newer".
+            'v': 3,
             'items': <Object?>[]
           }))}';
       await db.setSetting(IntruderEvidenceStore.indexKey, newer);

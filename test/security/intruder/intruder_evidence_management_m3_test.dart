@@ -70,6 +70,22 @@ FailedAttemptEvent ev(int seq, int run) => FailedAttemptEvent(
       packageName: 'com.bank',
     );
 
+/// Batch 3 (evidence index v2, disclosed fixture change): v2 stores the
+/// Phase 12 / M3 guard fields of LEGACY items under `retired.legacy`. These
+/// tests only store legacy items (no generation), so that record carries
+/// exactly the v1 meaning; it is exposed at the top level as before.
+Map<String, Object?> _legacyView(Map<String, Object?> m) {
+  if (m['v'] != 2) return m;
+  final Map<String, Object?> legacy =
+      (((m['retired'] as Map?) ?? const <String, Object?>{})['legacy'] as Map?)
+              ?.cast<String, Object?>() ??
+          const <String, Object?>{};
+  expect((m['retired']! as Map).keys.toSet().difference(<String>{'legacy'}),
+      isEmpty,
+      reason: 'legacy-only fixture: no generation records expected');
+  return <String, Object?>{...m, ...legacy};
+}
+
 void main() {
   late _FaultDb db;
   late SettingsCipher cipher;
@@ -78,7 +94,7 @@ void main() {
   setUp(() {
     db = _FaultDb();
     cipher = AesGcmSettingsCipher(InMemorySecretStore(),
-          database: InMemoryLocalDatabase());
+        database: InMemoryLocalDatabase());
     now = DateTime(2026, 10, 22, 12);
   });
 
@@ -99,9 +115,9 @@ void main() {
 
   Future<Map<String, Object?>> rawIndex() async {
     final String raw = (await db.getSetting(IntruderEvidenceStore.indexKey))!;
-    return jsonDecode(
-            await cipher.decryptString(raw.substring('enc:v1:'.length)))
-        as Map<String, Object?>;
+    return _legacyView(
+        jsonDecode(await cipher.decryptString(raw.substring('enc:v1:'.length)))
+            as Map<String, Object?>);
   }
 
   group('delete one', () {
@@ -274,7 +290,8 @@ void main() {
 
     test('newer-schema index: delete and clear are refused, never overwritten',
         () async {
-      await writeRawIndex(<String, Object?>{'v': 2, 'items': <Object?>[]});
+      // Batch 3: v2 is now the current index version; v3 models "newer".
+      await writeRawIndex(<String, Object?>{'v': 3, 'items': <Object?>[]});
       final String before =
           (await db.getSetting(IntruderEvidenceStore.indexKey))!;
       final IntruderEvidenceStore s = store();
@@ -321,7 +338,8 @@ void main() {
       ),
     ]) {
       // F-KEY-1 G-3: formerly "quarantined"; now unreadable and untouched.
-      test('corrupt guard fields ($name) are not trusted: unreadable, kept '
+      test(
+          'corrupt guard fields ($name) are not trusted: unreadable, kept '
           'byte-identical, never quarantined or replaced', () async {
         await writeRawIndex(idx);
         final String? raw = await db.getSetting(IntruderEvidenceStore.indexKey);
@@ -329,8 +347,8 @@ void main() {
         expect(await s.list(), isEmpty);
         expect(await s.health(), EvidenceIndexHealth.unreadable);
         expect(await db.getSetting(IntruderEvidenceStore.indexKey), raw);
-        expect(await db.getSetting(IntruderEvidenceStore.quarantineKey),
-            isNull);
+        expect(
+            await db.getSetting(IntruderEvidenceStore.quarantineKey), isNull);
       });
     }
 

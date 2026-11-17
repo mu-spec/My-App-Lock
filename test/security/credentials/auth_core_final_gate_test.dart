@@ -432,9 +432,8 @@ List<String> _lockViolations(Map<String, String> m) {
   // Fixed point: a private helper is lock-held iff it has at least one call
   // site and EVERY call site is inside a `_lock.run(` closure of an acquirer
   // or inside another lock-held helper.
-  final Set<String> helpers = m.keys
-      .where((String k) => k.startsWith('_') && !acq.contains(k))
-      .toSet();
+  final Set<String> helpers =
+      m.keys.where((String k) => k.startsWith('_') && !acq.contains(k)).toSet();
   final Set<String> held = <String>{};
   for (bool changed = true; changed;) {
     changed = false;
@@ -528,6 +527,9 @@ List<String> _lockViolations(Map<String, String> m) {
   return v;
 }
 
+/// Batch 3: the failure log is v2; a probe document needs a generation.
+const String _tq15Gen = 'AAAAAAAAAAAAAAAAAAAAAA';
+
 void main() {
   // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
   // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
@@ -537,13 +539,18 @@ void main() {
     test('the hanging and broken intruder stores reach the CAS', () async {
       final _HangingIntruderDb hang = _HangingIntruderDb();
       final Object first = await Future.any(<Future<Object>>[
-        IntruderFailureLogStore(hang)
-            .writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null),
+        IntruderFailureLogStore(hang).writeIfUnchanged(
+            IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+            expectedRaw: null),
         Future<Object>.delayed(const Duration(milliseconds: 20), () => 'hung'),
       ]);
       expect(first, 'hung');
       final _BrokenIntruderDb db = _BrokenIntruderDb();
-      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteUnknown>());
+      expect(
+          await IntruderFailureLogStore(db).writeIfUnchanged(
+              IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null),
+          isA<IntruderWriteUnknown>());
     });
   });
 
@@ -1533,7 +1540,8 @@ void main() {
       return '${src.substring(0, end)}\n$member${src.substring(end)}';
     }
 
-    test('the real manager: every credential writer is serialized, no '
+    test(
+        'the real manager: every credential writer is serialized, no '
         'unapproved path bypasses the lock, prompts stay outside it', () {
       final Map<String, String> m = _membersStrict(src);
       expect(_lockViolations(m), isEmpty);
@@ -1603,11 +1611,11 @@ void main() {
         'lock body of updateBiometricOptions calls acquirer _conditionalUpdate',
       ),
     };
-    for (final MapEntry<String, (String, String, String)> u
-        in unsafe.entries) {
+    for (final MapEntry<String, (String, String, String)> u in unsafe.entries) {
       test('self-test: detects ${u.key}', () {
         final (String from, String to, String expected) = u.value;
-        final String mutated = from.isEmpty ? withMember(to) : variant(from, to);
+        final String mutated =
+            from.isEmpty ? withMember(to) : variant(from, to);
         expect(mutated, isNot(src));
         expect(_lockViolations(_membersStrict(mutated)), contains(expected));
       });

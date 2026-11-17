@@ -65,34 +65,40 @@ enum IntruderAlarmWhy {
 }
 
 /// One terminal capture / alarm outcome (Phase 13 / M2). Immutable; holds
-/// the failed-attempt seq ([trig]) and closed enums only.
+/// the failed-attempt seq ([trig]) and closed enums only. Batch 3: `tgen`
+/// is the failure-log generation of that attempt (EID = (tgen, trig));
+/// null only for an event without a generation (legacy).
 sealed class IntruderOutcome {
   const IntruderOutcome();
 }
 
 final class CaptureSavedOutcome extends IntruderOutcome {
-  const CaptureSavedOutcome(this.trig);
+  const CaptureSavedOutcome(this.trig, {this.tgen});
 
   final int trig;
+  final String? tgen;
 }
 
 final class CaptureNotSavedOutcome extends IntruderOutcome {
-  const CaptureNotSavedOutcome(this.trig, this.why);
+  const CaptureNotSavedOutcome(this.trig, this.why, {this.tgen});
 
   final int trig;
+  final String? tgen;
   final IntruderCaptureWhy why;
 }
 
 final class AlarmStartedOutcome extends IntruderOutcome {
-  const AlarmStartedOutcome(this.trig);
+  const AlarmStartedOutcome(this.trig, {this.tgen});
 
   final int trig;
+  final String? tgen;
 }
 
 final class AlarmNotStartedOutcome extends IntruderOutcome {
-  const AlarmNotStartedOutcome(this.trig, this.why);
+  const AlarmNotStartedOutcome(this.trig, this.why, {this.tgen});
 
   final int trig;
+  final String? tgen;
   final IntruderAlarmWhy why;
 }
 
@@ -147,7 +153,15 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
   final Duration captureTimeout;
 
   final IntruderDefenseStatus status = IntruderDefenseStatus();
-  final LinkedHashSet<int> _handled = LinkedHashSet<int>();
+
+  /// Batch 3 (B2 §3.5): handled-event identities are EIDs (gen, seq), so a
+  /// re-initialized log's seq can never be mistaken for a handled one.
+  final LinkedHashSet<String> _handled = LinkedHashSet<String>();
+
+  /// Batch 3: the newest failure-log generation notified to this
+  /// coordinator, and the highest seq handled in it (clear-all floor).
+  String? _currentGen;
+  int _currentGenHighest = -1;
 
   /// Phase 12 / M3: highest event seq ever handed to this coordinator
   /// (never evicted). Used as the clear-all floor so evidence for any
@@ -171,6 +185,7 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
   /// terminal outcome was already reported. Read only by the reporting
   /// helpers and the `finally` fallback.
   int _captureTrig = -1;
+  String? _captureGen;
   bool _captureReported = true;
 
   /// Completes when every started operation has finished (tests).
@@ -189,8 +204,17 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
   @override
   void onFailedAttemptRecorded(FailedAttemptEvent event) {
     if (event.surface != AuthAttemptSurface.protectedAppChallenge) return;
-    if (!_handled.add(event.seq)) return; // duplicate notification
+    final String? gen = event.logGen;
+    if (!_handled.add('$gen:${event.seq}')) return; // duplicate notification
     if (event.seq > _highestSeq) _highestSeq = event.seq;
+    if (gen != null) {
+      if (gen != _currentGen) {
+        _currentGen = gen;
+        _currentGenHighest = event.seq;
+      } else if (event.seq > _currentGenHighest) {
+        _currentGenHighest = event.seq;
+      }
+    }
     while (_handled.length > _handledCapacity) {
       _handled.remove(_handled.first);
     }
@@ -218,6 +242,13 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
   /// Phase 12 / M3 — highest failed-attempt seq this coordinator was
   /// notified of (-1 when none).
   int get highestHandledSeq => _highestSeq;
+
+  /// Batch 3 — the newest failure-log generation this coordinator was
+  /// notified of (null when only legacy events were seen).
+  String? get currentGen => _currentGen;
+
+  /// Batch 3 — highest seq handled in [currentGen] (-1 when none).
+  int get currentGenHighestSeq => _currentGenHighest;
 
   /// Phase 12 / M3 — the owner (freshly verified) is clearing all evidence.
   /// Synchronous: bumps the capture epoch BEFORE the store clear so a
@@ -263,7 +294,7 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
       if (!alarm && !photo) return;
       status.triggers++;
       await Future.wait(<Future<void>>[
-        if (alarm) _alarm(alarmEpoch, event.seq),
+        if (alarm) _alarm(alarmEpoch, event.seq, event.logGen),
         if (photo) _capture(event, captureEpoch),
       ]);
     } catch (_) {
@@ -271,14 +302,14 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
     }
   }
 
-  Future<void> _alarm(int epoch, int trig) async {
+  Future<void> _alarm(int epoch, int trig, String? tgen) async {
     _alarmStartsPending++;
     AlarmStartResult r;
     try {
       r = await _service.startAlarm(duration: alarmDuration);
     } catch (_) {
       status.errors++;
-      _notify(AlarmNotStartedOutcome(trig, IntruderAlarmWhy.error));
+      _notify(AlarmNotStartedOutcome(trig, IntruderAlarmWhy.error, tgen: tgen));
       return;
     } finally {
       _alarmStartsPending--;
@@ -286,29 +317,32 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
     if (r != AlarmStartResult.started) {
       status.alarmsSuppressed++;
       status.lastFailure = 'alarm:${r.name}';
-      _notify(AlarmNotStartedOutcome(trig, _alarmWhy(r)));
+      _notify(AlarmNotStartedOutcome(trig, _alarmWhy(r), tgen: tgen));
       return;
     }
     if (epoch != _alarmEpoch) {
       // Owner success / revocation arrived while the start was pending.
       status.alarmsCancelled++;
       await _quiet(_service.stopAlarm);
-      _notify(AlarmNotStartedOutcome(trig, IntruderAlarmWhy.cancelled));
+      _notify(
+          AlarmNotStartedOutcome(trig, IntruderAlarmWhy.cancelled, tgen: tgen));
       return;
     }
     status.alarmsStarted++;
     _alarmPlaying = true;
-    _notify(AlarmStartedOutcome(trig));
+    _notify(AlarmStartedOutcome(trig, tgen: tgen));
   }
 
   Future<void> _capture(FailedAttemptEvent event, int epoch) async {
     if (_capturing) {
       status.captureSkipped++; // single capture slot; never queued
-      _notify(CaptureNotSavedOutcome(event.seq, IntruderCaptureWhy.busy));
+      _notify(CaptureNotSavedOutcome(event.seq, IntruderCaptureWhy.busy,
+          tgen: event.logGen));
       return;
     }
     _capturing = true;
     _captureTrig = event.seq;
+    _captureGen = event.logGen;
     _captureReported = false;
     try {
       if (await _service.cameraPermission() != CameraPermissionState.granted) {
@@ -352,6 +386,10 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
           }
           final EvidenceSaveResult saved = await _evidence.save(
             seq: event.seq,
+            // Batch 3: EID identity; a capture whose generation is no
+            // longer the newest one notified is never saved (superseded).
+            gen: event.logGen,
+            currentGen: event.logGen == null ? null : _currentGen,
             jpeg: jpeg,
             packageName: event.packageName,
             // Linearization point: checked synchronously inside the store's
@@ -360,7 +398,8 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
           );
           if (saved == EvidenceSaveResult.saved) {
             status.captured++;
-            _notifyCapture(CaptureSavedOutcome(_captureTrig));
+            _notifyCapture(
+                CaptureSavedOutcome(_captureTrig, tgen: _captureGen));
           } else if (saved == EvidenceSaveResult.cancelled ||
               saved == EvidenceSaveResult.superseded) {
             if (saved == EvidenceSaveResult.superseded) {
@@ -407,8 +446,8 @@ class IntruderDefenseCoordinator implements IntruderEventListener {
     _notify(o);
   }
 
-  void _captureNotSaved(IntruderCaptureWhy why) =>
-      _notifyCapture(CaptureNotSavedOutcome(_captureTrig, why));
+  void _captureNotSaved(IntruderCaptureWhy why) => _notifyCapture(
+      CaptureNotSavedOutcome(_captureTrig, why, tgen: _captureGen));
 
   static IntruderCaptureWhy _saveWhy(EvidenceSaveResult r) => switch (r) {
         EvidenceSaveResult.duplicate => IntruderCaptureWhy.duplicate,

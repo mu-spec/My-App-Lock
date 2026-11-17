@@ -193,6 +193,9 @@ Future<IntruderFailureLog> _durable(_QDb db) async {
 List<int> _seqs(IntruderFailureLog l) =>
     l.events.map((FailedAttemptEvent e) => e.seq).toList();
 
+/// Batch 3: the failure log is v2; a probe document needs a generation.
+const String _tq15Gen = 'AAAAAAAAAAAAAAAAAAAAAA';
+
 void main() {
   group('T-Q concurrent monitors on one database', () {
     test('T-Q1 interleaved read/read/CAS/CAS: both stored, B rebased once',
@@ -218,8 +221,8 @@ void main() {
       expect(lb.recorded, <String>['B1']);
       expect(la.notDurableAtNotify, isEmpty);
       expect(lb.notDurableAtNotify, isEmpty);
-      expect(a.status.droppedFailureRecords + b.status.droppedFailureRecords,
-          0);
+      expect(
+          a.status.droppedFailureRecords + b.status.droppedFailureRecords, 0);
     });
 
     test('T-Q2 stale-base pattern A, B x5, A: 7 unique increasing seqs',
@@ -257,8 +260,8 @@ void main() {
       final IntruderFailureLog l = await _durable(db);
       expect(l.events, hasLength(1));
       expect(la.recorded.length + lb.recorded.length, 1);
-      expect(a.status.droppedFailureRecords + b.status.droppedFailureRecords,
-          0, reason: 'a duplicate is not a drop');
+      expect(a.status.droppedFailureRecords + b.status.droppedFailureRecords, 0,
+          reason: 'a duplicate is not a drop');
     });
 
     test('T-Q4 permanent contention: exactly 3 attempts, dropped, 0 notify',
@@ -271,6 +274,7 @@ void main() {
         // A competing engine commits before every CAS of this monitor.
         await db.poke(IntruderFailureLogStore.encode(IntruderFailureLog(
           nextSeq: ++bump,
+          gen: _tq15Gen, // Batch 3: v2 documents carry a generation
           consecutiveFailures: 0,
           events: const <FailedAttemptEvent>[],
         )));
@@ -288,7 +292,8 @@ void main() {
       expect(db.durable, isNot(contains('LOST')));
     });
 
-    test('T-Q4b 8 monitors x 50 failures, 20 seeded interleavings: '
+    test(
+        'T-Q4b 8 monitors x 50 failures, 20 seeded interleavings: '
         'committed + dropped = 400, no duplicate seq, notify = committed',
         () async {
       for (int seed = 0; seed < 20; seed++) {
@@ -315,8 +320,8 @@ void main() {
         final IntruderFailureLog l = await _durable(db);
         final int notified =
             ls.fold<int>(0, (int s, _Listener x) => s + x.recorded.length);
-        final int dropped = ms.fold<int>(
-            0, (int s, IntruderMonitor m) => s + m.status.droppedFailureRecords);
+        final int dropped = ms.fold<int>(0,
+            (int s, IntruderMonitor m) => s + m.status.droppedFailureRecords);
         final int conflictDrops = ms.fold<int>(
             0, (int s, IntruderMonitor m) => s + m.status.conflictDrops);
         expect(notified + dropped, 400, reason: 'seed $seed');
@@ -327,11 +332,9 @@ void main() {
         expect(_seqs(l), List<int>.generate(l.events.length, (int i) => i),
             reason: 'seed $seed: gapless, increasing');
         expect(l.nextSeq, l.events.length, reason: 'seed $seed');
-        expect(
-            ls.every((_Listener x) => x.notDurableAtNotify.isEmpty), isTrue);
-        final Set<String> stored = l.events
-            .map((FailedAttemptEvent e) => e.verificationId)
-            .toSet();
+        expect(ls.every((_Listener x) => x.notDurableAtNotify.isEmpty), isTrue);
+        final Set<String> stored =
+            l.events.map((FailedAttemptEvent e) => e.verificationId).toSet();
         for (final _Listener x in ls) {
           expect(stored.containsAll(x.recorded), isTrue, reason: 'seed $seed');
         }
@@ -378,7 +381,8 @@ void main() {
       expect(db.casCalls - casBefore, 1);
     });
 
-    test('T-Q7 throw, then the re-read throws: unknown, 0 notify; a later '
+    test(
+        'T-Q7 throw, then the re-read throws: unknown, 0 notify; a later '
         'redelivery dedups', () async {
       final _QDb db = _QDb()
         ..fault = _CasFault.commitThenThrow
@@ -421,7 +425,8 @@ void main() {
       expect(await db.getSetting(_key), isNull);
     });
 
-    test('T-Q10 commit, then the monitor dies before notifying: a new '
+    test(
+        'T-Q10 commit, then the monitor dies before notifying: a new '
         'monitor given the redelivery neither duplicates nor notifies',
         () async {
       final _QDb db = _QDb()..fault = _CasFault.hangAfterCommit;
@@ -445,7 +450,8 @@ void main() {
   });
 
   group('T-Q corrupt, unsupported, reset and snapshot', () {
-    test('T-Q8 corrupt row raced by two monitors: one quarantine, one repair '
+    test(
+        'T-Q8 corrupt row raced by two monitors: one quarantine, one repair '
         'wins, the loser rebases', () async {
       final _QDb db = _QDb();
       await db.poke('{corrupt');
@@ -494,8 +500,7 @@ void main() {
       expect(await m.snapshot(), isNull);
     });
 
-    test('T-Q11 reset vs record race: run restarts, events intact',
-        () async {
+    test('T-Q11 reset vs record race: run restarts, events intact', () async {
       final _QDb db = _QDb();
       final IntruderMonitor a = _monitor(db);
       final IntruderMonitor b = _monitor(db);
@@ -527,7 +532,8 @@ void main() {
       expect(a.status.resetPending, isFalse);
     });
 
-    test('T-Q16 snapshot on read failure is unavailable, never cached data; '
+    test(
+        'T-Q16 snapshot on read failure is unavailable, never cached data; '
         'lastKnown() is explicitly stale', () async {
       final _QDb db = _QDb();
       final IntruderMonitor m = _monitor(db);
@@ -544,11 +550,12 @@ void main() {
       expect(last.asOf, _t0);
     });
 
-    test('encrypted rows: tokens differ per write and concurrent monitors '
+    test(
+        'encrypted rows: tokens differ per write and concurrent monitors '
         'still never lose events', () async {
       final _QDb db = _QDb();
-      final AesGcmSettingsCipher cipher =
-          AesGcmSettingsCipher(InMemorySecretStore(),
+      final AesGcmSettingsCipher cipher = AesGcmSettingsCipher(
+          InMemorySecretStore(),
           database: InMemoryLocalDatabase());
       // The master key exists before any failed attempt can occur (a
       // credential must be enrolled first). Its lazy FIRST creation is not
@@ -570,7 +577,16 @@ void main() {
       expect(l.events.map((FailedAttemptEvent e) => e.verificationId).toSet(),
           <String>{'E1', 'E2'});
       expect(r.raw, startsWith('enc:v1:'));
-      expect(r.raw, isNot(contains('E1')));
+      // Batch 3 (disclosed): the former probe `isNot(contains('E1'))` on
+      // the base64 row was probabilistic (any 2-char pair occurs in random
+      // base64 of this length with ~5-8% probability; the 22-char gen made
+      // the row longer) and failed once in the full suite. The plaintext
+      // JSON token '"E1"' can appear neither in the row nor in the decoded
+      // ciphertext bytes (4-byte chance match: negligible).
+      expect(r.raw, isNot(contains('"E1"')));
+      final String bytes = latin1.decode(base64Decode(r.raw.substring(7)));
+      expect(bytes, isNot(contains('"E1"')));
+      expect(bytes, isNot(contains('"vid"')));
     });
   });
 
@@ -579,14 +595,18 @@ void main() {
         () async {
       final _QDb db = _QDb();
       final IntruderFailureLogStore s = IntruderFailureLogStore(db);
-      final IntruderWriteResult w1 =
-          await s.writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null);
+      final IntruderWriteResult w1 = await s.writeIfUnchanged(
+          IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+          expectedRaw: null);
       expect(w1, isA<IntruderWriteCommitted>());
       final String raw1 = (w1 as IntruderWriteCommitted).raw;
       expect(await db.getSetting(_key), raw1);
       // A second insert-if-absent conflicts and changes nothing.
       const IntruderFailureLog other = IntruderFailureLog(
-          nextSeq: 9, consecutiveFailures: 0, events: <FailedAttemptEvent>[]);
+          nextSeq: 9,
+          gen: _tq15Gen, // Batch 3: v2 documents carry a generation
+          consecutiveFailures: 0,
+          events: <FailedAttemptEvent>[]);
       expect(await s.writeIfUnchanged(other, expectedRaw: null),
           isA<IntruderWriteConflict>());
       expect(await s.writeIfUnchanged(other, expectedRaw: 'stale'),
@@ -602,7 +622,8 @@ void main() {
     test('writeIfUnchanged never throws; storage errors are UNKNOWN', () async {
       final _QDb db = _QDb()..fault = _CasFault.throwBeforeCommit;
       final IntruderWriteResult w = await IntruderFailureLogStore(db)
-          .writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null);
+          .writeIfUnchanged(IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null);
       expect(w, isA<IntruderWriteUnknown>());
       expect((w as IntruderWriteUnknown).code, CasUnknownCode.io);
       expect(w.attemptedRaw, isNotNull);
@@ -612,9 +633,12 @@ void main() {
         () async {
       final _QDb db = _QDb();
       final IntruderFailureLogStore s = IntruderFailureLogStore(db);
-      final String same = IntruderFailureLogStore.encode(IntruderFailureLog.empty);
+      // Batch 3: v2 documents carry a gen; both sides use the same one.
+      final IntruderFailureLog doc =
+          IntruderFailureLog.empty.adoptGeneration(_tq15Gen);
+      final String same = IntruderFailureLogStore.encode(doc);
       final IntruderWriteResult w =
-          await s.writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: same);
+          await s.writeIfUnchanged(doc, expectedRaw: same);
       expect(w, isA<IntruderWriteUnknown>());
       expect(db.casCalls, 0);
     });
@@ -644,7 +668,8 @@ void main() {
 
   group('ST static guards', () {
     String src(String p) => File(p).readAsStringSync();
-    const String store = 'lib/security/intruder/intruder_failure_log_store.dart';
+    const String store =
+        'lib/security/intruder/intruder_failure_log_store.dart';
     const String monitor = 'lib/security/intruder/intruder_monitor.dart';
 
     test('ST-1 no blind write exists for the failure log', () {

@@ -85,6 +85,9 @@ class _ScriptStore extends IntruderEvidenceStore {
     required int seq,
     required Uint8List jpeg,
     String? packageName,
+    // Batch 3: the store API gained the EID generation (signature only).
+    String? gen,
+    String? currentGen,
     bool Function()? stillValid,
   }) async {
     log.add('save:$seq');
@@ -95,7 +98,12 @@ class _ScriptStore extends IntruderEvidenceStore {
       return r;
     }
     final EvidenceSaveResult real = await super.save(
-        seq: seq, jpeg: jpeg, packageName: packageName, stillValid: stillValid);
+        seq: seq,
+        jpeg: jpeg,
+        packageName: packageName,
+        gen: gen,
+        currentGen: currentGen,
+        stillValid: stillValid);
     log.add('saved:$seq');
     return real;
   }

@@ -105,6 +105,9 @@ class _OrderDb extends InMemoryLocalDatabase {
   }
 }
 
+/// Batch 3: the failure log is v2; a probe document needs a generation.
+const String _tq15Gen = 'AAAAAAAAAAAAAAAAAAAAAA';
+
 void main() {
   // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
   // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
@@ -113,10 +116,18 @@ void main() {
   group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
     test('breakLogWrites reaches the CAS; persist order is recorded', () async {
       final _OrderDb db = _OrderDb()..breakLogWrites = true;
-      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteUnknown>());
+      expect(
+          await IntruderFailureLogStore(db).writeIfUnchanged(
+              IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null),
+          isA<IntruderWriteUnknown>());
       expect(db.order, isNot(contains('persist')));
       db.breakLogWrites = false;
-      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteCommitted>());
+      expect(
+          await IntruderFailureLogStore(db).writeIfUnchanged(
+              IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null),
+          isA<IntruderWriteCommitted>());
       expect(db.order, <String>['persist']);
     });
   });
@@ -131,7 +142,7 @@ void main() {
   setUp(() {
     db = InMemoryLocalDatabase();
     cipher = AesGcmSettingsCipher(InMemorySecretStore(),
-          database: InMemoryLocalDatabase());
+        database: InMemoryLocalDatabase());
     platform = GatedEvidenceService()
       ..permission = CameraPermissionState.granted;
     settings = IntruderDefenseSettingsStore(db, cipher);

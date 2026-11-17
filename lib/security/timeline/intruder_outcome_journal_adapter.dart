@@ -59,26 +59,31 @@ class IntruderOutcomeJournalAdapter implements IntruderOutcomeObserver {
   static (SecurityJournalEventType, SecurityEventFields) map(
           IntruderOutcome o) =>
       switch (o) {
-        CaptureSavedOutcome(:final int trig) => (
+        CaptureSavedOutcome(:final int trig, :final String? tgen) => (
             SecurityJournalEventType.captureSaved,
-            CaptureSavedFields(trig),
+            CaptureSavedFields(trig, tgen: tgen),
           ),
         CaptureNotSavedOutcome(
           :final int trig,
-          :final IntruderCaptureWhy why
+          :final IntruderCaptureWhy why,
+          :final String? tgen
         ) =>
           (
             SecurityJournalEventType.captureNotSaved,
-            CaptureNotSavedFields(trig, captureWhy(why)),
+            CaptureNotSavedFields(trig, captureWhy(why), tgen: tgen),
           ),
-        AlarmStartedOutcome(:final int trig) => (
+        AlarmStartedOutcome(:final int trig, :final String? tgen) => (
             SecurityJournalEventType.alarmStarted,
-            AlarmStartedFields(trig),
+            AlarmStartedFields(trig, tgen: tgen),
           ),
-        AlarmNotStartedOutcome(:final int trig, :final IntruderAlarmWhy why) =>
+        AlarmNotStartedOutcome(
+          :final int trig,
+          :final IntruderAlarmWhy why,
+          :final String? tgen
+        ) =>
           (
             SecurityJournalEventType.alarmNotStarted,
-            AlarmNotStartedFields(trig, alarmWhy(why)),
+            AlarmNotStartedFields(trig, alarmWhy(why), tgen: tgen),
           ),
         AlarmStoppedOutcome() => (
             SecurityJournalEventType.alarmStopped,

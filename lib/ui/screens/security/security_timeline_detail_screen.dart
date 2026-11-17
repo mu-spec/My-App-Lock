@@ -230,7 +230,8 @@ class _SecurityTimelineDetailScreenState
     }
     // Q-M2-8 A: the timeline session ends BEFORE any verification route.
     session.invalidate('evidenceOpened');
-    await openIntruderEvidenceForSeq(context, widget.container, trig);
+    await openIntruderEvidenceForSeq(context, widget.container, trig,
+        gen: e.tgen);
   }
 
   @override

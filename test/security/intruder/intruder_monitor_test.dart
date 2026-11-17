@@ -119,6 +119,9 @@ const AuthAttemptContext _chat = AuthAttemptContext.protectedAppChallenge(
   challengeSerial: 3,
 );
 
+/// Batch 3: the failure log is v2; a probe document needs a generation.
+const String _tq15Gen = 'AAAAAAAAAAAAAAAAAAAAAA';
+
 void main() {
   // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
   // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
@@ -127,14 +130,20 @@ void main() {
   group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
     test('failWrites, writeGate and the counter reach the CAS', () async {
       final _FaultDb db = _FaultDb()..failWrites = true;
-      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteUnknown>());
+      expect(
+          await IntruderFailureLogStore(db).writeIfUnchanged(
+              IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null),
+          isA<IntruderWriteUnknown>());
       expect(db.writes, 0);
       db.failWrites = false;
       final Completer<void> gate = Completer<void>();
       db.writeGate = gate;
       bool done = false;
-      final Future<IntruderWriteResult> w =
-          IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null)..then((_) => done = true);
+      final Future<IntruderWriteResult> w = IntruderFailureLogStore(db)
+          .writeIfUnchanged(IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null)
+        ..then((_) => done = true);
       await Future<void>.delayed(const Duration(milliseconds: 5));
       expect(done, isFalse);
       gate.complete();
@@ -373,6 +382,8 @@ void main() {
         await store.writeIfUnchanged(
           const IntruderFailureLog(
             nextSeq: 0,
+            // Batch 3: the log is v2; a written document carries a gen.
+            gen: 'AAAAAAAAAAAAAAAAAAAAAA',
             consecutiveFailures: IntruderFailureLog.maxRun,
             events: <FailedAttemptEvent>[],
           ),
@@ -483,8 +494,8 @@ void main() {
       m2.onVerifiedAttempt(_attempt());
       await m2.idle();
       expect(await db.getSetting(_key), flipped, reason: 'bytes untouched');
-      expect(await db.getSetting(IntruderFailureLogStore.quarantineKey),
-          isNull);
+      expect(
+          await db.getSetting(IntruderFailureLogStore.quarantineKey), isNull);
       expect(m2.status.health, IntruderMonitorHealth.storageError);
     });
 
@@ -501,14 +512,15 @@ void main() {
     test('plaintext where ciphertext belongs is treated as corrupt', () async {
       // Q-ENG-1: the blind write() is deleted; seed via insert-if-absent.
       expect(
-        await IntruderFailureLogStore(db)
-            .writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null),
+        await IntruderFailureLogStore(db).writeIfUnchanged(
+            IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+            expectedRaw: null),
         isA<IntruderWriteCommitted>(),
       );
       final IntruderFailureLogStore enc = IntruderFailureLogStore(
         db,
         cipher: AesGcmSettingsCipher(InMemorySecretStore(),
-          database: InMemoryLocalDatabase()),
+            database: InMemoryLocalDatabase()),
       );
       expect(await enc.read(), isA<IntruderLogCorrupt>());
     });
@@ -570,7 +582,8 @@ void main() {
     test('a NEWER schema version is never overwritten (read-only)', () async {
       final String newer = jsonEncode(<String, Object?>{
         'schema': 'sal.intruder_log',
-        'v': 2,
+        // Batch 3: v2 is now the current log version; v3 models "newer".
+        'v': 3,
         'future': true,
       });
       await db.setSetting(_key, newer);

@@ -25,6 +25,12 @@
 // outcome fails safe (detached). This does NOT change journal identity or
 // deduplication (duplicate suppression across reused seqs is unchanged).
 //
+// P13/M3 Batch 3 (B2 §3.2): a generation outcome (`tgen` set) attaches ONLY
+// to the attempt with the exactly equal EID (logGen == tgen, seq == trig);
+// the 5-minute window is not used for it. A legacy outcome (no `tgen`)
+// attaches only to a legacy attempt (no generation) and keeps the F-CL-1
+// window, detached text and photo-action rule unchanged.
+//
 // F-CL-1 metadata safety (2026-10-22 decision): a timeline photo action
 // (a focusSeq lookup in the evidence viewer) is offered ONLY when the
 // attempt identity of the outcome is unambiguous — see
@@ -157,6 +163,10 @@ bool timelinePhotoActionAllowed(
 /// entry whose seq equals `outcome.trig`). Never throws; null ⇒ false.
 bool outcomeMatchesAttempt(TimelineEntry? attempt, TimelineEntry outcome) {
   if (attempt == null) return false;
+  if (outcome.trig != attempt.sourceSeq) return false;
+  // Batch 3: identity spaces never mix (legacy vs generation).
+  if (outcome.tgen != attempt.logGen) return false;
+  if (outcome.tgen != null) return true; // exact EID: no time window
   if (outcome.at.isBefore(attempt.at)) return false; // older: other epoch
   return outcome.at.difference(attempt.at) <=
       SecurityTimelineGrouping.maxOutcomeDelay;
@@ -166,6 +176,9 @@ bool _continues(TimelineEntry prev, TimelineEntry next) {
   final int? pr = prev.consecutiveFailures;
   final int? nr = next.consecutiveFailures;
   if (next.sourceSeq != prev.sourceSeq + 1) return false;
+  // Batch 3: a run never spans identity spaces (legacy events retained from
+  // a v1 log vs events of the log generation).
+  if (next.logGen != prev.logGen) return false;
   if (pr == null || nr == null || nr != pr + 1) return false;
   if (next.at.isBefore(prev.at)) return false; // backwards clock splits
   return next.at.difference(prev.at) <= SecurityTimelineGrouping.maxGap;

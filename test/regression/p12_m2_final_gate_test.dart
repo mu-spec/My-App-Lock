@@ -128,6 +128,9 @@ class _Recorder implements IntruderEventListener {
   void onOwnerVerified() => owner++;
 }
 
+/// Batch 3: the failure log is v2; a probe document needs a generation.
+const String _tq15Gen = 'AAAAAAAAAAAAAAAAAAAAAA';
+
 void main() {
   // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
   // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
@@ -139,8 +142,10 @@ void main() {
       final Completer<void> gate = Completer<void>();
       db.logWriteGate = gate;
       bool done = false;
-      final Future<IntruderWriteResult> w =
-          IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null)..then((_) => done = true);
+      final Future<IntruderWriteResult> w = IntruderFailureLogStore(db)
+          .writeIfUnchanged(IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null)
+        ..then((_) => done = true);
       await Future<void>.delayed(const Duration(milliseconds: 5));
       expect(done, isFalse);
       gate.complete();
@@ -167,7 +172,7 @@ void main() {
   setUp(() {
     db = _HookDb();
     cipher = AesGcmSettingsCipher(InMemorySecretStore(),
-          database: InMemoryLocalDatabase());
+        database: InMemoryLocalDatabase());
     platform = GatedEvidenceService()
       ..permission = CameraPermissionState.granted;
     settings = IntruderDefenseSettingsStore(db, cipher);

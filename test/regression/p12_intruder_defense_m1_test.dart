@@ -36,6 +36,7 @@ import 'package:smart_app_lock/security/credentials/auth_type.dart';
 import 'package:smart_app_lock/security/credentials/credential_state_machine.dart';
 import 'package:smart_app_lock/security/credentials/impl/default_credential_manager.dart';
 import 'package:smart_app_lock/security/credentials/verified_attempt.dart';
+import 'package:smart_app_lock/security/intruder/log_generation.dart';
 import 'package:smart_app_lock/security/intruder/failed_attempt_event.dart';
 import 'package:smart_app_lock/security/intruder/intruder_failure_log_store.dart';
 import 'package:smart_app_lock/security/intruder/intruder_monitor.dart';
@@ -103,6 +104,9 @@ class _GatedPinHasher implements PinHasher {
   }
 }
 
+/// Batch 3: the failure log is v2; a probe document needs a generation.
+const String _tq15Gen = 'AAAAAAAAAAAAAAAAAAAAAA';
+
 void main() {
   // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
   // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
@@ -111,9 +115,15 @@ void main() {
   group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
     test('the storage fault reaches the CAS', () async {
       final _BrokenIntruderDb db = _BrokenIntruderDb();
-      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteUnknown>());
-      expect((await db.getAllSettings())
-          .containsKey(IntruderFailureLogStore.storageKey), isFalse);
+      expect(
+          await IntruderFailureLogStore(db).writeIfUnchanged(
+              IntruderFailureLog.empty.adoptGeneration(_tq15Gen),
+              expectedRaw: null),
+          isA<IntruderWriteUnknown>());
+      expect(
+          (await db.getAllSettings())
+              .containsKey(IntruderFailureLogStore.storageKey),
+          isFalse);
     });
   });
 
@@ -585,7 +595,8 @@ void main() {
           await c.settingsCipher.decryptString(raw.substring(7));
       final Map<String, dynamic> doc =
           jsonDecode(plain) as Map<String, dynamic>;
-      expect(doc['v'], 1);
+      expect(doc['v'], 2); // Batch 3: log v2 with a generation id
+      expect(LogGeneration.isValid(doc['gen']), isTrue);
       expect(plain, isNot(contains('9137')));
       expect(plain, isNot(contains('2580')));
       final String settingsJson = jsonEncode(

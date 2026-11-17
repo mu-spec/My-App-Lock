@@ -7,6 +7,7 @@
 // Privacy: no PIN, no pattern, no input length, no hash, no biometric data,
 // no image. Only method, surface, challenge attribution and counters.
 import '../credentials/verified_attempt.dart';
+import 'log_generation.dart';
 
 /// Credential method of a failed verification (biometric never produces a
 /// failed-attempt event — see the M1 design gate §D.2).
@@ -28,6 +29,8 @@ final class FailedAttemptEvent {
     this.packageName,
     this.generation,
     this.challengeSerial,
+    this.logGen,
+    this.legacy = false,
   });
 
   /// Monotonic event identity and order (never the wall clock).
@@ -63,6 +66,51 @@ final class FailedAttemptEvent {
   /// Whether the attempt-counter write for this verification succeeded.
   final bool counterPersisted;
 
+  /// Batch 3 (B2 §3.1): the failure-log generation this event belongs to.
+  /// Document-level in storage (never serialized per event); null for a
+  /// legacy event. Event identity (EID) = (logGen, seq).
+  final String? logGen;
+
+  /// Batch 3 (B-D5): an event recorded before the log had a generation
+  /// (v1 era). Its lineage cannot be proven, so it stays legacy forever and
+  /// keeps the F-CL-1 heuristics.
+  final bool legacy;
+
+  /// This event with its generation attached (legacy events never get one).
+  FailedAttemptEvent withLogGen(String? gen) => FailedAttemptEvent(
+        seq: seq,
+        verificationId: verificationId,
+        at: at,
+        method: method,
+        surface: surface,
+        consecutiveFailures: consecutiveFailures,
+        lockoutTriggered: lockoutTriggered,
+        lockoutStreak: lockoutStreak,
+        counterPersisted: counterPersisted,
+        packageName: packageName,
+        generation: generation,
+        challengeSerial: challengeSerial,
+        logGen: legacy ? null : gen,
+        legacy: legacy,
+      );
+
+  /// This event marked legacy (v1 era; B-D5).
+  FailedAttemptEvent asLegacy() => FailedAttemptEvent(
+        seq: seq,
+        verificationId: verificationId,
+        at: at,
+        method: method,
+        surface: surface,
+        consecutiveFailures: consecutiveFailures,
+        lockoutTriggered: lockoutTriggered,
+        lockoutStreak: lockoutStreak,
+        counterPersisted: counterPersisted,
+        packageName: packageName,
+        generation: generation,
+        challengeSerial: challengeSerial,
+        legacy: true,
+      );
+
   static const int maxPackageNameLength = 256;
   static const int maxVerificationIdLength = 64;
 
@@ -79,6 +127,7 @@ final class FailedAttemptEvent {
         'lockout': lockoutTriggered,
         'streak': lockoutStreak,
         'persisted': counterPersisted,
+        if (legacy) 'legacy': true,
       };
 
   /// Strict decoder: throws [FormatException] on any invalid field.
@@ -130,6 +179,10 @@ final class FailedAttemptEvent {
     final bool lockout = field<bool>('lockout');
     final int streak = field<int>('streak');
     final bool persisted = field<bool>('persisted');
+    final bool? legacy = optional<bool>('legacy');
+    if (legacy == false) {
+      throw const FormatException('event field "legacy" is invalid');
+    }
 
     if (seq < 0 ||
         vid.isEmpty ||
@@ -165,6 +218,7 @@ final class FailedAttemptEvent {
       lockoutTriggered: lockout,
       lockoutStreak: streak,
       counterPersisted: persisted,
+      legacy: legacy ?? false,
     );
   }
 
@@ -181,6 +235,7 @@ final class IntruderFailureLog {
     required this.nextSeq,
     required this.consecutiveFailures,
     required this.events,
+    this.gen,
   });
 
   static const IntruderFailureLog empty = IntruderFailureLog(
@@ -190,7 +245,12 @@ final class IntruderFailureLog {
   );
 
   static const String schema = 'sal.intruder_log';
-  static const int version = 1;
+
+  /// Batch 3: v2 adds the document-level generation id `gen` (B2 §3.1).
+  /// v1 documents are still READ (all their events are legacy, gen null);
+  /// every write is v2. There is no v1 write path (B-D1 condition 8).
+  static const int version = 2;
+  static const int legacyVersion = 1;
 
   /// Decoder hard limit (well above the retention cap) so a hostile or
   /// damaged document can never make decoding unbounded.
@@ -209,9 +269,29 @@ final class IntruderFailureLog {
   /// Events, oldest first, strictly increasing [FailedAttemptEvent.seq].
   final List<FailedAttemptEvent> events;
 
+  /// The generation id; null only for a document read from v1 (or the
+  /// in-memory empty base before a generation is minted).
+  final String? gen;
+
+  /// Batch 3 lazy migration (B2 §4): the same log under generation [g].
+  /// Events without a generation (v1 era) become legacy permanently (B-D5);
+  /// nextSeq continues unchanged.
+  IntruderFailureLog adoptGeneration(String g) => IntruderFailureLog(
+        nextSeq: nextSeq,
+        consecutiveFailures: consecutiveFailures,
+        gen: g,
+        events: List<FailedAttemptEvent>.unmodifiable(<FailedAttemptEvent>[
+          for (final FailedAttemptEvent e in events)
+            e.logGen == null && !e.legacy ? e.asLegacy() : e,
+        ]),
+      );
+
+  /// Throws [StateError] without a generation: nothing is ever encoded as
+  /// v1 again (B-D1 condition 8, no automatic v1-header fallback).
   Map<String, Object?> toJson() => <String, Object?>{
         'schema': schema,
         'v': version,
+        'gen': gen ?? (throw StateError('log v2 requires a generation')),
         'nextSeq': nextSeq,
         'run': consecutiveFailures,
         'events': <Object?>[
@@ -232,9 +312,15 @@ final class IntruderFailureLog {
     if (raw is! Map) {
       throw const FormatException('log is not an object');
     }
-    if (raw['schema'] != schema || raw['v'] != version) {
+    final Object? v = raw['v'];
+    if (raw['schema'] != schema || (v != version && v != legacyVersion)) {
       throw const FormatException('log schema/version mismatch');
     }
+    final Object? g = raw['gen'];
+    if (v == version ? !LogGeneration.isValid(g) : g != null) {
+      throw const FormatException('log generation invalid');
+    }
+    final String? docGen = g as String?;
     final Object? nextSeq = raw['nextSeq'];
     final Object? run = raw['run'];
     final Object? list = raw['events'];
@@ -250,7 +336,12 @@ final class IntruderFailureLog {
     final List<FailedAttemptEvent> events = <FailedAttemptEvent>[];
     int lastSeq = -1;
     for (final Object? item in list) {
-      final FailedAttemptEvent e = FailedAttemptEvent.fromJson(item);
+      final FailedAttemptEvent parsed = FailedAttemptEvent.fromJson(item);
+      if (docGen == null && parsed.legacy) {
+        // a v1 document never carries the v2-only legacy marker
+        throw const FormatException('legacy marker in a v1 log');
+      }
+      final FailedAttemptEvent e = parsed.withLogGen(docGen);
       if (e.seq <= lastSeq || e.seq >= nextSeq) {
         throw const FormatException('log sequence invalid');
       }
@@ -261,6 +352,7 @@ final class IntruderFailureLog {
       nextSeq: nextSeq,
       consecutiveFailures: run,
       events: List<FailedAttemptEvent>.unmodifiable(events),
+      gen: docGen,
     );
   }
 }

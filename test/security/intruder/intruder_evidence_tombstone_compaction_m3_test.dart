@@ -57,6 +57,22 @@ Uint8List jpegFor(int seq) =>
     jpegWithMetadata(padding: 8 + seq % 97, fill: 1 + seq % 250);
 Uint8List cleanFor(int seq) => JpegSanitizer.strip(jpegFor(seq))!;
 
+/// Batch 3 (evidence index v2, disclosed fixture change): v2 stores the
+/// Phase 12 / M3 guard fields of LEGACY items under `retired.legacy`. These
+/// tests only store legacy items (no generation), so that record carries
+/// exactly the v1 meaning; it is exposed at the top level as before.
+Map<String, Object?> _legacyView(Map<String, Object?> m) {
+  if (m['v'] != 2) return m;
+  final Map<String, Object?> legacy =
+      (((m['retired'] as Map?) ?? const <String, Object?>{})['legacy'] as Map?)
+              ?.cast<String, Object?>() ??
+          const <String, Object?>{};
+  expect((m['retired']! as Map).keys.toSet().difference(<String>{'legacy'}),
+      isEmpty,
+      reason: 'legacy-only fixture: no generation records expected');
+  return <String, Object?>{...m, ...legacy};
+}
+
 void main() {
   late _FaultDb db;
   late SettingsCipher cipher;
@@ -65,7 +81,7 @@ void main() {
   setUp(() {
     db = _FaultDb();
     cipher = AesGcmSettingsCipher(InMemorySecretStore(),
-          database: InMemoryLocalDatabase());
+        database: InMemoryLocalDatabase());
     now = DateTime(2026, 10, 22, 12);
   });
 
@@ -77,9 +93,9 @@ void main() {
   Future<Map<String, Object?>> rawIndex() async {
     final String? raw = await db.getSetting(IntruderEvidenceStore.indexKey);
     if (raw == null) return <String, Object?>{};
-    return jsonDecode(
-            await cipher.decryptString(raw.substring('enc:v1:'.length)))
-        as Map<String, Object?>;
+    return _legacyView(
+        jsonDecode(await cipher.decryptString(raw.substring('enc:v1:'.length)))
+            as Map<String, Object?>);
   }
 
   Future<void> save(IntruderEvidenceStore s, int seq) async => expect(
@@ -344,23 +360,38 @@ void main() {
         IntruderEvidenceStore.indexKey,
         'enc:v1:${await cipher.encryptString(jsonEncode(m))}');
 
-    test('listed items BELOW hw are valid (not quarantined)', () async {
-      final IntruderEvidenceStore s = open();
-      await save(s, 5);
-      final Map<String, Object?> idx = await rawIndex();
-      await writeRaw(<String, Object?>{...idx, 'hw': 40});
-      expect(await s.health(), EvidenceIndexHealth.ok);
-      expect((await s.list()).single.seq, 5);
-      expect(await s.readImage(5), cleanFor(5));
-      expect(await s.save(seq: 20, jpeg: jpegFor(20)),
-          EvidenceSaveResult.superseded);
-      expect(
-          await s.save(seq: 5, jpeg: jpegFor(5)), EvidenceSaveResult.duplicate);
-    });
+    for (final int v in <int>[1, 2]) {
+      test('listed items BELOW hw are valid (not quarantined) (index v$v)',
+          () async {
+        final IntruderEvidenceStore s = open();
+        await save(s, 5);
+        final Map<String, Object?> idx = await rawIndex();
+        // Batch 3 (disclosed): the legacy hw lives in `retired.legacy` in v2;
+        // the v1 layout (top-level hw) is still read (lazy migration).
+        await writeRaw(v == 1
+            ? <String, Object?>{'v': 1, 'items': idx['items'], 'hw': 40}
+            : <String, Object?>{
+                'v': 2,
+                'nextBid': idx['nextBid'],
+                'items': idx['items'],
+                'retired': <String, Object?>{
+                  'legacy': <String, Object?>{'hw': 40},
+                },
+              });
+        expect(await s.health(), EvidenceIndexHealth.ok);
+        expect((await s.list()).single.seq, 5);
+        expect(await s.readImage(5), cleanFor(5));
+        expect(await s.save(seq: 20, jpeg: jpegFor(20)),
+            EvidenceSaveResult.superseded);
+        expect(await s.save(seq: 5, jpeg: jpegFor(5)),
+            EvidenceSaveResult.duplicate);
+      });
+    }
 
     for (final Object bad in <Object>[-2, 'x', 1.5]) {
       // F-KEY-1 G-3: formerly "quarantined"; now unreadable and untouched.
-      test('invalid hw ($bad) is never trusted: unreadable, kept '
+      test(
+          'invalid hw ($bad) is never trusted: unreadable, kept '
           'byte-identical, never quarantined or replaced', () async {
         final IntruderEvidenceStore s = open();
         await writeRaw(<String, Object?>{
@@ -372,8 +403,8 @@ void main() {
         expect(await s.list(), isEmpty);
         expect(await s.health(), EvidenceIndexHealth.unreadable);
         expect(await db.getSetting(IntruderEvidenceStore.indexKey), raw);
-        expect(await db.getSetting(IntruderEvidenceStore.quarantineKey),
-            isNull);
+        expect(
+            await db.getSetting(IntruderEvidenceStore.quarantineKey), isNull);
       });
     }
   });

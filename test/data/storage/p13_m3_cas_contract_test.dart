@@ -33,8 +33,8 @@ void main() {
       await db.setSetting(k, 'S3CR3T');
       await expectLater(
           db.compareAndSetSetting(k, expected: 'S3CR3T', next: 'S3CR3T'),
-          throwsA(isA<ArgumentError>().having((ArgumentError e) => '$e',
-              'text', isNot(contains('S3CR3T')))));
+          throwsA(isA<ArgumentError>().having(
+              (ArgumentError e) => '$e', 'text', isNot(contains('S3CR3T')))));
       expect(await db.getSetting(k), 'S3CR3T');
     });
 
@@ -46,8 +46,10 @@ void main() {
         for (int i = 0; i < 16; i++)
           db.compareAndSetSetting(k, expected: 'v0', next: 'v1-$i'),
       ]);
-      expect(r.where((CasOutcome o) => o == CasOutcome.committed), hasLength(1));
-      expect(r.where((CasOutcome o) => o == CasOutcome.conflict), hasLength(15));
+      expect(
+          r.where((CasOutcome o) => o == CasOutcome.committed), hasLength(1));
+      expect(
+          r.where((CasOutcome o) => o == CasOutcome.conflict), hasLength(15));
     });
 
     test('CAS-M4 interleaved increment loops lose nothing', () async {
@@ -67,7 +69,8 @@ void main() {
         }
       }
 
-      await Future.wait(<Future<void>>[for (int w = 0; w < 4; w++) worker('w$w')]);
+      await Future.wait(
+          <Future<void>>[for (int w = 0; w < 4; w++) worker('w$w')]);
       expect(int.parse((await db.getSetting(k))!.split('|').first), 400);
     });
 
@@ -105,7 +108,8 @@ void main() {
     // P13/M3 Batch 2 RE-BASELINE (R8 allow-list, disclosed): the F-KEY-1
     // master-key resolver commits `sec.key_commit` (K-2+B-compat) with CAS;
     // it is the owner-authorized third caller. Still EXACT.
-    test('CAS-G1 the only production callers outside lib/data/storage are '
+    test(
+        'CAS-G1 the only production callers outside lib/data/storage are '
         'the security-settings repository, the failure-log store and the '
         'master-key resolver', () {
       final List<String> callers = <String>[
@@ -117,7 +121,8 @@ void main() {
       expect(callers, kCasCallers);
     });
 
-    test('CAS-G2 anti-vacuity: every test fake overriding setSetting is '
+    test(
+        'CAS-G2 anti-vacuity: every test fake overriding setSetting is '
         'inventoried; none may inherit CAS once a caller exists', () {
       // A fake that overrides setSetting (fault injection, counters, delays)
       // INHERITS the atomic in-memory CAS, which would bypass that override.
@@ -206,6 +211,11 @@ const List<String> kCasOverrideFiles = <String>[
   'test/security/timeline/security_timeline_concurrency_test.dart',
   // Batch 2: resolver tests inject CAS unknown-outcome faults (KC-05).
   'test/security/encryption/p13_m3_b2_master_key_resolver_test.dart',
+  // Batch 3 (B-D1 cond. 7, disclosed): process-death fault on the
+  // failure-log CAS (the dying instance's CAS never returns).
+  'test/security/intruder/p13_m3_b3_downgrade_test.dart',
+  'test/security/intruder/p13_m3_b3_crash_concurrency_test.dart',
+  'test/security/intruder/p13_m3_b3_identity_test.dart',
 ];
 
 class _UnreadableDb extends InMemoryLocalDatabase {

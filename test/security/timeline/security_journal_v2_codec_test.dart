@@ -95,8 +95,13 @@ void main() {
       });
       final SecurityJournalDocument d = decode(raw);
       expect(d.events.length, validF.length);
-      expect(jsonEncode(d.toJson()), jsonEncode(raw));
-      expect(jsonEncode(decode(d.toJson()).toJson()), jsonEncode(raw));
+      // Batch 3 (disclosed): a v2 document re-encodes as v3, byte-identical
+      // except the version token (v3 = v2 + optional outcome `tgen`).
+      final String asV3 = jsonEncode(
+          <String, Object?>{...raw, 'v': SecurityJournalDocument.version});
+      expect(SecurityJournalDocument.version, 3);
+      expect(jsonEncode(d.toJson()), asV3);
+      expect(jsonEncode(decode(d.toJson()).toJson()), asV3);
     });
 
     test('codes are sorted and de-duplicated on encode; zero fields omitted',
@@ -114,8 +119,10 @@ void main() {
           '{"s":"offline","c":["detectionOffline","watcherNotRunning"],"first":false}');
       const SecurityJournalDocument d = SecurityJournalDocument(
           nextSeq: 0, discarded: 0, lost: 0, events: <SecurityJournalEvent>[]);
-      expect(jsonEncode(d.toJson()),
-          '{"schema":"sal.security_journal","v":2,"nextSeq":0,"discarded":0,"lost":0,"events":[]}');
+      expect(
+          jsonEncode(d.toJson()),
+          // Batch 3: the encoder writes version 3.
+          '{"schema":"sal.security_journal","v":3,"nextSeq":0,"discarded":0,"lost":0,"events":[]}');
     });
   });
 
@@ -421,7 +428,9 @@ void main() {
 
   group('U-06 freeze golden (version 2)', () {
     test('type names, f keys and enum wire names are frozen', () {
-      expect(SecurityJournalDocument.version, 2);
+      // Batch 3 (disclosed): version 3 adds ONLY the optional outcome key
+      // `tgen`; every type name, f key and wire name below is unchanged.
+      expect(SecurityJournalDocument.version, 3);
       expect(
           SecurityJournalEventType.values
               .map((SecurityJournalEventType t) => t.name)
@@ -549,7 +558,8 @@ void main() {
       expect(j.health, isNot(SecurityJournalHealth.readOnly));
     });
 
-    test('v == 3 with the right schema is unsupported (never decoded)',
+    // Batch 3: v3 is now current; v4 is the first unsupported version.
+    test('v == 4 with the right schema is unsupported (never decoded)',
         () async {
       final InMemoryLocalDatabase db = InMemoryLocalDatabase();
       final AesGcmSettingsCipher c = AesGcmSettingsCipher(InMemorySecretStore(),
@@ -557,10 +567,10 @@ void main() {
       final SecurityEventJournalStore store =
           SecurityEventJournalStore(db, cipher: null);
       await db.setSetting(SecurityEventJournalStore.storageKey,
-          jsonEncode(<String, Object?>{...doc2(<Object?>[]), 'v': 3}));
+          jsonEncode(<String, Object?>{...doc2(<Object?>[]), 'v': 4}));
       final SecurityJournalRead r = await store.read();
       expect(r, isA<SecurityJournalUnsupported>());
-      expect((r as SecurityJournalUnsupported).version, 3);
+      expect((r as SecurityJournalUnsupported).version, 4);
       expect(c, isNotNull);
     });
   });

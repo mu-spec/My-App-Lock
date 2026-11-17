@@ -352,7 +352,8 @@ void main() {
     });
 
     test('newer schema is read-only and NEVER overwritten (A1-3)', () async {
-      final String newer = '{"schema":"sal.security_journal","v":3,'
+      // Batch 3: v3 is now current; v4 = "newer".
+      final String newer = '{"schema":"sal.security_journal","v":4,'
           '"nextSeq":9,"events":[{"seq":1,"futureField":true}]}';
       await db.setSetting(_key, newer);
       final SecurityEventJournal j = journal(plaintext: true);

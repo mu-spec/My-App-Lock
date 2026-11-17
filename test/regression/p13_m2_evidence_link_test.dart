@@ -65,6 +65,10 @@ void main() {
   late AppContainer c;
   late _GateDb db;
   int imageFrames = 0;
+  // Batch 3: the failure-log generation of the seeded attempts. The fixture
+  // models the production flow (coordinator -> evidence (gen, seq) and
+  // journal outcome (tgen, trig)), which now always carries the EID.
+  late String gen;
 
   StaticOverlayLockService overlay() => c.overlay as StaticOverlayLockService;
   Finder image() => find.byKey(const Key('intruder_evidence_image'));
@@ -119,12 +123,15 @@ void main() {
       await c.auth.authenticatePin('000000');
     }
     await c.intruderMonitor.idle();
+    gen = (await c.intruderMonitor.snapshot())!.gen!;
     if (seed) {
-      expect(await c.intruderEvidence.save(seq: 1, jpeg: jpegWithMetadata()),
+      expect(
+          await c.intruderEvidence
+              .save(seq: 1, gen: gen, jpeg: jpegWithMetadata()),
           EvidenceSaveResult.saved);
     }
-    c.securityJournal.recordEvent(
-        SecurityJournalEventType.captureSaved, const CaptureSavedFields(1));
+    c.securityJournal.recordEvent(SecurityJournalEventType.captureSaved,
+        CaptureSavedFields(1, tgen: gen));
     await c.securityJournal.idle();
     await t.pumpAndSettle();
   }
@@ -184,10 +191,13 @@ void main() {
       await before.auth.authenticatePin('000000');
     }
     await before.intruderMonitor.idle();
-    expect(await before.intruderEvidence.save(seq: 1, jpeg: jpegWithMetadata()),
+    final String g0 = (await before.intruderMonitor.snapshot())!.gen!;
+    expect(
+        await before.intruderEvidence
+            .save(seq: 1, gen: g0, jpeg: jpegWithMetadata()),
         EvidenceSaveResult.saved);
     before.securityJournal.recordEvent(
-        SecurityJournalEventType.captureSaved, const CaptureSavedFields(1));
+        SecurityJournalEventType.captureSaved, CaptureSavedFields(1, tgen: g0));
     await before.securityJournal.idle();
     expect((await before.auth.authenticatePin(_pin)).isSuccess, isTrue);
     await before.intruderMonitor.idle();
@@ -211,6 +221,8 @@ void main() {
     }
     await c.intruderMonitor.idle();
     expect(c.intruderMonitor.status.quarantinedCorruptLog, isTrue);
+    gen = (await c.intruderMonitor.snapshot())!.gen!;
+    expect(gen, isNot(g0), reason: 'a re-initialized log has a new gen');
     final SecurityJournalView v = await c.securityJournal.read();
     await t.pumpAndSettle();
     return v.events
@@ -294,9 +306,9 @@ void main() {
       await boot(t);
       await openToViewPhoto(t);
       if (how == 'delete') {
-        await c.intruderEvidence.delete(1);
+        await c.intruderEvidence.delete(1, gen: gen);
       } else {
-        await c.intruderEvidence.clearAll(floorSeq: 1);
+        await c.intruderEvidence.clearAll(floorSeq: 1, floorGen: gen);
       }
       await tapView(t);
       await typePin(t, _pin);
@@ -409,7 +421,8 @@ void main() {
     await typePin(t, _pin, settleAfter: false);
     await frames(t, 10);
     expect(find.byType(IntruderEvidenceScreen), findsOneWidget);
-    final Future<EvidenceDeleteResult> del = c.intruderEvidence.delete(1);
+    final Future<EvidenceDeleteResult> del =
+        c.intruderEvidence.delete(1, gen: gen);
     db.release();
     await frames(t, 40);
     expect(await del, isNotNull);
@@ -620,7 +633,9 @@ void main() {
     expect(imageFrames, 0, reason: 'no pixels before fresh verification');
     await typePin(t, _pin);
     expect(find.byType(IntruderEvidenceScreen), findsOneWidget);
-    expect(find.byKey(const Key('intruder_evidence_item_1')), findsOneWidget);
+    // Batch 3: a generation item's list key carries its blob id (bid 0).
+    expect(
+        find.byKey(const Key('intruder_evidence_item_1_b0')), findsOneWidget);
     expect(overlay().secureWindow, isTrue);
     expect(c.intruderOwnerSessions.current, isNotNull);
   });
@@ -635,8 +650,8 @@ void main() {
     expect((await c.auth.authenticatePin(_pin)).isSuccess, isTrue);
     await c.auth.authenticatePin('000000');
     await c.intruderMonitor.idle();
-    c.securityJournal.recordEvent(
-        SecurityJournalEventType.captureSaved, const CaptureSavedFields(2));
+    c.securityJournal.recordEvent(SecurityJournalEventType.captureSaved,
+        CaptureSavedFields(2, tgen: gen));
     await c.securityJournal.idle();
     final SecurityJournalView v = await c.securityJournal.read();
     expect(

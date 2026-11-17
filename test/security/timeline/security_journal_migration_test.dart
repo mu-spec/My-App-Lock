@@ -177,7 +177,7 @@ void main() {
       await j.idle();
       expect(db.writes, 1);
       final Map<String, Object?> d = await rawDoc();
-      expect(d['v'], 2);
+      expect(d['v'], 3); // Batch 3: writes are v3
       expect(d['from'], 1);
       expect(d['lost'], 1);
       expect(d['discarded'], 2);
@@ -214,9 +214,10 @@ void main() {
   group('U-10 newer schema (v3) is read-only for the process', () {
     test('v3 row: unsupported, 0 writes, no quarantine, outcomes lost',
         () async {
+      // Batch 3: v3 is now current; the "newer" row is v4.
       final String v3 = jsonEncode(<String, Object?>{
         'schema': SecurityJournalDocument.schema,
-        'v': 3,
+        'v': 4,
         'nextSeq': 1,
         'whatever': true,
         'events': <Object?>[],
@@ -261,7 +262,7 @@ void main() {
           SecurityJournalEventType.captureSaved, const CaptureSavedFields(2));
       await j.idle();
       final Map<String, Object?> d = await rawDoc();
-      expect(d['v'], 2);
+      expect(d['v'], 3); // Batch 3: writes are v3
       expect(d['lost'], 1);
       final List<String> types = (d['events']! as List<Object?>)
           .map((Object? e) => (e! as Map<String, Object?>)['type']! as String)
@@ -415,7 +416,7 @@ void main() {
               _key,
               jsonEncode(<String, Object?>{
                 'schema': SecurityJournalDocument.schema,
-                'v': 3,
+                'v': 4, // Batch 3: v3 is current; v4 = "newer"
                 'nextSeq': 0,
                 'events': <Object?>[],
               }));
