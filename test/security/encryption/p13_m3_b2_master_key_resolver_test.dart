@@ -423,8 +423,13 @@ void main() {
     });
 
     test(
-        'KB-14 a wrapped copy that cannot be verified at activation is '
-        'dropped (alias recorded in `retired`, never deleted)', () async {
+        // B2-RET-1 FLIPPED (Batch 2 follow-up). The ORIGINAL KB-14 asserted
+        // that a copy failing verification on a TRANSIENT error ('busy') was
+        // dropped (`retired == [alias]`, blob discarded). Historical copy:
+        // BATCH_2/followup/tests_pre_followup/. Now its bytes are KEPT.
+        'KB-14 FLIPPED (B2-RET-1) a wrapped copy that cannot be verified at '
+        'activation (transient error) is KEPT with its bytes; a fresh verified '
+        'copy is added; nothing is deleted', () async {
       final _Secrets s = _Secrets();
       final _Db db = _Db();
       final InMemoryKeyWrapper w = InMemoryKeyWrapper();
@@ -436,8 +441,16 @@ void main() {
           await _resolver(s, db, wrapper: w).resolve(), isA<MasterKeyReady>());
       final Map<String, Object?> row = _row(await db.getSetting(_commit));
       expect(row['state'], 'active');
-      expect(row['retired'], <String>[wk.alias]);
+      expect(row['retired'], isNull, reason: 'no alias-only retirement');
+      expect(
+          row['kept'],
+          <Object?>[
+            <String, Object?>{'alias': wk.alias, 'wrapped': wk.blob},
+          ],
+          reason: 'exact wrapped bytes retained');
+      expect(row['alias'], isNot(wk.alias), reason: 'fresh copy added by T6');
       expect(w.aliases, contains(wk.alias), reason: 'KEK never deleted');
+      expect(await w.unwrap(wk), _key(13), reason: 'kept copy still usable');
     });
   });
 

@@ -94,6 +94,7 @@ class MasterKeyResolver {
     Future<void> Function(Duration)? delay,
     this.pendingPolls = 10,
     this.pendingPollInterval = const Duration(milliseconds: 100),
+    this.stalePendingAfter = const Duration(minutes: 10),
   })  : _secrets = secrets,
         _db = database,
         _wrapper = wrapper,
@@ -109,6 +110,11 @@ class MasterKeyResolver {
   /// Superseded KEK aliases are recorded (never deleted); bounded.
   static const int maxRetired = 4;
 
+  /// B2-RET-1: wrapped copies that could not be verified (KEK missing OR a
+  /// transient Keystore error) are KEPT here with their bytes, never
+  /// dropped. When full, nothing more is moved (the row is left as is).
+  static const int maxKept = 8;
+
   final SecretStore _secrets;
   final LocalDatabase _db;
   final KeyWrapper _wrapper;
@@ -116,6 +122,13 @@ class MasterKeyResolver {
   final DateTime Function() _clock;
   final Future<void> Function(Duration) _delay;
   final int pendingPolls;
+
+  /// B2-PEND-1: a PENDING commitment older than this, with no key anywhere
+  /// (L absent, no usable wrapped copy) and no encrypted data, may be taken
+  /// over by a new genesis, but only with a VERIFIED wrapped copy of the new
+  /// key and a winning CAS. A commitment stamped in the future (clock moved
+  /// back) is never stale.
+  final Duration stalePendingAfter;
   final Duration pendingPollInterval;
 
   MasterKeyReady? _ready;
@@ -159,6 +172,7 @@ class MasterKeyResolver {
 
   Future<MasterKeyState> _run(bool allowGenesis) async {
     int polls = 0;
+    _takeoverTried = false;
     for (int round = 0; round < maxRounds + pendingPolls; round++) {
       final _S? s;
       try {
@@ -173,7 +187,7 @@ class MasterKeyResolver {
           ? await _absent(l, allowGenesis)
           : s.active
               ? await _active(s, l)
-              : await _pending(s, l);
+              : await _pending(s, l, allowGenesis);
       switch (step) {
         case _Done(:final MasterKeyState state):
           return state;
@@ -203,7 +217,10 @@ class MasterKeyResolver {
         // T1 adopt the legacy key (existing installs). Ciphertext untouched.
         final String kid = await kidOf(key);
         final WrappedKey? w = await _tryWrap(key);
-        await _cas(null, _S.encode(false, kid, w, _now(), const <String>[]));
+        await _cas(
+            null,
+            _S.encode(
+                false, kid, w, _now(), const <String>[], const <WrappedKey>[]));
         return const _Retry(); // completes via the pending path (verify)
       case _LAbsent():
         final bool? e = await _encryptedDataExists();
@@ -221,8 +238,8 @@ class MasterKeyResolver {
         final Uint8List fresh = _freshKey();
         final String kid = await kidOf(fresh);
         final WrappedKey? w = await _tryWrap(fresh);
-        final String pending =
-            _S.encode(false, kid, w, _now(), const <String>[]);
+        final String pending = _S.encode(
+            false, kid, w, _now(), const <String>[], const <WrappedKey>[]);
         if (!await _cas(null, pending)) return const _Retry(); // loser
         return _completeGenesis(pending, fresh, kid);
     }
@@ -230,7 +247,7 @@ class MasterKeyResolver {
 
   // -- S pending -----------------------------------------------------------
 
-  Future<_Step> _pending(_S s, _L l) async {
+  Future<_Step> _pending(_S s, _L l, bool allowGenesis) async {
     switch (l) {
       case _LError():
         return const _Done(MasterKeyUnavailable(MasterKeyIssue.storageError));
@@ -240,10 +257,12 @@ class MasterKeyResolver {
       case _LValid(:final Uint8List key):
         final String kidL = await kidOf(key);
         if (kidL == s.kid) {
-          // T5: L matches. Activate only with a VERIFIED wrapped copy; an
-          // unverifiable copy is dropped (alias recorded, never deleted).
+          // T5: L matches (verified). A wrapped copy that cannot be verified
+          // now (KEK missing or a transient Keystore error) is moved, WITH
+          // its bytes, to `kept` (B2-RET-1: never dropped); T6 then adds a
+          // fresh verified copy. If `kept` is full the row keeps it as is.
           WrappedKey? keep = s.wrapped;
-          List<String> retired = s.retired;
+          List<WrappedKey> kept = s.kept;
           if (keep != null) {
             final Uint8List? u = await _tryUnwrap(keep);
             if (u != null && await kidOf(u) != s.kid) {
@@ -251,26 +270,28 @@ class MasterKeyResolver {
                   MasterKeyUnavailable(MasterKeyIssue.keyMismatch));
             }
             if (u == null) {
-              retired = _retire(retired, keep.alias);
-              keep = null;
+              final List<WrappedKey>? k = _keepCopy(kept, keep);
+              if (k != null) {
+                kept = k;
+                keep = null;
+              }
             }
           }
-          await _cas(s.raw, _S.encode(true, s.kid, keep, s.at, retired));
+          await _cas(
+              s.raw, _S.encode(true, s.kid, keep, s.at, s.retired, kept));
           return const _Retry();
         }
         // T5: L holds another valid key. Nothing was ever encrypted under a
-        // PENDING kid, so L wins: re-commit to L (pending), then verify.
+        // PENDING kid, so L wins: re-commit to L (pending), then verify. The
+        // old pending wrapped copy is kept with its bytes (B2-RET-1); if
+        // `kept` is full, fail closed and write nothing.
+        final List<WrappedKey>? kept =
+            s.wrapped == null ? s.kept : _keepCopy(s.kept, s.wrapped!);
+        if (kept == null) {
+          return const _Done(MasterKeyUnavailable(MasterKeyIssue.storageError));
+        }
         final WrappedKey? w = await _tryWrap(key);
-        await _cas(
-            s.raw,
-            _S.encode(
-                false,
-                kidL,
-                w,
-                _now(),
-                s.wrapped == null
-                    ? s.retired
-                    : _retire(s.retired, s.wrapped!.alias)));
+        await _cas(s.raw, _S.encode(false, kidL, w, _now(), s.retired, kept));
         return const _Retry();
       case _LAbsent():
         final bool? e = await _encryptedDataExists();
@@ -293,7 +314,8 @@ class MasterKeyResolver {
         // `initializing`. A pending row whose creator died before writing L
         // and that has no usable wrapped copy stays fail-closed (no data is
         // at risk: E is false). Disclosed as B2-PEND-1.
-        return const _Wait();
+        final _Step? t = allowGenesis ? await _takeOverStale(s) : null;
+        return t ?? const _Wait();
     }
   }
 
@@ -326,7 +348,8 @@ class MasterKeyResolver {
             if (w != null) {
               final Uint8List? u = await _tryUnwrap(w);
               if (u != null && await kidOf(u) == s.kid) {
-                await _cas(s.raw, _S.encode(true, s.kid, w, s.at, s.retired));
+                await _cas(
+                    s.raw, _S.encode(true, s.kid, w, s.at, s.retired, s.kept));
               }
             }
           }
@@ -370,23 +393,68 @@ class MasterKeyResolver {
 
   // -- helpers -------------------------------------------------------------
 
+  /// The primary wrapped copy, then every kept copy (B2-RET-1); a copy is
+  /// used only if its kid verifies. Missing only when every copy's KEK is
+  /// gone; any other failure is an error (transient, retried later).
   Future<_Unwrapped> _unwrapVerified(_S s) async {
-    final WrappedKey? w = s.wrapped;
-    if (w == null) return const _UMissing();
-    try {
-      final Uint8List k = await _wrapper.unwrap(w);
-      if (await kidOf(k) != s.kid) return const _UError();
-      return _UOk(k);
-    } on KeyWrapMissing {
-      return const _UMissing();
-    } catch (_) {
-      return const _UError();
+    final List<WrappedKey> all = <WrappedKey>[
+      if (s.wrapped != null) s.wrapped!,
+      ...s.kept,
+    ];
+    if (all.isEmpty) return const _UMissing();
+    bool error = false;
+    for (final WrappedKey w in all) {
+      try {
+        final Uint8List k = await _wrapper.unwrap(w);
+        if (await kidOf(k) == s.kid) return _UOk(k);
+        error = true;
+      } on KeyWrapMissing {
+        // this copy's KEK is gone; try the next
+      } catch (_) {
+        error = true;
+      }
     }
+    return error ? const _UError() : const _UMissing();
   }
 
-  static List<String> _retire(List<String> retired, String alias) {
-    final List<String> r = <String>[...retired, alias];
-    return r.length <= maxRetired ? r : r.sublist(r.length - maxRetired);
+  /// B2-PEND-1 recovery. Only for a STALE pending commitment with L absent,
+  /// no usable wrapped copy and no encrypted data (checked by the caller).
+  /// Nothing can have been encrypted under a pending kid. The new key must
+  /// have a verified wrapped copy BEFORE the CAS, so a late write of L by a
+  /// stalled creator can only produce KeyMismatch (fail closed, both keys
+  /// preserved), never loss. The old wrapped copy is kept with its bytes.
+  Future<_Step?> _takeOverStale(_S s) async {
+    final int age = _now() - s.at;
+    if (age < stalePendingAfter.inMilliseconds) return null;
+    // At most one attempt per resolve: never mint a KEK per poll round.
+    if (_takeoverTried) return null;
+    _takeoverTried = true;
+    final List<WrappedKey>? kept =
+        s.wrapped == null ? s.kept : _keepCopy(s.kept, s.wrapped!);
+    if (kept == null) return null;
+    final Uint8List fresh = _freshKey();
+    final String kid = await kidOf(fresh);
+    final WrappedKey? w = await _tryWrap(fresh);
+    if (w == null) return null;
+    final Uint8List? u = await _tryUnwrap(w);
+    if (u == null || await kidOf(u) != kid) return null;
+    final String next = _S.encode(false, kid, w, _now(), s.retired, kept);
+    if (!await _cas(s.raw, next)) return const _Retry();
+    takeovers++;
+    return _completeGenesis(next, fresh, kid);
+  }
+
+  /// Number of stale-pending takeovers performed (diagnostics / tests).
+  int takeovers = 0;
+  bool _takeoverTried = false;
+
+  /// [kept] plus [w] (bytes retained), or null when full (nothing moved).
+  static List<WrappedKey>? _keepCopy(List<WrappedKey> kept, WrappedKey w) {
+    if (kept.any((WrappedKey k) => k.alias == w.alias && k.blob == w.blob)) {
+      return kept;
+    }
+    if (kept.length >= maxKept) return null;
+    return <WrappedKey>[...kept, w];
   }
 
   Future<WrappedKey?> _tryWrap(Uint8List key) async {
@@ -428,7 +496,19 @@ class MasterKeyResolver {
     } catch (_) {
       return const _LError();
     }
-    if (raw == null) return const _LAbsent();
+    if (raw == null) {
+      // A null read is ABSENT only if the entry is also physically absent.
+      // Present-but-null (e.g. a failed decrypt reported as absent) is an
+      // ERROR: L is never restored or written over it (T7/T2 guard).
+      try {
+        if (await _secrets.containsKey(SecretKeys.settingsMasterKey)) {
+          return const _LError();
+        }
+      } catch (_) {
+        return const _LError();
+      }
+      return const _LAbsent();
+    }
     try {
       final Uint8List k = Uint8List.fromList(base64Decode(raw));
       if (k.length != keyLength) return const _LGarbage();
@@ -461,14 +541,15 @@ final class _Unsupported implements Exception {
 }
 
 final class _S {
-  const _S(
-      this.raw, this.active, this.kid, this.wrapped, this.at, this.retired);
+  const _S(this.raw, this.active, this.kid, this.wrapped, this.at, this.retired,
+      this.kept);
   final String raw;
   final bool active;
   final String kid;
   final WrappedKey? wrapped;
   final int at;
   final List<String> retired;
+  final List<WrappedKey> kept;
 
   static _S? parse(String? raw) {
     if (raw == null) return null;
@@ -485,6 +566,18 @@ final class _S {
     final Object? alias = d['alias'];
     final Object? blob = d['wrapped'];
     final Object? retired = d['retired'] ?? const <Object?>[];
+    final Object? keptRaw = d['kept'] ?? const <Object?>[];
+    if (keptRaw is! List || keptRaw.length > MasterKeyResolver.maxKept) {
+      throw const _Unsupported();
+    }
+    final List<WrappedKey> kept = <WrappedKey>[];
+    for (final Object? e in keptRaw) {
+      if (e is! Map || e['alias'] is! String || e['wrapped'] is! String) {
+        throw const _Unsupported();
+      }
+      kept.add(WrappedKey(
+          alias: e['alias'] as String, blob: e['wrapped'] as String));
+    }
     if (retired is! List ||
         retired.length > MasterKeyResolver.maxRetired ||
         retired.any((Object? a) => a is! String) ||
@@ -504,11 +597,12 @@ final class _S {
             ? null
             : WrappedKey(alias: alias as String, blob: blob as String),
         at,
-        List<String>.unmodifiable(retired.cast<String>()));
+        List<String>.unmodifiable(retired.cast<String>()),
+        List<WrappedKey>.unmodifiable(kept));
   }
 
   static String encode(bool active, String kid, WrappedKey? w, int at,
-          List<String> retired) =>
+          List<String> retired, List<WrappedKey> kept) =>
       jsonEncode(<String, Object?>{
         'v': 1,
         'state': active ? 'active' : 'pending',
@@ -517,6 +611,11 @@ final class _S {
         if (w != null) 'wrapped': w.blob,
         'at': at,
         if (retired.isNotEmpty) 'retired': retired,
+        if (kept.isNotEmpty)
+          'kept': <Map<String, String>>[
+            for (final WrappedKey k in kept)
+              <String, String>{'alias': k.alias, 'wrapped': k.blob},
+          ],
       });
 }
 
