@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'app/app.dart';
 import 'app/app_container.dart';
+import 'ui/screens/onboarding/onboarding_decision.dart';
 
 /// Smart App Lock — application entry point.
 ///
@@ -11,5 +12,9 @@ import 'app/app_container.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   final AppContainer container = await AppContainer.create();
-  runApp(SmartAppLockApp(container: container));
+  // Phase 15 / M1: first launch (no PIN or pattern yet) starts onboarding.
+  final bool onboarding = await shouldStartOnboarding(container.auth);
+  runApp(
+    SmartAppLockApp(container: container, startWithOnboarding: onboarding),
+  );
 }

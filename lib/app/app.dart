@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../ui/screens/onboarding/onboarding_screen.dart';
 import 'app_container.dart';
 import 'app_scope.dart';
 import 'capability_watch_guard.dart';
@@ -17,10 +18,19 @@ import 'theme/app_theme.dart';
 /// [LockChallengeHost] presents the unlock challenge whenever a protected
 /// app becomes active.
 class SmartAppLockApp extends StatefulWidget {
-  const SmartAppLockApp({super.key, this.container});
+  const SmartAppLockApp({
+    super.key,
+    this.container,
+    this.startWithOnboarding = false,
+  });
 
   /// Persistence wiring created in `main()` (null in pure widget tests).
   final AppContainer? container;
+
+  /// Phase 15 / M1: start in onboarding instead of the shell. Decided in
+  /// `main()` from the credential state (`shouldStartOnboarding`): true
+  /// only when no PIN or pattern exists. Read once, at first build.
+  final bool startWithOnboarding;
 
   @override
   State<SmartAppLockApp> createState() => _SmartAppLockAppState();
@@ -61,7 +71,12 @@ class _SmartAppLockAppState extends State<SmartAppLockApp> {
       initialRoute: RouteNames.home,
       onGenerateRoute: AppRouter.onGenerateRoute,
       // Phase 6 / M1: a platform-supplied initial route is ignored.
-      onGenerateInitialRoutes: AppRouter.onGenerateInitialRoutes,
+      // Phase 15 / M1: onboarding is built directly (no route name), so
+      // the platform route name still cannot select it.
+      onGenerateInitialRoutes:
+          widget.startWithOnboarding && widget.container != null
+              ? (String _) => <Route<dynamic>>[OnboardingScreen.route()]
+              : AppRouter.onGenerateInitialRoutes,
     );
 
     final AppContainer? container = widget.container;
