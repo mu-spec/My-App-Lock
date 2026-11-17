@@ -137,6 +137,21 @@
                 android:value="Keeps foreground detection alive while Smart App Lock is backgrounded so protected apps are locked the moment they open." />
         </service>
 
+        <!-- Phase 14 / M1: notification privacy. Bound only by the system
+             (BIND_NOTIFICATION_LISTENER_SERVICE) after the user grants
+             Notification access. Only the posting package and the
+             ongoing/clearable flags are ever inspected; notification
+             content is never read, stored, logged or sent. -->
+        <service
+            android:name=".SalNotificationListenerService"
+            android:exported="true"
+            android:label="Smart App Lock notification privacy"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <receiver
             android:name=".ProtectionBootReceiver"
             android:enabled="true"

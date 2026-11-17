@@ -76,6 +76,11 @@ import '../services/installed_apps_service.dart';
 import '../services/overlay_lock_service.dart';
 import '../services/screen_state_service.dart';
 import '../services/watcher_service.dart';
+import '../services/notification_privacy_service.dart';
+import '../services/impl/method_channel_notification_privacy_service.dart';
+import '../services/impl/static_notification_privacy_service.dart';
+import '../security/notification_privacy/notification_privacy_controller.dart';
+import '../security/notification_privacy/notification_privacy_settings.dart';
 import '../services/impl/method_channel_watcher_service.dart';
 
 /// Application dependency container — the single wiring point for all
@@ -100,6 +105,7 @@ class AppContainer {
     required this.capabilityMonitor,
     BiometricService? biometricsOverride,
     IntruderEvidenceService? intruderEvidenceOverride,
+    NotificationPrivacyService? notificationPrivacyOverride,
     PreferencesStore? preferencesOverride,
     DateTime Function()? accessClock,
     KeyWrapper keyWrapper = const NoKeyWrapper(),
@@ -183,6 +189,21 @@ class AppContainer {
     intruderStartup =
         intruderEvidence.startupMaintenance().catchError((Object _) {});
     unawaited(intruderStartup);
+    // Phase 14 / M1: per-app notification privacy (encrypted settings row)
+    // mirrored to native for the listener. Startup sync never blocks or
+    // fails startup; an unreadable record pushes nothing (fail closed).
+    notificationPrivacyService = notificationPrivacyOverride ??
+        MethodChannelNotificationPrivacyService();
+    notificationPrivacySettings =
+        NotificationPrivacySettingsStore(_database, settingsCipher);
+    notificationPrivacy = NotificationPrivacyController(
+      store: notificationPrivacySettings,
+      service: notificationPrivacyService,
+      protectedApps: protectedApps,
+    );
+    notificationPrivacyStartup =
+        notificationPrivacy.sync().then((bool _) {}).catchError((Object _) {});
+    unawaited(notificationPrivacyStartup);
     // Phase 13 / M1: encrypted, bounded security event journal (same DB and
     // cipher) + the read-only timeline model. Observe-only: nothing in
     // enforcement reads, imports or awaits either; startup maintenance never
@@ -377,6 +398,8 @@ class AppContainer {
     ScreenStateService? screenState,
     // Phase 13 / M3 Batch 2: platform KEK double (default: none).
     KeyWrapper? keyWrapper,
+    // Phase 14 / M1: fake native notification privacy (default: static).
+    NotificationPrivacyService? notificationPrivacy,
   }) {
     final InstalledAppsService installedAppsService =
         StaticInstalledAppsService(
@@ -405,6 +428,8 @@ class AppContainer {
       watcherService: StaticWatcherService(),
       intruderEvidenceOverride:
           intruderEvidence ?? StaticIntruderEvidenceService(),
+      notificationPrivacyOverride:
+          notificationPrivacy ?? StaticNotificationPrivacyService(),
       capabilityMonitor: CapabilityMonitor(
         hasUsageAccess: installedAppsService.hasUsageAccess,
         isAccessibilityEnabled: accessibilityService.isServiceEnabled,
@@ -472,6 +497,13 @@ class AppContainer {
   /// Phase 12 / M3 — completes when startup evidence maintenance (orphan
   /// sweep + retention) has finished. Never fails.
   late final Future<void> intruderStartup;
+
+  /// Phase 14 / M1: notification privacy (settings, native bridge,
+  /// controller) and its startup sync (never fails).
+  late final NotificationPrivacySettingsStore notificationPrivacySettings;
+  late final NotificationPrivacyService notificationPrivacyService;
+  late final NotificationPrivacyController notificationPrivacy;
+  late final Future<void> notificationPrivacyStartup;
 
   /// Phase 12 / M3 — in-memory owner evidence-viewing sessions (never
   /// persisted). Replaceable only so tests can inject a clock.

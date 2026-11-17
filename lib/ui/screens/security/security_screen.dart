@@ -22,6 +22,7 @@ import '../../../utilities/result.dart';
 import '../../widgets/secure_storage_unavailable.dart';
 import 'app_credential_verification.dart';
 import 'intruder_settings_screen.dart';
+import 'notification_privacy_screen.dart';
 import 'security_center_section.dart';
 import 'security_timeline_screen.dart';
 
@@ -621,6 +622,19 @@ class _SecurityScreenState extends State<SecurityScreen>
     await openSecurityTimeline(context, container);
   }
 
+  /// Phase 14 / M1 — opens per-app notification privacy (viewing needs no
+  /// verification; weakening a mode verifies freshly inside the screen).
+  Future<void> _openNotificationPrivacy() async {
+    final AppContainer? container = AppScope.read(context);
+    if (container == null) {
+      return;
+    }
+    await Navigator.of(context).push<void>(MaterialPageRoute<void>(
+      settings: const RouteSettings(name: notificationPrivacyRouteName),
+      builder: (_) => NotificationPrivacyScreen(container: container),
+    ));
+  }
+
   /// Phase 12 / M3 — opens Intruder settings. Viewing settings needs no
   /// verification (no evidence content is shown); every change and the
   /// evidence viewer verify freshly. Re-reads the switches on return.
@@ -1158,6 +1172,15 @@ class _SecurityScreenState extends State<SecurityScreen>
                   subtitle: const Text(SecurityTimelineText.rowSubtitle),
                   trailing: const Icon(Icons.chevron_right),
                   onTap: _intruderBusy ? null : _openSecurityTimeline,
+                ),
+                const Divider(),
+                ListTile(
+                  key: const ValueKey<String>('notification_privacy_row'),
+                  leading: const Icon(Icons.notifications_off_outlined),
+                  title: const Text(NotificationPrivacyText.title),
+                  subtitle: const Text(NotificationPrivacyText.rowSubtitle),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: _openNotificationPrivacy,
                 ),
                 const Divider(),
                 const SecurityStatusItem(

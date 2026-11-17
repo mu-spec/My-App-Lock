@@ -167,6 +167,8 @@ class MainActivity : FlutterFragmentActivity() {
         OverlayStatusChannel.register(flutterEngine, this)
         ScreenStateChannel.register(flutterEngine, this)
         WatcherChannel.register(flutterEngine, this)
+        // Phase 14 / M1: notification privacy (package names + mode ids only).
+        NotificationPrivacyChannel.register(flutterEngine, this)
         // Phase 12 / M2: owner-opted-in intruder evidence + alarm.
         IntruderEvidenceChannel.register(flutterEngine, this)
         // Phase 13 / M3 Batch 2: AndroidKeyStore KEK for the data key.
