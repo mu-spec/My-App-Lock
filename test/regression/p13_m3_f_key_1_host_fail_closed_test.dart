@@ -16,7 +16,8 @@
 //  * the settings row is byte-identical; no credential/lockout write;
 //  * once storage is readable again, the original PIN is required and works.
 // Residual (availability, not a grant): the user sees a shield with no
-// challenge until storage recovers (recorded as F-KEY-1e).
+// challenge until storage recovers (recorded as F-KEY-1e). Batch 2 (G7-H1
+// option 2): that shield now shows the neutral storage-unavailable text.
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:smart_app_lock/app/app.dart';
@@ -182,8 +183,16 @@ void main() {
           (c2.installedAppsService as StaticInstalledAppsService)
               .launchAppCalls,
           0);
-      // F-KEY-1e (availability residual, characterised): no challenge UI.
+      // F-KEY-1e: no challenge UI, and (Batch 2, G7-H1 option 2) the
+      // VISIBLE shield now carries the neutral storage-unavailable text.
       expect(find.byType(PinUnlockScreen), findsNothing);
+      expect(
+          (c2.overlay as StaticOverlayLockService)
+              .storageUnavailableNoticeCalls,
+          greaterThan(0));
+      expect(n2.storageUnavailableNotice, isTrue);
+      expect(n2.shieldVisible, isTrue, reason: 'text only, never hidden');
+      expect(n2.readyChallenge, isNull, reason: 'never markChallengeReady');
       // Credential + lockout row untouched.
       expect(await disk.getSetting(_settingsKey), rowBefore);
       // F-KEY-1d FLIPPED (Batch 2): the original asserted that one null
@@ -224,6 +233,40 @@ void main() {
       expect((c3.watcher as StaticWatcherService).authorizePackageCalls, 1);
     });
   }
+
+  testWidgets(
+      'FK-H5 Batch 2: a genuinely unenrolled state (readable, no credential) '
+      'never shows the storage-unavailable notice', (WidgetTester t) async {
+    t.view.physicalSize = const Size(800, 1600);
+    t.view.devicePixelRatio = 1.0;
+    addTearDown(t.view.reset);
+    final AppContainer c = AppContainer.inMemory(
+        database: InMemoryLocalDatabase(), secretStore: InMemorySecretStore());
+    // The package IS protected (Dart + native), so the host really reaches
+    // its no-credential branch (pass-1 B2-19 SURVIVED without this).
+    await c.protectedApps.add(ProtectedApp(
+      packageName: _pkg,
+      label: _pkg,
+      addedAt: DateTime(2026, 10, 22),
+    ));
+    final StaticNativeChallengeContract n =
+        _bind(c, enabled: true, packages: <String>{_pkg});
+    await t.pumpWidget(SmartAppLockApp(container: c));
+    await t.pumpAndSettle();
+    expect((await c.auth.status()).isSuccess, isTrue);
+    n.reportForeground(_pkg);
+    (c.accessibility as StaticAccessibilityLockService)
+        .emitForegroundPackage(_pkg);
+    await t.pumpAndSettle();
+    await t.pump(const Duration(seconds: 5));
+    await t.pumpAndSettle();
+    expect(
+        (c.overlay as StaticOverlayLockService).storageUnavailableNoticeCalls,
+        0);
+    expect(n.storageUnavailableNotice, isFalse);
+    await t.pumpWidget(const SizedBox());
+    await t.pumpAndSettle();
+  });
 
   // F-KEY-1d FLIPPED (Batch 2). The ORIGINAL nullOnce case asserted that one
   // null read minted and persisted a replacement key, losing the credential
@@ -267,6 +310,7 @@ void main() {
         .emitForegroundPackage(_pkg);
     await t.pumpAndSettle();
     expect(find.byType(PinUnlockScreen), findsOneWidget);
+    expect(n2.storageUnavailableNotice, isFalse);
     for (final String d in '000000'.split('')) {
       await t.tap(find.byKey(Key('pin_key_$d')));
       await t.pump(const Duration(milliseconds: 20));

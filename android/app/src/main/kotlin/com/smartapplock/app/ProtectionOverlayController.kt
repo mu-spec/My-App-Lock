@@ -147,6 +147,25 @@ object ProtectionOverlayController {
         }
     }
 
+    /**
+     * P13/M3 Batch 2 (G7-H1 option 2): shows the neutral "secure storage
+     * unavailable" text on the VISIBLE shield. Text only: visibility, flags
+     * and touch blocking are unchanged, and the shield is never hidden.
+     * Returns false (and changes nothing) when no shield is showing. The
+     * default text returns whenever the shield is hidden.
+     */
+    @Synchronized
+    fun showStorageUnavailableNotice(): Boolean {
+        if (!ShieldNotices.mayApplyStorageNotice(showing)) return false
+        val view = message ?: return false
+        return try {
+            view.text = ShieldNotices.STORAGE_UNAVAILABLE_MESSAGE
+            true
+        } catch (_: Exception) {
+            false // cosmetic only; the shield state is unaffected
+        }
+    }
+
     /** Makes the shield inert but retains the full-size pre-armed window. */
     @Synchronized
     fun hide(): Boolean {

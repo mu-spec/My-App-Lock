@@ -30,4 +30,11 @@ abstract interface class OverlayLockService {
   /// window — while set, the recents snapshot and screenshots render
   /// blank, so a lock challenge never leaks through task switching.
   Future<Result<void>> setSecureWindow(bool secure);
+
+  /// P13/M3 Batch 2 (G7-H1 option 2): replaces the text of the VISIBLE
+  /// native shield with the neutral "secure storage unavailable" copy.
+  /// Text only: the shield is never hidden, never made touch-transparent,
+  /// and nothing is granted. The default text returns when the shield is
+  /// hidden. Success means the text was applied to a visible shield.
+  Future<Result<void>> showStorageUnavailableNotice();
 }

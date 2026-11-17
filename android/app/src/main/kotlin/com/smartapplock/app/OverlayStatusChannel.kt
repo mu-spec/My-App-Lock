@@ -141,6 +141,11 @@ object OverlayStatusChannel {
                         result.success(false)
                     }
                 }
+                "showStorageUnavailableNotice" -> {
+                    // P13/M3 Batch 2 (G7-H1 option 2): text-only notice on
+                    // the visible shield. Never hides it, never grants.
+                    result.success(ProtectionOverlayController.showStorageUnavailableNotice())
+                }
                 "setSecureWindow" -> {
                     // Phase 5O (recents hardening): FLAG_SECURE keeps the
                     // recents snapshot and screenshots blank while the

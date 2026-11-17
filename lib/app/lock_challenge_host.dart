@@ -745,10 +745,23 @@ class _LockChallengeHostState extends State<LockChallengeHost>
         return;
       }
 
+      final Result<CredentialState> statusResult =
+          await container.auth.status();
+      // P13/M3 Batch 2 (F-KEY-1e, owner-approved G7-H1 option 2): an
+      // UNREADABLE credential state is not "no credential". Nothing is
+      // presented, granted or hidden; the native shield stays up and only
+      // its text changes to the neutral G-7 copy (no setup, no reset, no
+      // lockout change). Never markChallengeReady here: it hides the shield.
+      if (statusResult.isFailure) {
+        _diag('$diagId ABORT storage-unavailable package=$packageName');
+        if (mounted) {
+          await container.overlay.showStorageUnavailableNotice();
+        }
+        return;
+      }
       // Fail-safe: without an enrolled credential there is no challenge
       // to present — never lock the user out of their own phone.
-      final CredentialState? status =
-          (await container.auth.status()).valueOrNull;
+      final CredentialState? status = statusResult.valueOrNull;
       if (status == null || !status.hasAnyCredential) {
         _diag('$diagId ABORT no-credential package=$packageName');
         return;

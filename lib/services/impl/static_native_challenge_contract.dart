@@ -410,6 +410,19 @@ class StaticNativeChallengeContract {
   /// Phase 6 / M2: the shield shows the multi-window notice text.
   bool multiWindowNotice = false;
 
+  /// P13/M3 Batch 2 (G7-H1 option 2): the shield shows the neutral
+  /// "secure storage unavailable" text.
+  bool storageUnavailableNotice = false;
+
+  /// `ProtectionOverlayController.showStorageUnavailableNotice`: text only,
+  /// applied only to a VISIBLE shield; visibility is never changed.
+  bool showStorageUnavailableNotice() {
+    if (!shieldVisible) return false;
+    multiWindowNotice = false;
+    storageUnavailableNotice = true;
+    return true;
+  }
+
   // -- ProtectionAccessState (subset: no grace or session expiry) -----------
 
   final Set<String> authorizedPackages = <String>{};
@@ -908,6 +921,7 @@ class StaticNativeChallengeContract {
     if (!shieldHideSucceeds) return false;
     shieldVisible = false;
     multiWindowNotice = false;
+    storageUnavailableNotice = false;
     return true;
   }
 
@@ -940,5 +954,6 @@ class StaticNativeChallengeContract {
     readyChallenge = null;
     _showShield();
     multiWindowNotice = true;
+    storageUnavailableNotice = false;
   }
 }

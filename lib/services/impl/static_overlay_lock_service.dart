@@ -127,4 +127,21 @@ class StaticOverlayLockService implements OverlayLockService {
     secureWindow = secure;
     return Result.success(null);
   }
+
+  /// P13/M3 Batch 2 (G7-H1 option 2): counts notice requests. With a bound
+  /// [nativeContract] the notice applies only to a visible shield and never
+  /// changes its visibility (native contract).
+  int storageUnavailableNoticeCalls = 0;
+
+  @override
+  Future<Result<void>> showStorageUnavailableNotice() async {
+    storageUnavailableNoticeCalls++;
+    final StaticNativeChallengeContract? native = nativeContract;
+    if (native != null) {
+      return native.showStorageUnavailableNotice()
+          ? Result.success(null)
+          : Result.failure(StateError('No visible shield.'));
+    }
+    return Result.success(null);
+  }
 }
