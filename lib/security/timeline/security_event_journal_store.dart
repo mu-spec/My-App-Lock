@@ -64,16 +64,29 @@ class SecurityEventJournalStore {
   final LocalDatabase _database;
   final SettingsCipher? _cipher;
 
-  Future<SecurityJournalRead> read() async {
+  Future<SecurityJournalRead> read() async => (await readWithRaw()).$1;
+
+  /// E-2: the decoded row plus the exact stored bytes it was decoded from
+  /// (null when missing or not readable): the `expected` value of the next
+  /// [writeIfUnchanged].
+  Future<(SecurityJournalRead, String?)> readWithRaw() async {
     final String? raw;
     try {
       raw = await _database.getSetting(storageKey);
     } catch (_) {
-      return const SecurityJournalUnreadable(permanent: false);
+      return (const SecurityJournalUnreadable(permanent: false), null);
     }
     if (raw == null) {
-      return const SecurityJournalMissing();
+      return (const SecurityJournalMissing(), null);
     }
+    return (await _decode(raw), raw);
+  }
+
+  /// Exact stored bytes (throws on storage failure). Used to reconcile an
+  /// unknown write outcome.
+  Future<String?> readRaw() => _database.getSetting(storageKey);
+
+  Future<SecurityJournalRead> _decode(String raw) async {
     final String jsonText;
     if (raw.startsWith(_encryptedPrefix)) {
       final SettingsCipher? cipher = _cipher;
@@ -124,18 +137,52 @@ class SecurityEventJournalStore {
   /// the size bound.
   static String encode(SecurityJournalDocument doc) => jsonEncode(doc.toJson());
 
-  /// Throws on failure; the previous row stays intact (single-row replace).
-  Future<void> write(SecurityJournalDocument doc) async {
+  Future<String> _seal(SecurityJournalDocument doc) async {
     final String json = encode(doc);
     final SettingsCipher? cipher = _cipher;
-    final String stored = cipher == null
+    return cipher == null
         ? json
         : '$_encryptedPrefix${await cipher.encryptString(json)}';
-    await _database.setSetting(storageKey, stored);
+  }
+
+  /// E-2 (R-P13M3-T1): writes [doc] only if the row still holds exactly
+  /// [expectedRaw] (null = absent). There is no blind write: a second
+  /// engine's stale copy can never replace a newer row (e.g. resurrect
+  /// history the owner cleared). Never throws:
+  ///  * [JournalWriteCommitted]: this call changed the row to `raw`;
+  ///  * [JournalWriteConflict]: the row changed since it was read; nothing
+  ///    was written;
+  ///  * [JournalWriteUnknown]: completion not confirmed; the caller must
+  ///    reconcile by re-reading and never report it as saved.
+  Future<JournalWriteResult> writeIfUnchanged(
+    SecurityJournalDocument doc, {
+    required String? expectedRaw,
+  }) async {
+    final String stored;
+    try {
+      stored = await _seal(doc);
+    } catch (_) {
+      return const JournalWriteUnknown(null);
+    }
+    try {
+      final CasOutcome outcome = await _database.compareAndSetSetting(
+        storageKey,
+        expected: expectedRaw,
+        next: stored,
+      );
+      return switch (outcome) {
+        CasOutcome.committed => JournalWriteCommitted(stored),
+        CasOutcome.conflict => const JournalWriteConflict(),
+      };
+    } catch (_) {
+      return JournalWriteUnknown(stored);
+    }
   }
 
   /// Keeps the FIRST corrupt value only (bounded; never overwritten).
   /// Returns true when [raw] was quarantined now. Throws on storage failure.
+  /// (Unchanged by E-2: the replacement of the corrupt row is itself
+  /// conditional on the exact corrupt bytes, so only one engine replaces it.)
   Future<bool> quarantine(String raw) async {
     if (await _database.getSetting(quarantineKey) != null) {
       return false;
@@ -152,4 +199,27 @@ class SecurityEventJournalStore {
   /// failure (the caller reports "integrity unknown").
   Future<bool> hasQuarantine() async =>
       await _database.getSetting(quarantineKey) != null;
+}
+
+/// E-2: result of [SecurityEventJournalStore.writeIfUnchanged].
+sealed class JournalWriteResult {
+  const JournalWriteResult();
+}
+
+/// This call's statement changed the row to [raw].
+final class JournalWriteCommitted extends JournalWriteResult {
+  const JournalWriteCommitted(this.raw);
+  final String raw;
+}
+
+/// The row no longer held the expected bytes; nothing was written.
+final class JournalWriteConflict extends JournalWriteResult {
+  const JournalWriteConflict();
+}
+
+/// Completion is not confirmed. [attemptedRaw] is the exact value that may
+/// or may not have landed (null when it could not even be produced).
+final class JournalWriteUnknown extends JournalWriteResult {
+  const JournalWriteUnknown(this.attemptedRaw);
+  final String? attemptedRaw;
 }

@@ -178,6 +178,21 @@ class SecurityEventJournal
   bool _draining = false;
 
   SecurityJournalDocument? _cache;
+
+  /// E-2: the exact stored bytes [_cache] was loaded from or last written
+  /// as (null = row absent). Every write is conditional on it.
+  String? _cacheRaw;
+
+  /// E-2: true while the queued operation runs its LAST permitted attempt;
+  /// a conflict then fails like any storage error instead of retrying.
+  bool _lastAttempt = false;
+
+  /// E-2: operations abandoned after [maxCasAttempts] conflicts.
+  int casExhausted = 0;
+
+  /// E-2: total attempts per queued operation (1 + retries on conflict).
+  static const int maxCasAttempts = 3;
+
   bool _readOnly = false;
   bool _storageError = false;
   bool _quarantined = false;
@@ -302,8 +317,12 @@ class SecurityEventJournal
         if (doc != null) {
           await _persistBounded(doc);
         }
-      } finally {
         done.complete();
+      } on _JournalConflict {
+        rethrow; // re-run by the drain; completes then
+      } catch (_) {
+        done.complete();
+        rethrow;
       }
     });
     return done.future;
@@ -327,6 +346,8 @@ class SecurityEventJournal
           lost: SecurityJournalDocument.saturatingAdd(shown.lost, _pendingLost),
           suppressed: shown.suppressed,
         ));
+      } on _JournalConflict {
+        rethrow;
       } catch (_) {
         out.complete(_unavailable());
         rethrow;
@@ -394,6 +415,8 @@ class SecurityEventJournal
         }
         await _persistBounded(next);
         out.complete(HistoryClearJournalResult.committed);
+      } on _JournalConflict {
+        rethrow;
       } catch (_) {
         if (!out.isCompleted) out.complete(HistoryClearJournalResult.failed);
         rethrow;
@@ -443,6 +466,8 @@ class SecurityEventJournal
         }
         await _persistBounded(doc.copyWith(events: events));
         out.complete(HistoryClearJournalResult.committed);
+      } on _JournalConflict {
+        rethrow;
       } catch (_) {
         if (!out.isCompleted) out.complete(HistoryClearJournalResult.failed);
         rethrow;
@@ -478,11 +503,25 @@ class SecurityEventJournal
       while (_queue.isNotEmpty) {
         final Future<void> Function() op = _queue.removeFirst();
         try {
-          await op();
+          for (int attempt = 1;; attempt++) {
+            _lastAttempt = attempt >= maxCasAttempts;
+            try {
+              await op();
+              break;
+            } on _JournalConflict {
+              // E-2: another engine changed the row since this process read
+              // it. Drop the stale copy and re-run the operation on the
+              // fresh row (it re-derives everything from what is stored).
+              _cache = null;
+              _cacheRaw = null;
+            }
+          }
         } catch (_) {
           _cache = null;
+          _cacheRaw = null;
           _storageError = true;
         } finally {
+          _lastAttempt = false;
           _pending--;
         }
       }
@@ -520,6 +559,8 @@ class SecurityEventJournal
         return;
       }
       await _persistBounded(_withEvent(doc, type, null, at));
+    } on _JournalConflict {
+      rethrow;
     } catch (_) {
       _addLost(1);
       rethrow;
@@ -629,6 +670,8 @@ class SecurityEventJournal
         return;
       }
       await _persistBounded(_withEvent(doc, fields.type, fields, at));
+    } on _JournalConflict {
+      rethrow;
     } catch (_) {
       _addLost(1);
       rethrow;
@@ -654,6 +697,22 @@ class SecurityEventJournal
     _healthObserved = true;
     final SecurityJournalHealthMark? lastSeen = _healthLastSeen;
     _healthLastSeen = obs;
+    try {
+      return await _observeHealthLoaded(obs, firstInProcess, lastSeen);
+    } on _JournalConflict {
+      // Retried: restore the in-process accounting so the re-run sees the
+      // same "first in process" / "last seen" state.
+      _healthObserved = !firstInProcess;
+      _healthLastSeen = lastSeen;
+      rethrow;
+    }
+  }
+
+  Future<void> _observeHealthLoaded(
+    SecurityJournalHealthMark obs,
+    bool firstInProcess,
+    SecurityJournalHealthMark? lastSeen,
+  ) async {
     try {
       SecurityJournalDocument? doc = await _loadExisting();
       if (doc == null) {
@@ -709,6 +768,8 @@ class SecurityEventJournal
         healthMark: obs,
         suppressed: 0,
       ));
+    } on _JournalConflict {
+      rethrow;
     } catch (_) {
       _addLost(1);
       rethrow;
@@ -757,6 +818,8 @@ class SecurityEventJournal
         at,
         storage: <StorageSource, StoreState>{...doc.storage, source: state},
       ));
+    } on _JournalConflict {
+      rethrow;
     } catch (_) {
       _addLost(1);
       rethrow;
@@ -776,7 +839,8 @@ class SecurityEventJournal
     if (cached != null) {
       return cached;
     }
-    final SecurityJournalRead r = await _store.read();
+    final (SecurityJournalRead r, String? raw) = await _store.readWithRaw();
+    _cacheRaw = raw;
     switch (r) {
       case SecurityJournalLoaded(:final SecurityJournalDocument document):
         _cache = document;
@@ -863,12 +927,38 @@ class SecurityEventJournal
     }
     final SecurityJournalDocument out = bounded.$1;
     if (changed) {
-      await _store.write(out);
+      _cacheRaw = await _casWrite(out);
       _pendingLost -= committedLost;
     }
     _cache = out;
     _storageError = false;
     return out;
+  }
+
+  /// E-2: writes [doc] only over the bytes this operation was derived from.
+  /// Returns the new stored bytes. A conflict throws [_JournalConflict]
+  /// (the drain re-runs the operation on the fresh row) or, on the last
+  /// permitted attempt, a plain storage error. An unconfirmed outcome is
+  /// reconciled by one re-read; if that does not prove the write landed it
+  /// is a storage error (never retried blindly, never reported as saved).
+  Future<String> _casWrite(SecurityJournalDocument doc) async {
+    final JournalWriteResult w =
+        await _store.writeIfUnchanged(doc, expectedRaw: _cacheRaw);
+    switch (w) {
+      case JournalWriteCommitted(:final String raw):
+        return raw;
+      case JournalWriteConflict():
+        if (_lastAttempt) {
+          casExhausted++;
+          throw StateError('security journal: write contention');
+        }
+        throw const _JournalConflict();
+      case JournalWriteUnknown(:final String? attemptedRaw):
+        if (attemptedRaw != null && await _store.readRaw() == attemptedRaw) {
+          return attemptedRaw;
+        }
+        throw StateError('security journal: write outcome unknown');
+    }
   }
 
   /// Pure: [doc] with retention and caps applied and [committedLost]
@@ -923,4 +1013,9 @@ class SecurityEventJournal
     }
     return (out, dropped);
   }
+}
+
+/// E-2: the row changed since this process read it (internal signal).
+final class _JournalConflict implements Exception {
+  const _JournalConflict();
 }

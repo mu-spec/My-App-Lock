@@ -6,7 +6,9 @@
 // the next step's row write fails (nothing of it lands), then every engine
 // object is rebuilt over the same database ("restart").
 import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -72,6 +74,8 @@ class _Db extends InMemoryLocalDatabase {
   final Map<String, int> allow = <String, int>{};
   int writes = 0;
   int journalWrites = 0;
+  Future<void> Function(String key)? gate;
+  final Map<String, int> forceConflicts = <String, int>{};
 
   bool _blocked(String key) {
     final int? left = allow[key];
@@ -100,7 +104,16 @@ class _Db extends InMemoryLocalDatabase {
   Future<CasOutcome> compareAndSetSetting(String key,
       {required String? expected, required String next}) async {
     if (_blocked(key)) throw StateError('injected CAS fault: $key');
+    // E-2: a gate can hold one CAS (deterministic two-engine interleaving)
+    // or force conflicts without writing (persistent contention).
+    final Future<void> Function(String key)? g = gate;
+    if (g != null) await g(key);
+    if ((forceConflicts[key] ?? 0) > 0) {
+      forceConflicts[key] = forceConflicts[key]! - 1;
+      return CasOutcome.conflict;
+    }
     writes++;
+    if (key == _jKey) journalWrites++; // E-2: journal rows are CAS-written
     return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 }
@@ -161,6 +174,13 @@ class _World {
             currentGen: gen,
             jpeg: jpegWithMetadata(fill: fill)),
         EvidenceSaveResult.saved);
+  }
+
+  /// The stored (sanitized) image bytes for a fixture of [fill].
+  Future<Uint8List> evidenceImage(int fill) async {
+    await evidence.save(
+        seq: 0, gen: _g1, currentGen: _g1, jpeg: jpegWithMetadata(fill: fill));
+    return (await evidence.readImage(0, gen: _g1))!;
   }
 
   Future<IntruderFailureLog> log() async =>
@@ -583,10 +603,8 @@ void main() {
   });
 
   // ENG-04 (DURABLE_IDENTITY v2 §9): clear in engine A, then a write in
-  // engine B whose caches were warmed before the clear. The failure log is
-  // CAS-protected (Q-ENG-1), so it holds. The journal and the evidence index
-  // are NOT CAS-protected (R8 / R-P13M3-T1 OPEN); ENG-04j pins the measured
-  // behaviour of the journal so the limitation is visible, not hidden.
+  // engine B whose caches were warmed before the clear. E-2: the failure
+  // log, the journal and the evidence index are all compare-and-set.
   group('ENG-04 second engine with stale caches', () {
     Future<(_World, _World)> twoEngines() async {
       final _World a = await _seed();
@@ -610,18 +628,154 @@ void main() {
     });
 
     test(
-        'ENG-04j journal (KNOWN LIMITATION, no CAS): B records an outcome '
-        'from its stale cache -> marker lost and cleared outcomes return',
-        () async {
+        'ENG-04j journal (E-2): B records an outcome from its stale cache -> '
+        'conflict, re-run on the fresh row: marker kept, cleared outcomes '
+        'stay cleared, B\'s new outcome stored', () async {
       final (_World a, _World b) = await twoEngines();
-      await b.outcome(3);
+      await b.outcome(3); // trig 3 >= cut 3: not cleared
       final SecurityJournalDocument d = await a.doc();
-      // Measured behaviour (not desired): pinned so that adding journal CAS
-      // (E-2) flips this test and forces it to be rewritten as a guarantee.
-      expect(_marker(d), isNull);
+      expect(_marker(d)!.state, HistoryClearState.done);
+      final List<int> trigs = <int>[
+        for (final SecurityJournalEvent e in d.events)
+          if (e.type.isOutcome) e.fields!.trig!,
+      ];
+      expect(trigs, <int>[3]);
+      expect(b.journal.casExhausted, 0);
+      expect(b.journal.health, SecurityJournalHealth.ok);
+    });
+  });
+
+  group('E-2 two engines, deterministic interleavings', () {
+    /// Holds the FIRST compare-and-set on [key] until [release] completes;
+    /// [held] completes once it is waiting.
+    (Completer<void>, Completer<void>) holdFirst(_Db db, String key) {
+      final Completer<void> held = Completer<void>();
+      final Completer<void> release = Completer<void>();
+      bool used = false;
+      db.gate = (String k) async {
+        if (k != key || used) return;
+        used = true;
+        held.complete();
+        await release.future;
+      };
+      return (held, release);
+    }
+
+    test('ENG-02 journal: two engines append concurrently -> both kept',
+        () async {
+      final _World a = await _seed();
+      final _World b = _World(a.db, a.cipher, mints: <String>[]);
+      await a.journal.read();
+      await b.journal.read(); // both caches warm on the same row
+      final (Completer<void> held, Completer<void> release) =
+          holdFirst(a.db, _jKey);
+      final Future<void> fa = a.outcome(5); // A's write is held (stale soon)
+      await held.future;
+      await b.outcome(6); // B commits first
+      release.complete();
+      await fa;
+      final List<int> trigs = <int>[
+        for (final SecurityJournalEvent e in (await a.doc()).events)
+          if (e.type.isOutcome) e.fields!.trig!,
+      ];
+      expect(trigs, containsAll(<int>[0, 1, 2, 5, 6]));
+      expect(a.journal.casExhausted + b.journal.casExhausted, 0);
+    });
+
+    test('ENG-03 evidence: concurrent saves picking the same blob id -> no '
+        'blob overwritten, both listed with distinct ids and their own image',
+        () async {
+      final _World a = await _seed();
+      final _World b = _World(a.db, a.cipher, mints: <String>[]);
+      final (Completer<void> held, Completer<void> release) =
+          holdFirst(a.db, IntruderEvidenceStore.indexKey);
+      final Future<EvidenceSaveResult> sa = a.evidence.save(
+          seq: 3, gen: _g1, currentGen: _g1, jpeg: jpegWithMetadata(fill: 0x0A));
+      await held.future; // A's blob is placed, its index write is held
       expect(
-          d.events.where((SecurityJournalEvent e) => e.type.isOutcome).length,
-          greaterThan(1));
+          await b.evidence.save(
+              seq: 4,
+              gen: _g1,
+              currentGen: _g1,
+              jpeg: jpegWithMetadata(fill: 0x0B)),
+          EvidenceSaveResult.saved);
+      release.complete();
+      expect(await sa, EvidenceSaveResult.saved);
+      final List<EvidenceItem> items = await a.evidence.list();
+      final EvidenceItem i3 = items.singleWhere((EvidenceItem e) => e.seq == 3);
+      final EvidenceItem i4 = items.singleWhere((EvidenceItem e) => e.seq == 4);
+      expect(i3.bid, isNot(i4.bid));
+      final Uint8List img3 = (await a.evidence.readImage(3, gen: _g1))!;
+      final Uint8List img4 = (await a.evidence.readImage(4, gen: _g1))!;
+      expect(img3, isNot(img4));
+      expect(img3, (await _World(_Db(), a.cipher).evidenceImage(0x0A)));
+      expect(img4, (await _World(_Db(), a.cipher).evidenceImage(0x0B)));
+      // No unreferenced blob row left behind by the losing attempt.
+      final Set<String> blobs = (await a.db.getAllSettings())
+          .keys
+          .where((String k) => k.startsWith(IntruderEvidenceStore.blob2Prefix))
+          .toSet();
+      expect(blobs.length, items.where((EvidenceItem e) => e.bid != null).length);
+    });
+
+    test('ENG-04e evidence: a late save in B races A\'s photo clear -> B '
+        're-reads the cleared index and is refused; nothing resurrected',
+        () async {
+      final _World a = await _seed();
+      final _World b = _World(a.db, a.cipher, mints: <String>[]);
+      await a.fails(1); // attempt seq 3 exists before the clear
+      final (Completer<void> held, Completer<void> release) =
+          holdFirst(a.db, IntruderEvidenceStore.indexKey);
+      final Future<EvidenceSaveResult> late = b.evidence.save(
+          seq: 3, gen: _g1, currentGen: _g1, jpeg: jpegWithMetadata());
+      await held.future; // B's index write (stale base) is held
+      a.db.gate = null;
+      expect(await a.service.clear(photos: true, stillValid: _valid),
+          HistoryClearOutcome.done);
+      release.complete();
+      expect(await late, EvidenceSaveResult.superseded);
+      expect(await a.photos(), isEmpty);
+      expect(
+          (await a.db.getAllSettings()).keys.where((String k) =>
+              k.startsWith(IntruderEvidenceStore.blob2Prefix) ||
+              k.startsWith(IntruderEvidenceStore.blobPrefix)),
+          isEmpty);
+    });
+
+    test('ENG-05 persistent contention: bounded attempts, then a storage '
+        'error; nothing written, the loss is disclosed', () async {
+      final _World w = await _seed();
+      await w.journal.read();
+      final String? before = await w.db.getSetting(_jKey);
+      // Pinned bound (not derived from the constant under test).
+      expect(SecurityEventJournal.maxCasAttempts, 3);
+      expect(IntruderEvidenceStore.maxCasAttempts, 3);
+      w.db.forceConflicts[_jKey] = 3;
+      await w.outcome(7);
+      expect(await w.db.getSetting(_jKey), before);
+      expect(w.journal.casExhausted, 1);
+      expect(w.journal.health, SecurityJournalHealth.storageError);
+      await w.outcome(8); // next write succeeds and folds in the loss
+      final SecurityJournalDocument d = await w.doc();
+      expect(d.lost, 1);
+      expect(
+          d.events.where((SecurityJournalEvent e) => e.fields?.trig == 7),
+          isEmpty);
+      final String? idx = await w.db.getSetting(IntruderEvidenceStore.indexKey);
+      w.db.forceConflicts[IntruderEvidenceStore.indexKey] = 3;
+      expect(
+          await w.evidence.save(
+              seq: 9, gen: _g1, currentGen: _g1, jpeg: jpegWithMetadata()),
+          EvidenceSaveResult.storageFailed);
+      expect(await w.db.getSetting(IntruderEvidenceStore.indexKey), idx);
+      expect(w.evidence.casExhausted, 1);
+      expect(
+          (await w.db.getAllSettings())
+              .keys
+              .where((String k) => k.startsWith(IntruderEvidenceStore.blob2Prefix))
+              .length,
+          (await w.evidence.list()).where((EvidenceItem e) => e.bid != null).length,
+          reason: 'the losing blob row is removed');
     });
   });
 

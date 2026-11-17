@@ -20,6 +20,7 @@ import 'package:smart_app_lock/app/app_container.dart';
 import 'package:smart_app_lock/data/models/app_security_level.dart';
 import 'package:smart_app_lock/data/models/protected_app.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/protection/impl/default_access_controller.dart';
 import 'package:smart_app_lock/security/credentials/auth_type.dart';
 import 'package:smart_app_lock/security/intruder/intruder_failure_log_store.dart';
@@ -59,6 +60,18 @@ class _JournalFaultDb extends InMemoryLocalDatabase {
       throw StateError('journal write fault');
     }
     return super.setSetting(key, value);
+  }
+
+  // E-2 (disclosed): journal / evidence rows are now written with
+  // compareAndSetSetting; the same fault interception applies to it.
+  @override
+  Future<CasOutcome> compareAndSetSetting(String key,
+      {required String? expected, required String next}) async {
+    if (key.startsWith(SecurityEventJournalStore.storageKey)) {
+      journalCalls++;
+      throw StateError('journal write fault');
+    }
+    return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 }
 

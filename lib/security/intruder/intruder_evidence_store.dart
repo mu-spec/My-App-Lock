@@ -479,6 +479,18 @@ class IntruderEvidenceStore {
   final Queue<Completer<void>> _waiters = Queue<Completer<void>>();
 
   /// Serializes every store operation (no concurrent index writes).
+  /// E-2 (R-P13M3-T1): the exact index bytes the running operation read
+  /// (null = absent); every index write is conditional on them. Operations
+  /// are serialized in-process, so one field suffices.
+  String? _indexRaw;
+  bool _lastAttempt = false;
+
+  /// E-2: total attempts per operation (1 + retries on conflict).
+  static const int maxCasAttempts = 3;
+
+  /// E-2: operations abandoned after [maxCasAttempts] conflicts.
+  int casExhausted = 0;
+
   Future<T> _serial<T>(Future<T> Function() op) async {
     if (_held) {
       final Completer<void> turn = Completer<void>();
@@ -488,8 +500,18 @@ class IntruderEvidenceStore {
       _held = true;
     }
     try {
-      return await op();
+      for (int attempt = 1;; attempt++) {
+        _lastAttempt = attempt >= maxCasAttempts;
+        try {
+          return await op();
+        } on _IndexConflict {
+          // E-2: another engine changed the index since this operation read
+          // it; nothing of ours is listed. Re-run on the fresh index.
+        }
+      }
     } finally {
+      _lastAttempt = false;
+      _indexRaw = null;
       if (_waiters.isEmpty) {
         _held = false;
       } else {
@@ -519,6 +541,7 @@ class IntruderEvidenceStore {
     } catch (_) {
       return const _Index(<EvidenceItem>[], EvidenceIndexHealth.unreadable);
     }
+    _indexRaw = raw;
     if (raw == null) {
       return const _Index(<EvidenceItem>[], EvidenceIndexHealth.ok);
     }
@@ -667,7 +690,27 @@ class IntruderEvidenceStore {
         if (idx.superseded.isNotEmpty) 'superseded': idx.superseded,
       },
     }));
-    await _database.setSetting(indexKey, '$_enc$enc');
+    final String next = '$_enc$enc';
+    final CasOutcome outcome;
+    try {
+      outcome = await _database.compareAndSetSetting(indexKey,
+          expected: _indexRaw, next: next);
+    } catch (_) {
+      // Unknown outcome: committed only if a re-read proves it.
+      if (await _database.getSetting(indexKey) == next) {
+        _indexRaw = next;
+        return;
+      }
+      rethrow;
+    }
+    if (outcome == CasOutcome.conflict) {
+      if (_lastAttempt) {
+        casExhausted++;
+        throw StateError('evidence index: write contention');
+      }
+      throw const _IndexConflict();
+    }
+    _indexRaw = next;
   }
 
   /// Items currently stored (oldest first). Empty when unreadable.
@@ -752,6 +795,7 @@ class IntruderEvidenceStore {
         if (clean == null) return EvidenceSaveResult.invalidImage;
         if (clean.length > maxImageBytes) return EvidenceSaveResult.oversized;
         _Index idx = await _readIndex();
+        final _Index read = idx;
         if (idx.health == EvidenceIndexHealth.unsupported) {
           return EvidenceSaveResult.unsupportedSchema;
         }
@@ -796,16 +840,39 @@ class IntruderEvidenceStore {
           return EvidenceSaveResult.cancelled;
         }
         final String key = _keyOf(item);
+        // E-2: the blob row is inserted only if absent: an existing row (an
+        // in-flight save of another engine that picked the same blob id, or
+        // a crash orphan) is NEVER overwritten.
+        final CasOutcome placed;
         try {
-          await _database.setSetting(key, '$_enc$blob');
+          placed = await _database.compareAndSetSetting(key,
+              expected: null, next: '$_enc$blob');
+        } catch (_) {
+          return EvidenceSaveResult.storageFailed; // nothing removed
+        }
+        if (placed == CasOutcome.conflict) {
+          if (bid == null) return EvidenceSaveResult.storageFailed;
+          // Skip the taken blob id (ids are never reused) and retry.
+          try {
+            await _writeIndex(read.copyWith(nextBid: bid + 1));
+          } on _IndexConflict {
+            rethrow;
+          } catch (_) {
+            return EvidenceSaveResult.storageFailed;
+          }
+          if (_lastAttempt) return EvidenceSaveResult.storageFailed;
+          throw const _IndexConflict();
+        }
+        try {
           await _writeIndex(idx.copyWith(
             items: next,
             nextBid: bid == null ? null : bid + 1,
           ));
-        } catch (_) {
+        } catch (e) {
           try {
-            await _database.removeSetting(key);
+            await _database.removeSetting(key); // our own row (inserted above)
           } catch (_) {}
+          if (e is _IndexConflict) rethrow;
           return EvidenceSaveResult.storageFailed;
         }
         final Set<String> kept = next.map(_keyOf).toSet();
@@ -882,6 +949,8 @@ class IntruderEvidenceStore {
     if (present.length != items.length) {
       try {
         await _writeIndex(idx.copyWith(items: present));
+      } on _IndexConflict {
+        rethrow;
       } catch (_) {}
     }
     return removed;
@@ -955,6 +1024,8 @@ class IntruderEvidenceStore {
         }
         try {
           await _writeIndex(base);
+        } on _IndexConflict {
+          rethrow;
         } catch (_) {
           return EvidenceDeleteResult.storageFailed;
         }
@@ -1027,6 +1098,8 @@ class IntruderEvidenceStore {
             legacy: legacy,
             gens: gens,
           ));
+        } on _IndexConflict {
+          rethrow;
         } catch (_) {
           return EvidenceClearResult.storageFailed;
         }
@@ -1128,6 +1201,8 @@ class IntruderEvidenceStore {
         }
         try {
           await _writeIndex(next);
+        } on _IndexConflict {
+          rethrow;
         } catch (_) {
           return EvidenceClearResult.storageFailed;
         }
@@ -1155,6 +1230,8 @@ class IntruderEvidenceStore {
     if (kept.length == idx.items.length) return 0;
     try {
       await _writeIndex(idx.copyWith(items: kept));
+    } on _IndexConflict {
+      rethrow;
     } catch (_) {
       return 0;
     }
@@ -1184,4 +1261,9 @@ class IntruderEvidenceStore {
       }
     }
   }
+}
+
+/// E-2: the index changed since the running operation read it.
+final class _IndexConflict implements Exception {
+  const _IndexConflict();
 }

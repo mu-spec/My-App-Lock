@@ -185,7 +185,11 @@ const List<String> kCasCallers = <String>[
   kOnlyCasCaller,
   // Batch 2 (F-KEY-1, K-2+B-compat key commitment), disclosed re-baseline.
   'lib/security/encryption/master_key_resolver.dart',
+  'lib/security/intruder/intruder_evidence_store.dart',
   'lib/security/intruder/intruder_failure_log_store.dart',
+  // E-2 (owner-directed, disclosed re-baseline): journal row and evidence
+  // index / blob rows are written compare-and-set (R-P13M3-T1).
+  'lib/security/timeline/security_event_journal_store.dart',
 ];
 
 /// NF-NS-1: fakes that intercept security_settings / all-key writes and
@@ -222,6 +226,15 @@ const List<String> kCasOverrideFiles = <String>[
   // Batch 4: Clear History fault stores (failure-log CAS faults).
   'test/regression/p13_m3_b4_clear_history_ui_test.dart',
   'test/security/history/p13_m3_b4_clear_history_test.dart',
+  // E-2: fakes intercepting journal / evidence writes (now compare-and-set).
+  'test/regression/p12_m3_owner_lockout_qa_test.dart',
+  'test/regression/p13_m1_security_timeline_test.dart',
+  'test/security/intruder/intruder_evidence_management_m3_test.dart',
+  'test/security/intruder/intruder_evidence_store_test.dart',
+  'test/security/intruder/intruder_evidence_tombstone_compaction_m3_test.dart',
+  'test/security/timeline/security_event_journal_test.dart',
+  'test/security/timeline/security_journal_migration_test.dart',
+  'test/security/timeline/security_journal_producers_test.dart',
 ];
 
 class _UnreadableDb extends InMemoryLocalDatabase {

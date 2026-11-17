@@ -9,6 +9,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:smart_app_lock/security/credentials/verified_attempt.dart';
 import 'package:smart_app_lock/security/intruder/failed_attempt_event.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/security/encryption/settings_cipher.dart';
 import 'package:smart_app_lock/security/encryption/settings_cipher_impl.dart';
 import 'package:smart_app_lock/security/intruder/intruder_defense_coordinator.dart';
@@ -50,6 +51,19 @@ class _FaultDb extends InMemoryLocalDatabase {
     }
     if (key == _key) writes++;
     return super.setSetting(key, value);
+  }
+
+  // E-2 (disclosed): journal / evidence rows are now written with
+  // compareAndSetSetting; the same fault interception applies to it.
+  @override
+  Future<CasOutcome> compareAndSetSetting(String key,
+      {required String? expected, required String next}) async {
+    if (failWrites && key == _key) throw StateError('write fault');
+    if (failQuarantineWrites && key == _qKey) {
+      throw StateError('quarantine fault');
+    }
+    if (key == _key) writes++;
+    return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 }
 
