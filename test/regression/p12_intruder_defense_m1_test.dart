@@ -26,6 +26,7 @@ import 'package:smart_app_lock/data/models/app_security_level.dart';
 import 'package:smart_app_lock/data/models/protected_app.dart';
 import 'package:smart_app_lock/data/repositories/impl/security_settings_repository_impl.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/design_system/design_system.dart';
 import 'package:smart_app_lock/profiles/security_profile.dart';
 import 'package:smart_app_lock/protection/impl/default_access_controller.dart';
@@ -66,6 +67,21 @@ class _BrokenIntruderDb extends InMemoryLocalDatabase {
     }
     return super.setSetting(key, value);
   }
+
+  // Q-ENG-1 (contract A §6): the failure log now persists ONLY through
+  // compareAndSetSetting; route it through the same interception as
+  // setSetting so this fake's faults keep reaching the real write path.
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    if (key.startsWith(IntruderFailureLogStore.storageKey)) {
+      throw StateError('intruder storage fault');
+    }
+    return super.compareAndSetSetting(key, expected: expected, next: next);
+  }
 }
 
 /// PIN hasher whose verification waits on [gate] (when set), so a test can
@@ -88,6 +104,19 @@ class _GatedPinHasher implements PinHasher {
 }
 
 void main() {
+  // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
+  // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
+  // must pass through this file's fault fake. If the fake stopped
+  // intercepting CAS, this fails.
+  group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
+    test('the storage fault reaches the CAS', () async {
+      final _BrokenIntruderDb db = _BrokenIntruderDb();
+      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteUnknown>());
+      expect((await db.getAllSettings())
+          .containsKey(IntruderFailureLogStore.storageKey), isFalse);
+    });
+  });
+
   Future<AppContainer> pumpApp(
     WidgetTester tester, {
     AppContainer? container,

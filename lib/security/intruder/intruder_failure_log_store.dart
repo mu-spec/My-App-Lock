@@ -5,6 +5,11 @@
 // is atomic), encrypted with the SAME AES-256-GCM SettingsCipher and
 // Keystore-backed master key as the security settings. No new store, SDK or
 // permission.
+//
+// P13/M3 Q-ENG-1 (contract A §3): every read variant carries the exact
+// durable bytes, and the ONLY write path is a compare-and-set against those
+// bytes ([writeIfUnchanged]). There is no blind write: a stale base can
+// never overwrite events committed by another monitor or engine.
 import 'dart:convert';
 
 import '../../data/storage/local_database.dart';
@@ -23,8 +28,11 @@ final class IntruderLogMissing extends IntruderLogRead {
 
 /// A valid v1 document.
 final class IntruderLogLoaded extends IntruderLogRead {
-  const IntruderLogLoaded(this.log);
+  const IntruderLogLoaded(this.log, {required this.raw});
   final IntruderFailureLog log;
+
+  /// The exact stored value (the compare-and-set token).
+  final String raw;
 }
 
 /// Undecryptable (GCM tamper), unparsable or schema-invalid. [raw] is the
@@ -36,8 +44,12 @@ final class IntruderLogCorrupt extends IntruderLogRead {
 
 /// Written by a NEWER schema version: must never be overwritten.
 final class IntruderLogUnsupported extends IntruderLogRead {
-  const IntruderLogUnsupported(this.version);
+  const IntruderLogUnsupported(this.version, {required this.raw});
   final int version;
+
+  /// The exact stored value. Carried for diagnostics/tests only: an
+  /// unsupported row is NEVER a write base (invariant 8).
+  final String raw;
 }
 
 /// Storage could not be read (or encrypted data without a cipher): nothing
@@ -98,10 +110,10 @@ class IntruderFailureLogStore {
         declared > IntruderFailureLog.version &&
         decoded is Map &&
         decoded['schema'] == IntruderFailureLog.schema) {
-      return IntruderLogUnsupported(declared);
+      return IntruderLogUnsupported(declared, raw: raw);
     }
     try {
-      return IntruderLogLoaded(IntruderFailureLog.fromJson(decoded));
+      return IntruderLogLoaded(IntruderFailureLog.fromJson(decoded), raw: raw);
     } on FormatException {
       return IntruderLogCorrupt(raw);
     }
@@ -111,23 +123,95 @@ class IntruderFailureLogStore {
   /// used for the size bound.
   static String encode(IntruderFailureLog log) => jsonEncode(log.toJson());
 
-  /// Throws on failure; the previous row stays intact (single-row replace).
-  Future<void> write(IntruderFailureLog log) async {
+  /// Encodes and (when a cipher is configured) encrypts [log] into the
+  /// exact value that would be stored.
+  Future<String> _seal(IntruderFailureLog log) async {
     final String json = encode(log);
     final SettingsCipher? cipher = _cipher;
-    final String stored = cipher == null
+    return cipher == null
         ? json
         : '$_encryptedPrefix${await cipher.encryptString(json)}';
-    await _database.setSetting(storageKey, stored);
   }
 
-  /// Keeps the FIRST corrupt value only (bounded; never overwritten).
-  /// Returns true when [raw] was quarantined now.
-  Future<bool> quarantine(String raw) async {
-    if (await _database.getSetting(quarantineKey) != null) {
-      return false;
+  /// Q-ENG-1: replaces the row with [next] ONLY if it still holds exactly
+  /// [expectedRaw] (`null` = only if no row exists). One statement; never
+  /// retried here. Never throws:
+  ///  * [IntruderWriteCommitted]: THIS call changed the row;
+  ///  * [IntruderWriteConflict]: the row changed since it was read; nothing
+  ///    was written;
+  ///  * [IntruderWriteUnknown]: completion could not be confirmed (any
+  ///    storage or cipher error). The caller must reconcile by re-reading;
+  ///    an unknown is never reported as saved.
+  Future<IntruderWriteResult> writeIfUnchanged(
+    IntruderFailureLog next, {
+    required String? expectedRaw,
+  }) async {
+    final String stored;
+    try {
+      stored = await _seal(next);
+    } catch (_) {
+      return const IntruderWriteUnknown(CasUnknownCode.other);
     }
-    await _database.setSetting(quarantineKey, raw);
-    return true;
+    if (stored == expectedRaw) {
+      // Plaintext only (a cipher nonce makes every value distinct): the
+      // durable bytes may already equal [next], but that is NOT confirmed
+      // without a read. Never claim a commit this call did not make.
+      return IntruderWriteUnknown(CasUnknownCode.other, attemptedRaw: stored);
+    }
+    try {
+      final CasOutcome outcome = await _database.compareAndSetSetting(
+        storageKey,
+        expected: expectedRaw,
+        next: stored,
+      );
+      return switch (outcome) {
+        CasOutcome.committed => IntruderWriteCommitted(stored),
+        CasOutcome.conflict => const IntruderWriteConflict(),
+      };
+    } on CasUnknownOutcome catch (e) {
+      return IntruderWriteUnknown(e.code, attemptedRaw: stored);
+    } catch (_) {
+      return IntruderWriteUnknown(CasUnknownCode.other, attemptedRaw: stored);
+    }
   }
+
+  /// Keeps the FIRST corrupt value only (bounded; never overwritten):
+  /// insert-if-absent on the quarantine key, so two racing repairers can
+  /// never replace each other's copy. Returns true when [raw] was
+  /// quarantined by THIS call. Throws on a storage error or an unknown
+  /// outcome (callers treat quarantine as best effort).
+  Future<bool> quarantineOnce(String raw) async {
+    final CasOutcome outcome = await _database.compareAndSetSetting(
+      quarantineKey,
+      expected: null,
+      next: raw,
+    );
+    return outcome == CasOutcome.committed;
+  }
+}
+
+/// Q-ENG-1 (contract A §3): result of [IntruderFailureLogStore
+/// .writeIfUnchanged].
+sealed class IntruderWriteResult {
+  const IntruderWriteResult();
+}
+
+/// This call's statement changed the row to [raw].
+final class IntruderWriteCommitted extends IntruderWriteResult {
+  const IntruderWriteCommitted(this.raw);
+  final String raw;
+}
+
+/// The row no longer held the expected bytes; nothing was written.
+final class IntruderWriteConflict extends IntruderWriteResult {
+  const IntruderWriteConflict();
+}
+
+/// Completion is not confirmed (fixed [code], never exception text).
+/// [attemptedRaw] is the exact value that may or may not have landed
+/// (null when the value could not even be produced).
+final class IntruderWriteUnknown extends IntruderWriteResult {
+  const IntruderWriteUnknown(this.code, {this.attemptedRaw});
+  final CasUnknownCode code;
+  final String? attemptedRaw;
 }

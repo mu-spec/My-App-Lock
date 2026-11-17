@@ -23,6 +23,7 @@ import 'dart:async';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:smart_app_lock/app/app_container.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/security/credentials/auth_result.dart';
 import 'package:smart_app_lock/security/credentials/auth_type.dart';
 import 'package:smart_app_lock/security/credentials/credential_state.dart';
@@ -70,6 +71,19 @@ class _GateDb extends InMemoryLocalDatabase {
   Future<void> setSetting(String key, String value) async {
     if (gatedWrites.contains(key)) await _gate.future;
     return super.setSetting(key, value);
+  }
+
+  // Q-ENG-1 (contract A §6): the failure log now persists ONLY through
+  // compareAndSetSetting; route it through the same interception as
+  // setSetting so this fake's faults keep reaching the real write path.
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    if (gatedWrites.contains(key)) await _gate.future;
+    return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 }
 
@@ -154,6 +168,24 @@ class _Rig {
 }
 
 void main() {
+  // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
+  // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
+  // must pass through this file's fault fake. If the fake stopped
+  // intercepting CAS, this fails.
+  group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
+    test('gatedWrites holds the CAS', () async {
+      final _GateDb db = _GateDb()..arm();
+      db.gatedWrites.add(IntruderFailureLogStore.storageKey);
+      bool done = false;
+      final Future<IntruderWriteResult> w =
+          IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null)..then((_) => done = true);
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      expect(done, isFalse);
+      db.release();
+      expect(await w, isA<IntruderWriteCommitted>());
+    });
+  });
+
   group('R-P13M1-1 deterministic saturation (maxPending 8)', () {
     /// 4 failures queued behind a held write, then [loads] timeline loads,
     /// then 16 more failures; then storage is released.

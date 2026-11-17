@@ -1,0 +1,239 @@
+// P13/M3 F-KEY-1 — FK-H: a protected-app launch after a (SIMULATED) process
+// restart while the credential state is UNREADABLE must never grant access.
+//
+// Host evidence only: real app widgets + LockChallengeHost over the static
+// native-contract model (mirrors WatcherService shield-first recovery). Not
+// Android, not device QA. First launch / key creation is NOT exercised here
+// (the key exists because process 1 enrolled a PIN); the unfixed key race is
+// reproduced separately in p13_m3_f_key_1_open_reproducer_test.dart.
+//
+// Expected fail-closed shape (code-read, asserted here on host):
+//  * protection bootstrap fails -> nothing sent to native; the persisted
+//    native protected set stays active;
+//  * native raises the opaque shield + persisted ticket; Dart's host ABORTs
+//    (status unreadable) without presenting, granting or hiding anything;
+//  * no authorizePackage, no Dart session, no launch, no shield hide;
+//  * the settings row is byte-identical; no credential/lockout write;
+//  * once storage is readable again, the original PIN is required and works.
+// Residual (availability, not a grant): the user sees a shield with no
+// challenge until storage recovers (recorded as F-KEY-1e).
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:smart_app_lock/app/app.dart';
+import 'package:smart_app_lock/app/app_container.dart';
+import 'package:smart_app_lock/data/models/protected_app.dart';
+import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/protection/access_controller.dart';
+import 'package:smart_app_lock/protection/impl/default_access_controller.dart';
+import 'package:smart_app_lock/security/storage/impl/in_memory_secret_store.dart';
+import 'package:smart_app_lock/security/storage/secret_store.dart';
+import 'package:smart_app_lock/services/impl/static_accessibility_lock_service.dart';
+import 'package:smart_app_lock/services/impl/static_installed_apps_service.dart';
+import 'package:smart_app_lock/services/impl/static_native_challenge_contract.dart';
+import 'package:smart_app_lock/services/impl/static_overlay_lock_service.dart';
+import 'package:smart_app_lock/services/impl/static_watcher_service.dart';
+import 'package:smart_app_lock/ui/screens/pin/pin_unlock_screen.dart';
+
+const String _pin = '482914';
+const String _pkg = 'com.bank.app';
+const String _settingsKey = 'security_settings';
+const String _mk = SecretKeys.settingsMasterKey;
+
+enum _Mode { healthy, throws, nullOnce, wrongKey }
+
+/// Wraps the persisted secret store of "process 1" and injects one fault
+/// mode for the master key in "process 2".
+class _FaultySecrets implements SecretStore {
+  _FaultySecrets(this.inner, this.mode);
+  final InMemorySecretStore inner;
+  _Mode mode;
+  int keyWrites = 0;
+  bool _nullUsed = false;
+
+  @override
+  Future<String?> read(String key) async {
+    if (key == _mk) {
+      switch (mode) {
+        case _Mode.healthy:
+          break;
+        case _Mode.throws:
+          throw StateError('keystore unavailable');
+        case _Mode.nullOnce:
+          // flutter_secure_storage 11.2.0 resetOnError: a failed read
+          // deletes the entry and reports "absent" once.
+          if (!_nullUsed) {
+            _nullUsed = true;
+            return null;
+          }
+        case _Mode.wrongKey:
+          return _wrongKey;
+      }
+    }
+    return inner.read(key);
+  }
+
+  @override
+  Future<void> write(String key, String value) {
+    if (key == _mk) keyWrites++;
+    return inner.write(key, value);
+  }
+
+  @override
+  Future<void> delete(String key) => inner.delete(key);
+  @override
+  Future<void> clear() => inner.clear();
+  @override
+  Future<bool> containsKey(String key) => inner.containsKey(key);
+}
+
+/// A well-formed but WRONG 256-bit key (32 x 0x07, base64).
+const String _wrongKey = 'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=';
+
+StaticNativeChallengeContract _bind(
+  AppContainer c, {
+  required bool enabled,
+  required Set<String> packages,
+}) {
+  final StaticNativeChallengeContract n = StaticNativeChallengeContract();
+  (c.overlay as StaticOverlayLockService).nativeContract = n;
+  (c.watcher as StaticWatcherService).nativeContract = n;
+  n.configure(enabled: enabled, packages: packages);
+  return n;
+}
+
+void main() {
+  late InMemoryLocalDatabase disk;
+  late InMemorySecretStore secrets;
+  late Set<String> nativePackages;
+
+  /// Process 1: enroll, protect, synchronize native. Returns nothing; the
+  /// persisted state lives in [disk], [secrets] and [nativePackages].
+  Future<void> process1() async {
+    disk = InMemoryLocalDatabase();
+    secrets = InMemorySecretStore();
+    final AppContainer c1 =
+        AppContainer.inMemory(database: disk, secretStore: secrets);
+    await c1.auth.enrollPin(_pin);
+    await c1.protectedApps.add(ProtectedApp(
+      packageName: _pkg,
+      label: _pkg,
+      addedAt: DateTime(2026, 10, 22),
+    ));
+    expect((await c1.protectionBootstrap.synchronize()).isSuccess, isTrue);
+    final StaticWatcherService w = c1.watcher as StaticWatcherService;
+    expect(w.protectionConfigured, isTrue);
+    nativePackages = Set<String>.of(w.protectedPackages);
+    expect(nativePackages, contains(_pkg));
+  }
+
+  for (final _Mode mode in <_Mode>[
+    _Mode.throws,
+    _Mode.nullOnce,
+    _Mode.wrongKey
+  ]) {
+    testWidgets(
+        'FK-H ${mode.name}: protected launch with unreadable '
+        'credential state never grants access', (WidgetTester t) async {
+      t.view.physicalSize = const Size(800, 1600);
+      t.view.devicePixelRatio = 1.0;
+      addTearDown(t.view.reset);
+      await process1();
+      final String rowBefore = (await disk.getSetting(_settingsKey))!;
+      final String keyBefore = (await secrets.read(_mk))!;
+
+      // Process 2 (SIMULATED restart) with the master key unreadable.
+      final _FaultySecrets faulty = _FaultySecrets(secrets, mode);
+      final AppContainer c2 =
+          AppContainer.inMemory(database: disk, secretStore: faulty);
+      final StaticNativeChallengeContract n2 =
+          _bind(c2, enabled: true, packages: nativePackages);
+      await t.pumpWidget(SmartAppLockApp(container: c2));
+      await t.pumpAndSettle();
+      final StaticWatcherService w2 = c2.watcher as StaticWatcherService;
+
+      expect((await c2.auth.status()).isFailure, isTrue);
+      expect((await c2.protectionBootstrap.synchronize()).isFailure, isTrue);
+      expect(n2.enabled, isTrue, reason: 'native protection never disabled');
+      expect(n2.protectedPackages, nativePackages);
+
+      // Production order: native first, then Dart.
+      n2.reportForeground(_pkg);
+      (c2.accessibility as StaticAccessibilityLockService)
+          .emitForegroundPackage(_pkg);
+      await t.pumpAndSettle();
+      await t.pump(const Duration(seconds: 5)); // heartbeat retries
+      await t.pumpAndSettle();
+
+      expect(n2.shieldVisible, isTrue, reason: 'opaque shield stays up');
+      expect(n2.pending?.packageName, _pkg, reason: 'ticket stays pending');
+      expect(n2.authorizedPackages, isEmpty);
+      expect(w2.authorizePackageCalls, 0);
+      expect((c2.accessController as DefaultAccessController).sessionFor(_pkg),
+          isNull);
+      expect(await c2.accessController.evaluate(_pkg),
+          isNot(AccessDecision.allow));
+      expect(
+          (c2.overlay as StaticOverlayLockService).hideLockChallengeCalls, 0);
+      expect(
+          (c2.installedAppsService as StaticInstalledAppsService)
+              .launchAppCalls,
+          0);
+      // F-KEY-1e (availability residual, characterised): no challenge UI.
+      expect(find.byType(PinUnlockScreen), findsNothing);
+      // Credential + lockout row untouched.
+      expect(await disk.getSetting(_settingsKey), rowBefore);
+      if (mode == _Mode.throws || mode == _Mode.wrongKey) {
+        expect(faulty.keyWrites, 0);
+        expect(await secrets.read(_mk), keyBefore);
+      } else {
+        // OPEN F-KEY-1d (asserts CURRENT unsafe behaviour; must flip after
+        // the K-2+ repair): one null read made _masterKey() mint and persist
+        // a replacement key over the good one. Access still fails closed.
+        expect(faulty.keyWrites, 1);
+        expect(await secrets.read(_mk), isNot(keyBefore));
+      }
+      await t.pumpWidget(const SizedBox());
+      await t.pumpAndSettle();
+
+      if (mode == _Mode.nullOnce) {
+        // F-KEY-1d: the original key is gone, so the credential is lost
+        // for good; the app keeps failing closed (no fresh enrollment).
+        final AppContainer c3 =
+            AppContainer.inMemory(database: disk, secretStore: secrets);
+        expect((await c3.auth.status()).isFailure, isTrue);
+        expect((await c3.auth.enrollPin('111111')).isFailure, isTrue);
+        expect(await disk.getSetting(_settingsKey), rowBefore);
+        await t.pump(const Duration(seconds: 5)); // drain the dead tree's timers
+        return;
+      }
+
+      // Recovery: storage readable again -> the ORIGINAL PIN is required.
+      final AppContainer c3 =
+          AppContainer.inMemory(database: disk, secretStore: secrets);
+      final StaticNativeChallengeContract n3 =
+          _bind(c3, enabled: true, packages: nativePackages);
+      await t.pumpWidget(SmartAppLockApp(container: c3));
+      await t.pumpAndSettle();
+      n3.reportForeground(_pkg);
+      (c3.accessibility as StaticAccessibilityLockService)
+          .emitForegroundPackage(_pkg);
+      await t.pumpAndSettle();
+      expect(find.byType(PinUnlockScreen), findsOneWidget);
+      for (final String d in '000000'.split('')) {
+        await t.tap(find.byKey(Key('pin_key_$d')));
+        await t.pump(const Duration(milliseconds: 20));
+      }
+      await t.pumpAndSettle();
+      expect(n3.authorizedPackages, isEmpty);
+      await t.pump(const Duration(seconds: 2));
+      await t.pumpAndSettle();
+      for (final String d in _pin.split('')) {
+        await t.tap(find.byKey(Key('pin_key_$d')));
+        await t.pump(const Duration(milliseconds: 20));
+      }
+      await t.pumpAndSettle();
+      expect(n3.authorizedPackages, contains(_pkg));
+      expect((c3.watcher as StaticWatcherService).authorizePackageCalls, 1);
+    });
+  }
+}

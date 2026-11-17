@@ -99,15 +99,18 @@ void main() {
     // P13/M3 NF-NS-1 RE-BASELINE (E-B6, disclosed): the credential fix makes
     // the security-settings repository the ONE production caller. Any other
     // caller (monitor, journal, evidence, UI) still fails here.
-    test('CAS-G1 the only production caller outside lib/data/storage is the '
-        'security-settings repository (no monitor integration)', () {
+    // P13/M3 Q-ENG-1 RE-BASELINE (R8 allow-list, disclosed): the failure-
+    // log store is the owner-authorized second caller. The set is EXACT:
+    // the monitor, journal, evidence store and UI still fail here.
+    test('CAS-G1 the only production callers outside lib/data/storage are '
+        'the security-settings repository and the failure-log store', () {
       final List<String> callers = <String>[
         for (final File f in dartFiles('lib'))
           if (!f.path.replaceAll(r'\', '/').startsWith('lib/data/storage/') &&
               f.readAsStringSync().contains('compareAndSetSetting'))
             f.path.replaceAll(r'\', '/'),
-      ];
-      expect(callers, <String>[kOnlyCasCaller]);
+      ]..sort();
+      expect(callers, kCasCallers);
     });
 
     test('CAS-G2 anti-vacuity: every test fake overriding setSetting is '
@@ -165,6 +168,12 @@ const int kFakeFiles = 39;
 const String kOnlyCasCaller =
     'lib/data/repositories/impl/security_settings_repository_impl.dart';
 
+/// Q-ENG-1 (R8): the exact production caller set (sorted).
+const List<String> kCasCallers = <String>[
+  kOnlyCasCaller,
+  'lib/security/intruder/intruder_failure_log_store.dart',
+];
+
 /// NF-NS-1: fakes that intercept security_settings / all-key writes and
 /// therefore route compareAndSetSetting through the same interception.
 const List<String> kCasOverrideFiles = <String>[
@@ -179,6 +188,16 @@ const List<String> kCasOverrideFiles = <String>[
   'test/ui/security/security_recommendations_card_test.dart',
   'test/ui/security/security_score_card_test.dart',
   'test/ui/security_screen_test.dart',
+  // Q-ENG-1 (contract A §6): fakes intercepting failure-log writes.
+  'test/regression/p12_intruder_defense_m1_test.dart',
+  'test/regression/p12_m2_final_gate_test.dart',
+  'test/regression/p13_p1_monitor_reliability_test.dart',
+  'test/security/credentials/auth_core_final_gate_test.dart',
+  'test/security/intruder/intruder_defense_coordinator_test.dart',
+  'test/security/intruder/intruder_monitor_p1_test.dart',
+  'test/security/intruder/intruder_monitor_test.dart',
+  'test/security/intruder/p13_m3_q_eng_1_monitor_cas_test.dart',
+  'test/security/timeline/security_timeline_concurrency_test.dart',
 ];
 
 class _UnreadableDb extends InMemoryLocalDatabase {

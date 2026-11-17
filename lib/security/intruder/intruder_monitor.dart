@@ -26,6 +26,17 @@
 //    joins the queue tail when the tail is a not-yet-started snapshot
 //    (order-preserving), and outstanding snapshot callers are capped at
 //    [maxSnapshotWaiters] (excess callers get `null` = unavailable).
+//
+// P13/M3 Q-ENG-1 (contract A §4): there is NO cached write base. Every
+// operation re-reads the durable row and writes through a compare-and-set
+// on the exact bytes it read, at most [IntruderMonitor.maxCasAttempts]
+// times (first try included). Several monitors (engines, isolates) sharing
+// one database therefore never lose each other's committed events, and a
+// sequence number always comes from a fresh authoritative read. A record is
+// reported (listener, "saved") ONLY after this call's statement committed
+// or a durable re-read contains its verificationId. A snapshot never
+// substitutes old data for a failed read; [IntruderMonitor.lastKnown] is
+// the separate, explicitly stale accessor.
 import 'dart:async';
 import 'dart:collection';
 
@@ -70,6 +81,8 @@ final class IntruderMonitorStatus {
     this.resetFailures = 0,
     this.resetPending = false,
     this.snapshotsRejected = 0,
+    this.conflictDrops = 0,
+    this.unknownOutcomes = 0,
   });
 
   final IntruderMonitorHealth health;
@@ -97,6 +110,30 @@ final class IntruderMonitorStatus {
 
   /// Whether a corrupt stored log was quarantined by this instance.
   final bool quarantinedCorruptLog;
+
+  /// Q-ENG-1: failure records dropped because the row kept changing for
+  /// [IntruderMonitor.maxCasAttempts] attempts. Each is ALSO counted in
+  /// [droppedFailureRecords] (a subset, never double-counted elsewhere).
+  final int conflictDrops;
+
+  /// Q-ENG-1: writes whose completion could not be confirmed AND whose
+  /// reconciliation read failed: neither saved nor known to be lost. Never
+  /// counted as saved and never counted in [droppedFailureRecords].
+  final int unknownOutcomes;
+}
+
+/// Q-ENG-1 (contract A §4.3): last log this monitor read or committed,
+/// explicitly labelled stale. Never returned by [IntruderMonitor.snapshot].
+final class IntruderLastKnown {
+  const IntruderLastKnown({required this.log, required this.asOf});
+
+  final IntruderFailureLog log;
+
+  /// Monitor clock time at which [log] was durably observed.
+  final DateTime asOf;
+
+  /// Always true: this is never an authoritative read.
+  bool get stale => true;
 }
 
 class IntruderMonitor implements VerifiedAttemptObserver {
@@ -117,6 +154,9 @@ class IntruderMonitor implements VerifiedAttemptObserver {
   static const int defaultMaxEncodedBytes = 64 * 1024;
   static const int defaultMaxSnapshotWaiters = 64;
   static const int _seenIdsCapacity = 256;
+
+  /// Q-ENG-1: compare-and-set attempts per operation, first try included.
+  static const int maxCasAttempts = 3;
 
   final IntruderFailureLogStore _store;
 
@@ -177,11 +217,13 @@ class IntruderMonitor implements VerifiedAttemptObserver {
   int _peakReadOps = 0;
   int _peakResetOps = 0;
   int _peakSnapshotWaiters = 0;
-  IntruderFailureLog? _cache;
+  IntruderLastKnown? _lastKnown;
   bool _readOnly = false;
   bool _storageError = false;
   bool _quarantined = false;
   int _dropped = 0;
+  int _conflictDrops = 0;
+  int _unknownOutcomes = 0;
   final LinkedHashSet<String> _seenIds = LinkedHashSet<String>();
 
   IntruderMonitorStatus get status => IntruderMonitorStatus(
@@ -195,7 +237,14 @@ class IntruderMonitor implements VerifiedAttemptObserver {
         resetFailures: _resetFailures,
         resetPending: _appliedResetEpoch < _ownerEpoch,
         snapshotsRejected: _snapshotsRejected,
+        conflictDrops: _conflictDrops,
+        unknownOutcomes: _unknownOutcomes,
       );
+
+  /// Q-ENG-1: the last durably observed log, flagged stale (null when none
+  /// was ever observed). For a UI that explicitly wants last-known data;
+  /// never a write base and never what [snapshot] returns.
+  IntruderLastKnown? lastKnown() => _lastKnown;
 
   /// Diagnostics (P-1 bounds): snapshot ops queued or running.
   int get liveReadOps => _liveReadOps;
@@ -225,8 +274,10 @@ class IntruderMonitor implements VerifiedAttemptObserver {
     return waiter.future;
   }
 
-  /// The current log, read in queue order (null when unreadable/read-only
-  /// and nothing valid is known). For M2 / M3 / Phase 13 readers and tests.
+  /// The current log, read AUTHORITATIVELY in queue order. Returns null
+  /// (= unavailable) whenever that read fails or the log is read-only; it
+  /// never substitutes previously read data (Q-ENG-1, see [lastKnown]).
+  /// For M2 / M3 / Phase 13 readers and tests.
   ///
   /// P-1: never consumes failure-record capacity. Joins the queue tail when
   /// the tail is a snapshot that has not started (no operation was queued
@@ -344,7 +395,6 @@ class IntruderMonitor implements VerifiedAttemptObserver {
           }
         } catch (_) {
           // Never escapes: a monitor failure must not surface anywhere.
-          _cache = null;
           _storageError = true;
         } finally {
           switch (op) {
@@ -370,32 +420,31 @@ class IntruderMonitor implements VerifiedAttemptObserver {
 
   // -- operations -----------------------------------------------------------
 
-  Future<IntruderFailureLog?> _ensureLoaded() async {
-    final IntruderFailureLog? cached = _cache;
-    if (cached != null) {
-      return cached;
-    }
+  /// Q-ENG-1: one authoritative read of the durable row. Returns the write
+  /// base (log + exact expected bytes), or null when nothing may be written
+  /// in this operation (read-only, or a storage error this op).
+  Future<_Base?> _readBase() async {
     if (_readOnly) {
       return null;
     }
     final IntruderLogRead read = await _store.read();
     switch (read) {
-      case IntruderLogLoaded(:final IntruderFailureLog log):
-        _cache = log;
-        return log;
+      case IntruderLogLoaded(:final IntruderFailureLog log, :final String raw):
+        _observe(log);
+        return _Base(log, raw);
       case IntruderLogMissing():
-        _cache = IntruderFailureLog.empty;
-        return _cache;
+        return const _Base(IntruderFailureLog.empty, null);
       case IntruderLogCorrupt(:final String raw):
-        // Preserve the damaged value once, then start a fresh v1 log.
+        // Preserve the damaged value once (insert-if-absent), then replace
+        // ONLY these exact bytes with a fresh log (a racing repairer makes
+        // this a conflict and the loser rebases on the winner).
         try {
-          await _store.quarantine(raw);
+          await _store.quarantineOnce(raw);
           _quarantined = true;
         } catch (_) {
           // Quarantine is best effort; reinitialization still proceeds.
         }
-        _cache = IntruderFailureLog.empty;
-        return _cache;
+        return _Base(IntruderFailureLog.empty, raw);
       case IntruderLogUnsupported():
         _readOnly = true;
         return null;
@@ -409,15 +458,50 @@ class IntruderMonitor implements VerifiedAttemptObserver {
     }
   }
 
-  Future<void> _runRead(_ReadOp op) async {
-    final IntruderFailureLog? log;
+  void _observe(IntruderFailureLog log) {
+    _lastKnown = IntruderLastKnown(log: log, asOf: _now());
+  }
+
+  void _committed(IntruderFailureLog log) {
+    _observe(log);
+    _storageError = false;
+  }
+
+  /// Reconciliation read after an unknown write outcome. Returns the
+  /// durable log (null when the row is missing/corrupt/unsupported) and
+  /// whether the read itself succeeded.
+  Future<(IntruderFailureLog?, String?, bool)> _reconcileRead() async {
+    final IntruderLogRead read;
     try {
-      log = await _ensureLoaded();
+      read = await _store.read();
+    } catch (_) {
+      return (null, null, false);
+    }
+    switch (read) {
+      case IntruderLogLoaded(:final IntruderFailureLog log, :final String raw):
+        _observe(log);
+        return (log, raw, true);
+      case IntruderLogMissing():
+        return (null, null, true);
+      case IntruderLogCorrupt(:final String raw):
+        return (null, raw, true);
+      case IntruderLogUnsupported(:final String raw):
+        _readOnly = true;
+        return (null, raw, true);
+      case IntruderLogUnreadable():
+        return (null, null, false);
+    }
+  }
+
+  Future<void> _runRead(_ReadOp op) async {
+    final _Base? base;
+    try {
+      base = await _readBase();
     } catch (_) {
       _completeReaders(op, null);
       rethrow;
     }
-    _completeReaders(op, log);
+    _completeReaders(op, base?.log);
   }
 
   void _completeReaders(_ReadOp op, IntruderFailureLog? log) {
@@ -430,8 +514,9 @@ class IntruderMonitor implements VerifiedAttemptObserver {
 
   /// Applies the owner-success intent up to [op]'s target. A failed or
   /// impossible reset keeps the intent (never silently dropped) and is NOT
-  /// retried in a loop: the next persisted record applies it inline, and
-  /// the next owner success queues a fresh reset.
+  /// retried beyond [maxCasAttempts]: the next persisted record applies it
+  /// inline, and the next owner success queues a fresh reset. Touches only
+  /// the run counter (never events or nextSeq; invariant 11).
   Future<void> _runReset(_ResetOp op) async {
     if (identical(_queuedReset, op)) _queuedReset = null;
     final int target = op.target;
@@ -439,26 +524,45 @@ class IntruderMonitor implements VerifiedAttemptObserver {
       if (_appliedResetEpoch >= target) {
         return; // already applied inline by a later record
       }
-      final IntruderFailureLog? log = await _ensureLoaded();
-      if (log == null) {
-        return; // unreadable / read-only: intent kept (resetPending)
-      }
-      if (log.consecutiveFailures == 0) {
-        _appliedResetEpoch = target; // nothing to write
-        return;
-      }
-      final bool saved = await _save(
-        IntruderFailureLog(
+      for (int attempt = 1; attempt <= maxCasAttempts; attempt++) {
+        final _Base? base = await _readBase();
+        if (base == null) {
+          return; // unreadable / read-only: intent kept (resetPending)
+        }
+        final IntruderFailureLog log = base.log;
+        if (log.consecutiveFailures == 0) {
+          _appliedResetEpoch = target; // nothing to write
+          return;
+        }
+        final IntruderFailureLog next = IntruderFailureLog(
           nextSeq: log.nextSeq,
           consecutiveFailures: 0,
           events: log.events,
-        ),
-      );
-      if (saved) {
-        _appliedResetEpoch = target;
-      } else {
-        _resetFailures++;
+        );
+        final IntruderWriteResult result =
+            await _store.writeIfUnchanged(next, expectedRaw: base.raw);
+        switch (result) {
+          case IntruderWriteCommitted():
+            _committed(next);
+            _appliedResetEpoch = target;
+            return;
+          case IntruderWriteConflict():
+            continue; // re-read and rebase
+          case IntruderWriteUnknown(:final String? attemptedRaw):
+            final (_, String? durableRaw, bool readOk) =
+                await _reconcileRead();
+            if (readOk && attemptedRaw != null && durableRaw == attemptedRaw) {
+              _committed(next); // durably confirmed
+              _appliedResetEpoch = target;
+            } else {
+              if (!readOk) _unknownOutcomes++;
+              _storageError = true;
+              _resetFailures++;
+            }
+            return;
+        }
       }
+      _resetFailures++; // contention: intent kept
     } finally {
       if (_resetDeferred) {
         _resetDeferred = false;
@@ -476,58 +580,99 @@ class IntruderMonitor implements VerifiedAttemptObserver {
     AuthAttemptResult result,
     int ownerEpoch,
   ) async {
-    final IntruderFailureLog? log = await _ensureLoaded();
-    if (log == null) {
-      _dropped++;
-      return;
-    }
     final String vid = attempt.verificationId;
-    if (_seenIds.contains(vid) ||
-        log.events.any((FailedAttemptEvent e) => e.verificationId == vid)) {
-      return; // duplicate delivery: already recorded
-    }
-    // P-1: an owner success verified before this failure but not yet
-    // reflected in the persisted run restarts the run here.
-    final bool resetFirst = ownerEpoch > _appliedResetEpoch;
-    final int base = resetFirst ? 0 : log.consecutiveFailures;
-    final int run = base >= IntruderFailureLog.maxRun
-        ? IntruderFailureLog.maxRun
-        : base + 1;
-    final AuthAttemptContext context = attempt.context;
-    final bool challenge =
-        context.surface == AuthAttemptSurface.protectedAppChallenge;
-    final FailedAttemptEvent event = FailedAttemptEvent(
-      seq: log.nextSeq,
-      verificationId: vid,
-      at: attempt.at,
-      method: method,
-      surface: context.surface,
-      packageName: challenge ? context.packageName : null,
-      generation: challenge ? context.generation : null,
-      challengeSerial: challenge ? context.challengeSerial : null,
-      consecutiveFailures: run,
-      lockoutTriggered: result is AuthLockedOut,
-      lockoutStreak: attempt.lockoutStreak,
-      counterPersisted: attempt.counterPersisted,
-    );
-    final bool saved = await _save(
-      IntruderFailureLog(
+    for (int tries = 1; tries <= maxCasAttempts; tries++) {
+      final _Base? base = await _readBase();
+      if (base == null) {
+        _dropped++;
+        return;
+      }
+      final IntruderFailureLog log = base.log;
+      if (_seenIds.contains(vid) ||
+          log.events.any((FailedAttemptEvent e) => e.verificationId == vid)) {
+        return; // duplicate delivery: already durably recorded
+      }
+      // P-1: an owner success verified before this failure but not yet
+      // reflected in the persisted run restarts the run here.
+      final bool resetFirst = ownerEpoch > _appliedResetEpoch;
+      final int prior = resetFirst ? 0 : log.consecutiveFailures;
+      final int run = prior >= IntruderFailureLog.maxRun
+          ? IntruderFailureLog.maxRun
+          : prior + 1;
+      final AuthAttemptContext context = attempt.context;
+      final bool challenge =
+          context.surface == AuthAttemptSurface.protectedAppChallenge;
+      final FailedAttemptEvent event = FailedAttemptEvent(
+        seq: log.nextSeq, // from THIS authoritative read
+        verificationId: vid,
+        at: attempt.at,
+        method: method,
+        surface: context.surface,
+        packageName: challenge ? context.packageName : null,
+        generation: challenge ? context.generation : null,
+        challengeSerial: challenge ? context.challengeSerial : null,
+        consecutiveFailures: run,
+        lockoutTriggered: result is AuthLockedOut,
+        lockoutStreak: attempt.lockoutStreak,
+        counterPersisted: attempt.counterPersisted,
+      );
+      final IntruderFailureLog next = IntruderFailureLog(
         nextSeq: log.nextSeq + 1,
         consecutiveFailures: run,
         events: _bounded(<FailedAttemptEvent>[...log.events, event]),
-      ),
-    );
-    if (saved) {
-      if (resetFirst) _appliedResetEpoch = ownerEpoch;
-      if (ownerEpoch == _ownerEpoch) {
-        _notify((IntruderEventListener l) => l.onFailedAttemptRecorded(event));
+      );
+      final IntruderWriteResult written =
+          await _store.writeIfUnchanged(next, expectedRaw: base.raw);
+      switch (written) {
+        case IntruderWriteCommitted():
+          _committed(next);
+          _recorded(vid, event, ownerEpoch, resetFirst);
+          return;
+        case IntruderWriteConflict():
+          continue; // another writer committed first: re-read and rebase
+        case IntruderWriteUnknown():
+          final (IntruderFailureLog? durable, _, bool readOk) =
+              await _reconcileRead();
+          _storageError = true;
+          if (!readOk) {
+            _unknownOutcomes++; // neither saved nor known lost
+            return;
+          }
+          FailedAttemptEvent? landed;
+          for (final FailedAttemptEvent e
+              in durable?.events ?? const <FailedAttemptEvent>[]) {
+            if (e.verificationId == vid) landed = e;
+          }
+          if (landed == null) {
+            _dropped++; // durably absent: not saved
+            return;
+          }
+          _committed(durable!); // durably confirmed by verificationId
+          _recorded(vid, landed, ownerEpoch, resetFirst);
+          return;
       }
-      _seenIds.add(vid);
-      while (_seenIds.length > _seenIdsCapacity) {
-        _seenIds.remove(_seenIds.first);
-      }
-    } else {
-      _dropped++;
+    }
+    _conflictDrops++;
+    _dropped++;
+  }
+
+  /// Bookkeeping for a durably confirmed record; the listener is told only
+  /// here (and only if no owner success was verified after the failure).
+  void _recorded(
+    String vid,
+    FailedAttemptEvent event,
+    int ownerEpoch,
+    bool resetFirst,
+  ) {
+    if (resetFirst && ownerEpoch > _appliedResetEpoch) {
+      _appliedResetEpoch = ownerEpoch;
+    }
+    _seenIds.add(vid);
+    while (_seenIds.length > _seenIdsCapacity) {
+      _seenIds.remove(_seenIds.first);
+    }
+    if (ownerEpoch == _ownerEpoch) {
+      _notify((IntruderEventListener l) => l.onFailedAttemptRecorded(event));
     }
   }
 
@@ -552,20 +697,17 @@ class IntruderMonitor implements VerifiedAttemptObserver {
     }
     return List<FailedAttemptEvent>.unmodifiable(kept);
   }
+}
 
-  Future<bool> _save(IntruderFailureLog next) async {
-    try {
-      await _store.write(next);
-      _cache = next;
-      _storageError = false;
-      return true;
-    } catch (_) {
-      // The previous row is intact; reload from storage next time.
-      _cache = null;
-      _storageError = true;
-      return false;
-    }
-  }
+/// Q-ENG-1: a write base from one authoritative read.
+final class _Base {
+  const _Base(this.log, this.raw);
+
+  final IntruderFailureLog log;
+
+  /// Exact durable bytes ([log] was decoded from them), or null when no row
+  /// exists (insert-if-absent).
+  final String? raw;
 }
 
 // -- queued operations (P-1) --------------------------------------------------

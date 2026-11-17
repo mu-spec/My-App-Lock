@@ -31,6 +31,7 @@ import 'package:smart_app_lock/data/models/security_settings.dart';
 import 'package:smart_app_lock/data/repositories/impl/security_settings_repository_impl.dart';
 import 'package:smart_app_lock/data/repositories/security_settings_repository.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/protection/impl/default_access_controller.dart';
 import 'package:smart_app_lock/security/credentials/auth_result.dart';
 import 'package:smart_app_lock/security/credentials/auth_type.dart';
@@ -41,6 +42,7 @@ import 'package:smart_app_lock/security/credentials/credential_state_machine.dar
 import 'package:smart_app_lock/security/credentials/impl/default_credential_manager.dart';
 import 'package:smart_app_lock/security/credentials/pattern_hasher.dart';
 import 'package:smart_app_lock/security/credentials/verified_attempt.dart';
+import 'package:smart_app_lock/security/intruder/failed_attempt_event.dart';
 import 'package:smart_app_lock/security/intruder/intruder_failure_log_store.dart';
 import 'package:smart_app_lock/security/intruder/intruder_monitor.dart';
 import 'package:smart_app_lock/security/pin_hasher.dart';
@@ -188,6 +190,21 @@ class _HangingIntruderDb extends InMemoryLocalDatabase {
     }
     return super.setSetting(key, value);
   }
+
+  // Q-ENG-1 (contract A §6): the failure log now persists ONLY through
+  // compareAndSetSetting; route it through the same interception as
+  // setSetting so this fake's faults keep reaching the real write path.
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) {
+    if (key.startsWith(IntruderFailureLogStore.storageKey)) {
+      return Completer<CasOutcome>().future; // never completes
+    }
+    return super.compareAndSetSetting(key, expected: expected, next: next);
+  }
 }
 
 /// Intruder storage that throws on every access.
@@ -206,6 +223,21 @@ class _BrokenIntruderDb extends InMemoryLocalDatabase {
       throw StateError('intruder storage fault');
     }
     return super.setSetting(key, value);
+  }
+
+  // Q-ENG-1 (contract A §6): the failure log now persists ONLY through
+  // compareAndSetSetting; route it through the same interception as
+  // setSetting so this fake's faults keep reaching the real write path.
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    if (key.startsWith(IntruderFailureLogStore.storageKey)) {
+      throw StateError('intruder storage fault');
+    }
+    return super.compareAndSetSetting(key, expected: expected, next: next);
   }
 }
 
@@ -497,6 +529,24 @@ List<String> _lockViolations(Map<String, String> m) {
 }
 
 void main() {
+  // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
+  // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
+  // must pass through this file's fault fake. If the fake stopped
+  // intercepting CAS, this fails.
+  group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
+    test('the hanging and broken intruder stores reach the CAS', () async {
+      final _HangingIntruderDb hang = _HangingIntruderDb();
+      final Object first = await Future.any(<Future<Object>>[
+        IntruderFailureLogStore(hang)
+            .writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null),
+        Future<Object>.delayed(const Duration(milliseconds: 20), () => 'hung'),
+      ]);
+      expect(first, 'hung');
+      final _BrokenIntruderDb db = _BrokenIntruderDb();
+      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteUnknown>());
+    });
+  });
+
   final DateTime t0 = DateTime(2026, 10, 22, 9);
 
   // -------------------------------------------------------------------------

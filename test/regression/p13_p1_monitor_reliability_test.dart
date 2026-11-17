@@ -22,6 +22,7 @@ import 'package:smart_app_lock/app/app_container.dart';
 import 'package:smart_app_lock/data/models/app_security_level.dart';
 import 'package:smart_app_lock/data/models/protected_app.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/protection/impl/default_access_controller.dart';
 import 'package:smart_app_lock/security/credentials/auth_result.dart';
 import 'package:smart_app_lock/security/credentials/auth_type.dart';
@@ -74,6 +75,26 @@ class _LogFaultDb extends InMemoryLocalDatabase {
     }
     return super.setSetting(key, value);
   }
+
+  // Q-ENG-1 (contract A §6): the failure log now persists ONLY through
+  // compareAndSetSetting; route it through the same interception as
+  // setSetting so this fake's faults keep reaching the real write path.
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    if (key == _logKey) {
+      final Completer<void>? g = writeGate;
+      if (g != null) await g.future;
+      if (failNextWrites > 0) {
+        failNextWrites--;
+        throw StateError('log write fault');
+      }
+    }
+    return super.compareAndSetSetting(key, expected: expected, next: next);
+  }
 }
 
 int _vid = 0;
@@ -109,6 +130,28 @@ VerifiedAttempt _ok() => VerifiedAttempt(
     );
 
 void main() {
+  // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
+  // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
+  // must pass through this file's fault fake. If the fake stopped
+  // intercepting CAS, this fails.
+  group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
+    test('fault and gate reach the CAS', () async {
+      final _LogFaultDb db = _LogFaultDb()..failNextWrites = 1;
+      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteUnknown>());
+      expect(db.failNextWrites, 0, reason: 'the fault was consumed by CAS');
+      expect(await db.getSetting(_logKey), isNull);
+      final Completer<void> gate = Completer<void>();
+      db.writeGate = gate;
+      bool done = false;
+      final Future<IntruderWriteResult> w =
+          IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null)..then((_) => done = true);
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      expect(done, isFalse, reason: 'the gate holds the CAS');
+      gate.complete();
+      expect(await w, isA<IntruderWriteCommitted>());
+    });
+  });
+
   group('P1-T08 real IntruderDefenseCoordinator (threshold 3, alarm only)', () {
     late _LogFaultDb db;
     late GatedEvidenceService platform;

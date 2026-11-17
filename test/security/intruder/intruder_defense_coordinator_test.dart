@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:smart_app_lock/app/app_container.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/security/credentials/auth_result.dart';
 import 'package:smart_app_lock/security/credentials/verified_attempt.dart';
 import 'package:smart_app_lock/security/encryption/settings_cipher.dart';
@@ -86,9 +87,40 @@ class _OrderDb extends InMemoryLocalDatabase {
     }
     return super.setSetting(key, value);
   }
+
+  // Q-ENG-1 (contract A §6): the failure log now persists ONLY through
+  // compareAndSetSetting; route it through the same interception as
+  // setSetting so this fake's faults keep reaching the real write path.
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    if (key.startsWith(IntruderFailureLogStore.storageKey)) {
+      if (breakLog || breakLogWrites) throw StateError('log fault');
+      order.add('persist');
+    }
+    return super.compareAndSetSetting(key, expected: expected, next: next);
+  }
 }
 
 void main() {
+  // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
+  // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
+  // must pass through this file's fault fake. If the fake stopped
+  // intercepting CAS, this fails.
+  group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
+    test('breakLogWrites reaches the CAS; persist order is recorded', () async {
+      final _OrderDb db = _OrderDb()..breakLogWrites = true;
+      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteUnknown>());
+      expect(db.order, isNot(contains('persist')));
+      db.breakLogWrites = false;
+      expect(await IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null), isA<IntruderWriteCommitted>());
+      expect(db.order, <String>['persist']);
+    });
+  });
+
   late InMemoryLocalDatabase db;
   late SettingsCipher cipher;
   late GatedEvidenceService platform;

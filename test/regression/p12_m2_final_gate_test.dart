@@ -26,6 +26,7 @@ import 'package:smart_app_lock/app/theme/app_theme.dart';
 import 'package:smart_app_lock/data/models/app_security_level.dart';
 import 'package:smart_app_lock/data/models/protected_app.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
+import 'package:smart_app_lock/data/storage/local_database.dart';
 import 'package:smart_app_lock/protection/impl/default_access_controller.dart';
 import 'package:smart_app_lock/security/credentials/auth_result.dart';
 import 'package:smart_app_lock/security/credentials/credential_state.dart';
@@ -86,6 +87,22 @@ class _HookDb extends InMemoryLocalDatabase {
     }
     return super.setSetting(key, value);
   }
+
+  // Q-ENG-1 (contract A §6): the failure log now persists ONLY through
+  // compareAndSetSetting; route it through the same interception as
+  // setSetting so this fake's faults keep reaching the real write path.
+  @override
+  Future<CasOutcome> compareAndSetSetting(
+    String key, {
+    required String? expected,
+    required String next,
+  }) async {
+    final Completer<void>? g = logWriteGate;
+    if (g != null && key.startsWith(IntruderFailureLogStore.storageKey)) {
+      await g.future;
+    }
+    return super.compareAndSetSetting(key, expected: expected, next: next);
+  }
 }
 
 /// Fake whose permission query runs a hook (owner success lands there).
@@ -112,6 +129,25 @@ class _Recorder implements IntruderEventListener {
 }
 
 void main() {
+  // Q-ENG-1 T-Q15 anti-vacuity (contract A §6): the REAL failure-log write
+  // path (IntruderFailureLogStore.writeIfUnchanged -> compareAndSetSetting)
+  // must pass through this file's fault fake. If the fake stopped
+  // intercepting CAS, this fails.
+  group('T-Q15 anti-vacuity: the failure-log CAS path is intercepted', () {
+    test('the log write gate holds the CAS', () async {
+      final _HookDb db = _HookDb();
+      final Completer<void> gate = Completer<void>();
+      db.logWriteGate = gate;
+      bool done = false;
+      final Future<IntruderWriteResult> w =
+          IntruderFailureLogStore(db).writeIfUnchanged(IntruderFailureLog.empty, expectedRaw: null)..then((_) => done = true);
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      expect(done, isFalse);
+      gate.complete();
+      expect(await w, isA<IntruderWriteCommitted>());
+    });
+  });
+
   late _HookDb db;
   late SettingsCipher cipher;
   late GatedEvidenceService platform;
