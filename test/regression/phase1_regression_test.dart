@@ -20,6 +20,7 @@ import 'package:smart_app_lock/ui/screens/security/security_screen.dart';
 import 'package:smart_app_lock/ui/screens/settings/settings_screen.dart';
 import 'package:smart_app_lock/ui/screens/smart/smart_screen.dart';
 import 'package:smart_app_lock/ui/shell/main_shell.dart';
+import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
 
 /// Phase 1G — regression suite.
 ///
@@ -201,7 +202,8 @@ void main() {
 
       // Cipher sanity: tampering is rejected.
       final AesGcmSettingsCipher cipher =
-          AesGcmSettingsCipher(InMemorySecretStore());
+          AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
       final String encrypted = await cipher.encryptString('sensitive');
       final String tampered =
           '${encrypted.substring(0, encrypted.length - 1)}x';

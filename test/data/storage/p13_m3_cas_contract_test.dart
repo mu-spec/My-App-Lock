@@ -102,8 +102,12 @@ void main() {
     // P13/M3 Q-ENG-1 RE-BASELINE (R8 allow-list, disclosed): the failure-
     // log store is the owner-authorized second caller. The set is EXACT:
     // the monitor, journal, evidence store and UI still fail here.
+    // P13/M3 Batch 2 RE-BASELINE (R8 allow-list, disclosed): the F-KEY-1
+    // master-key resolver commits `sec.key_commit` (K-2+B-compat) with CAS;
+    // it is the owner-authorized third caller. Still EXACT.
     test('CAS-G1 the only production callers outside lib/data/storage are '
-        'the security-settings repository and the failure-log store', () {
+        'the security-settings repository, the failure-log store and the '
+        'master-key resolver', () {
       final List<String> callers = <String>[
         for (final File f in dartFiles('lib'))
           if (!f.path.replaceAll(r'\', '/').startsWith('lib/data/storage/') &&
@@ -171,6 +175,8 @@ const String kOnlyCasCaller =
 /// Q-ENG-1 (R8): the exact production caller set (sorted).
 const List<String> kCasCallers = <String>[
   kOnlyCasCaller,
+  // Batch 2 (F-KEY-1, K-2+B-compat key commitment), disclosed re-baseline.
+  'lib/security/encryption/master_key_resolver.dart',
   'lib/security/intruder/intruder_failure_log_store.dart',
 ];
 
@@ -198,6 +204,8 @@ const List<String> kCasOverrideFiles = <String>[
   'test/security/intruder/intruder_monitor_test.dart',
   'test/security/intruder/p13_m3_q_eng_1_monitor_cas_test.dart',
   'test/security/timeline/security_timeline_concurrency_test.dart',
+  // Batch 2: resolver tests inject CAS unknown-outcome faults (KC-05).
+  'test/security/encryption/p13_m3_b2_master_key_resolver_test.dart',
 ];
 
 class _UnreadableDb extends InMemoryLocalDatabase {

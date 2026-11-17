@@ -25,6 +25,7 @@ import 'package:smart_app_lock/data/models/protected_app.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
 import 'package:smart_app_lock/protection/access_controller.dart';
 import 'package:smart_app_lock/protection/impl/default_access_controller.dart';
+import 'package:smart_app_lock/security/credentials/auth_result.dart';
 import 'package:smart_app_lock/security/storage/impl/in_memory_secret_store.dart';
 import 'package:smart_app_lock/security/storage/secret_store.dart';
 import 'package:smart_app_lock/services/impl/static_accessibility_lock_service.dart';
@@ -126,9 +127,12 @@ void main() {
     expect(nativePackages, contains(_pkg));
   }
 
+  // nullOnce is FLIPPED by Batch 2 into its own test (FK-H nullOnce
+  // FLIPPED, below): one null read no longer yields a persistent
+  // unreadable state, so the persistent-fault assertions here no longer
+  // describe it.
   for (final _Mode mode in <_Mode>[
     _Mode.throws,
-    _Mode.nullOnce,
     _Mode.wrongKey
   ]) {
     testWidgets(
@@ -182,30 +186,14 @@ void main() {
       expect(find.byType(PinUnlockScreen), findsNothing);
       // Credential + lockout row untouched.
       expect(await disk.getSetting(_settingsKey), rowBefore);
-      if (mode == _Mode.throws || mode == _Mode.wrongKey) {
-        expect(faulty.keyWrites, 0);
-        expect(await secrets.read(_mk), keyBefore);
-      } else {
-        // OPEN F-KEY-1d (asserts CURRENT unsafe behaviour; must flip after
-        // the K-2+ repair): one null read made _masterKey() mint and persist
-        // a replacement key over the good one. Access still fails closed.
-        expect(faulty.keyWrites, 1);
-        expect(await secrets.read(_mk), isNot(keyBefore));
-      }
+      // F-KEY-1d FLIPPED (Batch 2): the original asserted that one null
+      // read minted and persisted a replacement key (preserved in the sealed
+      // F_KEY_1/tests copy). Now NO mode writes a key and the original key
+      // survives, so every mode recovers below with the ORIGINAL PIN.
+      expect(faulty.keyWrites, 0);
+      expect(await secrets.read(_mk), keyBefore);
       await t.pumpWidget(const SizedBox());
       await t.pumpAndSettle();
-
-      if (mode == _Mode.nullOnce) {
-        // F-KEY-1d: the original key is gone, so the credential is lost
-        // for good; the app keeps failing closed (no fresh enrollment).
-        final AppContainer c3 =
-            AppContainer.inMemory(database: disk, secretStore: secrets);
-        expect((await c3.auth.status()).isFailure, isTrue);
-        expect((await c3.auth.enrollPin('111111')).isFailure, isTrue);
-        expect(await disk.getSetting(_settingsKey), rowBefore);
-        await t.pump(const Duration(seconds: 5)); // drain the dead tree's timers
-        return;
-      }
 
       // Recovery: storage readable again -> the ORIGINAL PIN is required.
       final AppContainer c3 =
@@ -236,4 +224,65 @@ void main() {
       expect((c3.watcher as StaticWatcherService).authorizePackageCalls, 1);
     });
   }
+
+  // F-KEY-1d FLIPPED (Batch 2). The ORIGINAL nullOnce case asserted that one
+  // null read minted and persisted a replacement key, losing the credential
+  // for good (sealed copy in Phase13/.../F_KEY_1/tests/). Repaired: that
+  // read fails closed WITHOUT any key write; the next read recovers the
+  // original key; a protected launch then requires the ORIGINAL PIN.
+  testWidgets(
+      'FK-H nullOnce FLIPPED: one null key read fails closed, writes no key, '
+      'and the original PIN is then required and works', (WidgetTester t) async {
+    t.view.physicalSize = const Size(800, 1600);
+    t.view.devicePixelRatio = 1.0;
+    addTearDown(t.view.reset);
+    await process1();
+    final String rowBefore = (await disk.getSetting(_settingsKey))!;
+    final String keyBefore = (await secrets.read(_mk))!;
+    final _FaultySecrets faulty = _FaultySecrets(secrets, _Mode.nullOnce);
+    final AppContainer c2 =
+        AppContainer.inMemory(database: disk, secretStore: faulty);
+    // The read that sees the null fails closed (never "no credential").
+    expect((await c2.auth.status()).isFailure, isTrue);
+    // An authentication whose key read sees the null never grants, even
+    // with the CORRECT PIN (separate process view, its own null read).
+    final _FaultySecrets faultyB = _FaultySecrets(secrets, _Mode.nullOnce);
+    final AppContainer c2b =
+        AppContainer.inMemory(database: disk, secretStore: faultyB);
+    expect((await c2b.auth.authenticatePin(_pin)).valueOrNull,
+        isNot(isA<AuthSuccess>()));
+    expect(faultyB.keyWrites, 0);
+    expect(faulty.keyWrites, 0, reason: 'FIXED: no replacement key');
+    expect(await secrets.read(_mk), keyBefore);
+    expect(await disk.getSetting(_settingsKey), rowBefore);
+    // Not cached as a failure: the next read recovers the SAME state.
+    expect((await c2.auth.status()).valueOrNull!.hasAnyCredential, isTrue);
+
+    final StaticNativeChallengeContract n2 =
+        _bind(c2, enabled: true, packages: nativePackages);
+    await t.pumpWidget(SmartAppLockApp(container: c2));
+    await t.pumpAndSettle();
+    n2.reportForeground(_pkg);
+    (c2.accessibility as StaticAccessibilityLockService)
+        .emitForegroundPackage(_pkg);
+    await t.pumpAndSettle();
+    expect(find.byType(PinUnlockScreen), findsOneWidget);
+    for (final String d in '000000'.split('')) {
+      await t.tap(find.byKey(Key('pin_key_$d')));
+      await t.pump(const Duration(milliseconds: 20));
+    }
+    await t.pumpAndSettle();
+    expect(n2.authorizedPackages, isEmpty);
+    await t.pump(const Duration(seconds: 2));
+    await t.pumpAndSettle();
+    for (final String d in _pin.split('')) {
+      await t.tap(find.byKey(Key('pin_key_$d')));
+      await t.pump(const Duration(milliseconds: 20));
+    }
+    await t.pumpAndSettle();
+    expect(n2.authorizedPackages, contains(_pkg));
+    expect(faulty.keyWrites, 0);
+    await t.pumpWidget(const SizedBox());
+    await t.pumpAndSettle();
+  });
 }

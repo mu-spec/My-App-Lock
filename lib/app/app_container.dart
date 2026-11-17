@@ -32,6 +32,7 @@ import '../protection/protected_app_matcher.dart';
 import '../protection/health/protection_health_monitor.dart';
 import '../protection/protection_bootstrap.dart';
 import 'protection_health_journal_recorder.dart';
+import '../security/encryption/key_wrapper.dart';
 import '../security/encryption/settings_cipher.dart';
 import '../security/encryption/settings_cipher_impl.dart';
 import '../security/credentials/credential_manager.dart';
@@ -99,6 +100,7 @@ class AppContainer {
     IntruderEvidenceService? intruderEvidenceOverride,
     PreferencesStore? preferencesOverride,
     DateTime Function()? accessClock,
+    KeyWrapper keyWrapper = const NoKeyWrapper(),
   })  : _keyValueStore = keyValueStore,
         _database = database,
         secretStore = secretStore,
@@ -108,7 +110,10 @@ class AppContainer {
         screenState = screenStateService,
         watcher = watcherService,
         _accessClock = accessClock {
-    settingsCipher = AesGcmSettingsCipher(secretStore);
+    // F-KEY-1 (Batch 2): the master key is committed in THIS database
+    // (atomic CAS) before first use; see MasterKeyResolver.
+    settingsCipher = AesGcmSettingsCipher(secretStore,
+        database: _database, keyWrapper: keyWrapper);
     preferences = preferencesOverride ?? PreferencesStoreImpl(_keyValueStore);
     protectedApps = ProtectedAppsRepositoryImpl(_database);
     securitySettings = SecuritySettingsRepositoryImpl(
@@ -304,6 +309,7 @@ class AppContainer {
       keyValueStore: SharedPreferencesKeyValueStore(prefs),
       database: database,
       secretStore: FlutterSecureSecretStore(),
+      keyWrapper: const MethodChannelKeyWrapper(),
       installedAppsService: installedAppsService,
       accessibilityService: accessibilityService,
       overlayService: overlayService,
@@ -347,6 +353,8 @@ class AppContainer {
     // given screen-state service (e.g. the method-channel service on a
     // mocked channel). Default: the static test service.
     ScreenStateService? screenState,
+    // Phase 13 / M3 Batch 2: platform KEK double (default: none).
+    KeyWrapper? keyWrapper,
   }) {
     final InstalledAppsService installedAppsService =
         StaticInstalledAppsService(
@@ -367,6 +375,7 @@ class AppContainer {
       keyValueStore: kv,
       database: database ?? InMemoryLocalDatabase(),
       secretStore: secretStore ?? InMemorySecretStore(),
+      keyWrapper: keyWrapper ?? const NoKeyWrapper(),
       installedAppsService: installedAppsService,
       accessibilityService: accessibilityService,
       overlayService: overlayService,

@@ -139,7 +139,8 @@ VerifiedAttempt _wrong() => VerifiedAttempt(
 class _Rig {
   _Rig({int maxPending = 8, int journalMaxPending = 64}) {
     db = _GateDb();
-    final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore());
+    final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
     monitor = _CountingMonitor(
       store: IntruderFailureLogStore(db, cipher: cipher),
       now: () => _t0,

@@ -16,7 +16,8 @@ void main() {
     db = InMemoryLocalDatabase();
     repo = SecuritySettingsRepositoryImpl(
       db,
-      cipher: AesGcmSettingsCipher(InMemorySecretStore()),
+      cipher: AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase()),
     );
   });
 
@@ -105,7 +106,8 @@ void main() {
     final InMemoryLocalDatabase otherDb = InMemoryLocalDatabase();
     final SecuritySettingsRepository writer = SecuritySettingsRepositoryImpl(
       otherDb,
-      cipher: AesGcmSettingsCipher(InMemorySecretStore()),
+      cipher: AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase()),
     );
     await writer.saveSettings(SecuritySettings.defaults);
 

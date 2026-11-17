@@ -53,7 +53,8 @@ void main() {
 
   setUp(() {
     db = InMemoryLocalDatabase();
-    cipher = AesGcmSettingsCipher(InMemorySecretStore());
+    cipher = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
     now = DateTime(2026, 10, 22, 12);
   });
 

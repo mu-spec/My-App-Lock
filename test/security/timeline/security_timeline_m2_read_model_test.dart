@@ -105,7 +105,8 @@ VerifiedAttempt _wrong() => VerifiedAttempt(
 
 class _Rig {
   _Rig({int maxSnapshotWaiters = 64, int maxPending = 8}) {
-    final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore());
+    final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore(),
+        database: InMemoryLocalDatabase());
     monitor = _StatusMonitor(
       store: IntruderFailureLogStore(db, cipher: cipher),
       now: () => _t0,

@@ -124,7 +124,8 @@ class _ScriptSettings extends IntruderDefenseSettingsStore {
 
 class _Rig {
   _Rig({bool photo = true, bool alarm = true, int threshold = 1}) {
-    final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore());
+    final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore(),
+        database: InMemoryLocalDatabase());
     settings = _ScriptSettings(db, cipher);
     store = _ScriptStore(db, cipher, log);
     platform = GatedEvidenceService()
@@ -354,7 +355,8 @@ void main() {
         () async {
       final _Rig r = _Rig(alarm: false);
       final InMemoryLocalDatabase jdb = InMemoryLocalDatabase();
-      final SettingsCipher jc = AesGcmSettingsCipher(InMemorySecretStore());
+      final SettingsCipher jc = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
       final SecurityEventJournalStore js =
           SecurityEventJournalStore(jdb, cipher: jc);
       final SecurityEventJournal j = SecurityEventJournal(store: js);

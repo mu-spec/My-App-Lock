@@ -552,8 +552,8 @@ void main() {
     test('v == 3 with the right schema is unsupported (never decoded)',
         () async {
       final InMemoryLocalDatabase db = InMemoryLocalDatabase();
-      final AesGcmSettingsCipher c =
-          AesGcmSettingsCipher(InMemorySecretStore());
+      final AesGcmSettingsCipher c = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
       final SecurityEventJournalStore store =
           SecurityEventJournalStore(db, cipher: null);
       await db.setSetting(SecurityEventJournalStore.storageKey,

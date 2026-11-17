@@ -160,7 +160,8 @@ void main() {
     setUp(() async {
       db = _LogFaultDb();
       final AesGcmSettingsCipher cipher =
-          AesGcmSettingsCipher(InMemorySecretStore());
+          AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
       platform = GatedEvidenceService()
         ..permission = CameraPermissionState.granted;
       final IntruderDefenseSettingsStore settings =

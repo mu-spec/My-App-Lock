@@ -152,7 +152,8 @@ void main() {
 
     setUp(() {
       db = _FaultDb();
-      cipher = AesGcmSettingsCipher(InMemorySecretStore());
+      cipher = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
       monitor = IntruderMonitor(
         store: IntruderFailureLogStore(db, cipher: cipher),
         now: () => _t0,

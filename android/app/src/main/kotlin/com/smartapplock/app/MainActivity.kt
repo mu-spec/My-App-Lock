@@ -169,6 +169,8 @@ class MainActivity : FlutterFragmentActivity() {
         WatcherChannel.register(flutterEngine, this)
         // Phase 12 / M2: owner-opted-in intruder evidence + alarm.
         IntruderEvidenceChannel.register(flutterEngine, this)
+        // Phase 13 / M3 Batch 2: AndroidKeyStore KEK for the data key.
+        KeyWrapChannel.register(flutterEngine)
     }
 
     override fun onRequestPermissionsResult(

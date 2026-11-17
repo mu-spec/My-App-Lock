@@ -274,8 +274,9 @@ void main() {
     test(
         'F-02 cipher encryption throws on append: previous row intact, '
         'loss counted', () async {
-      final _FlakyCipher cipher =
-          _FlakyCipher(AesGcmSettingsCipher(InMemorySecretStore()));
+      final _FlakyCipher cipher = _FlakyCipher(AesGcmSettingsCipher(
+          InMemorySecretStore(),
+          database: InMemoryLocalDatabase()));
       final SecurityEventJournal j = journal(cipher: cipher);
       j.record(SecurityJournalEventType.journalRecovered);
       await j.idle();
@@ -321,7 +322,8 @@ void main() {
 
     group('F-04 corrupt v2 (GCM tamper)', () {
       Future<(SettingsCipher, String)> tampered() async {
-        final SettingsCipher c = AesGcmSettingsCipher(InMemorySecretStore());
+        final SettingsCipher c = AesGcmSettingsCipher(InMemorySecretStore(),
+            database: InMemoryLocalDatabase());
         final SecurityEventJournal w = journal(cipher: c);
         w.recordEvent(
             SecurityJournalEventType.captureSaved, const CaptureSavedFields(1));
@@ -352,7 +354,8 @@ void main() {
       test(
           'decryptable but unparsable (key proven) with quarantine empty: '
           'quarantined first, reinitialized with journalRecovered', () async {
-        final SettingsCipher c = AesGcmSettingsCipher(InMemorySecretStore());
+        final SettingsCipher c = AesGcmSettingsCipher(InMemorySecretStore(),
+            database: InMemoryLocalDatabase());
         final String bad = 'enc:v1:${await c.encryptString('not json')}';
         await db.setSetting(_key, bad);
         final SecurityEventJournal j = journal(cipher: c);
@@ -393,8 +396,9 @@ void main() {
         'capture/alarm behaviour identical to a null observer', () async {
       Future<(List<String>, String)> run({required bool withJournal}) async {
         final InMemoryLocalDatabase evDb = InMemoryLocalDatabase();
-        final SettingsCipher cipher =
-            AesGcmSettingsCipher(InMemorySecretStore());
+        final SettingsCipher cipher = AesGcmSettingsCipher(
+            InMemorySecretStore(),
+            database: InMemoryLocalDatabase());
         final IntruderDefenseSettingsStore settings =
             IntruderDefenseSettingsStore(evDb, cipher);
         await settings.write(const IntruderDefenseSettings(

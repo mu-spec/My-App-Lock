@@ -1,10 +1,10 @@
-// P13/M3 F-KEY-1: OPEN-defect reproducer and credential fail-closed
-// characterization. NOT a fix, and no production code is changed.
+// P13/M3 F-KEY-1: reproducer (FK-R*, FLIPPED by the Batch 2 repair) and
+// credential fail-closed characterization (FK-C*, unchanged).
 //
-// FK-R* tests assert the CURRENT, UNSAFE master-key behaviour of
-// AesGcmSettingsCipher, on purpose. When the owner-approved K-2+ repair
-// lands, each FK-R* test MUST fail and be deliberately flipped (never
-// deleted or weakened): that flip is the regression proof.
+// FK-R* tests asserted the UNSAFE master-key behaviour of
+// AesGcmSettingsCipher, on purpose. Batch 2 (K-2+B-compat repair) made each
+// FK-R* fail; they are now deliberately FLIPPED (never deleted or
+// weakened) and the originals are preserved as sealed historical evidence.
 //
 // FK-C* tests assert what must hold now AND after the repair: unreadable or
 // missing credential state fails closed (no access, no silent reset, no
@@ -20,6 +20,7 @@ import 'package:smart_app_lock/app/app_container.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
 import 'package:smart_app_lock/security/credentials/auth_result.dart';
 import 'package:smart_app_lock/security/credentials/credential_state.dart';
+import 'package:smart_app_lock/security/encryption/master_key_resolver.dart';
 import 'package:smart_app_lock/security/encryption/settings_cipher_impl.dart';
 import 'package:smart_app_lock/security/storage/impl/in_memory_secret_store.dart';
 import 'package:smart_app_lock/security/storage/secret_store.dart';
@@ -64,17 +65,27 @@ class _Secrets implements SecretStore {
 const String _pin = '482915';
 
 void main() {
-  group('FK-R OPEN F-KEY-1 reproducers (assert CURRENT unsafe behaviour)', () {
-    test('FK-R1 two concurrent first uses of ONE cipher create two master '
-        'keys; one first-session ciphertext is undecryptable after restart',
+  // FLIPPED by Batch 2 (owner-approved K-2+B-compat repair). The ORIGINAL
+  // FK-R1..R4 (asserting two keys / replacement / overwrite) are preserved
+  // verbatim as historical evidence in the sealed
+  // Phase13/m3_implementation/E_feature_resumption/F_KEY_1/tests/ copy and
+  // in the Batch 2 evidence folder. Same IDs, same FIRST-LAUNCH setup (no
+  // pre-initialized key); every cipher over one secret store shares one
+  // commitment database, as AppContainer wires it.
+  group('FK-R FLIPPED F-KEY-1 (Batch 2: assert REPAIRED behaviour)', () {
+    test('FK-R1 FLIPPED two concurrent first uses of ONE cipher create ONE '
+        'master key; every first-session ciphertext decrypts after restart',
         () async {
       final _Secrets secrets = _Secrets();
-      final AesGcmSettingsCipher p1 = AesGcmSettingsCipher(secrets);
+      final InMemoryLocalDatabase db = InMemoryLocalDatabase();
+      final AesGcmSettingsCipher p1 =
+          AesGcmSettingsCipher(secrets, database: db);
       final List<String> cts = await Future.wait(<Future<String>>[
         p1.encryptString('row-A'),
         p1.encryptString('row-B'),
       ]);
-      final AesGcmSettingsCipher p2 = AesGcmSettingsCipher(secrets);
+      final AesGcmSettingsCipher p2 =
+          AesGcmSettingsCipher(secrets, database: db);
       int bad = 0;
       for (final String ct in cts) {
         try {
@@ -83,18 +94,20 @@ void main() {
           bad++;
         }
       }
-      expect(secrets.writes, 2, reason: 'OPEN: no single-flight creation');
-      expect(bad, 1, reason: 'OPEN: a losing-key ciphertext was produced');
+      expect(secrets.writes, 1, reason: 'FIXED: single key creation');
+      expect(bad, 0, reason: 'FIXED: no losing-key ciphertext');
     });
 
-    test('FK-R2 two cipher INSTANCES (two engines) over one secret store '
-        'also create two keys', () async {
+    test('FK-R2 FLIPPED two cipher INSTANCES (two engines) over one secret '
+        'store create ONE key (SQLite CAS commitment)', () async {
       final _Secrets secrets = _Secrets();
+      final InMemoryLocalDatabase db = InMemoryLocalDatabase();
       final List<String> cts = await Future.wait(<Future<String>>[
-        AesGcmSettingsCipher(secrets).encryptString('engine-1'),
-        AesGcmSettingsCipher(secrets).encryptString('engine-2'),
+        AesGcmSettingsCipher(secrets, database: db).encryptString('engine-1'),
+        AesGcmSettingsCipher(secrets, database: db).encryptString('engine-2'),
       ]);
-      final AesGcmSettingsCipher after = AesGcmSettingsCipher(secrets);
+      final AesGcmSettingsCipher after =
+          AesGcmSettingsCipher(secrets, database: db);
       int bad = 0;
       for (final String ct in cts) {
         try {
@@ -103,37 +116,47 @@ void main() {
           bad++;
         }
       }
-      expect(secrets.writes, 2);
-      expect(bad, 1, reason: 'OPEN: a per-instance mutex cannot fix this');
+      expect(secrets.writes, 1);
+      expect(bad, 0, reason: 'FIXED: cross-instance commitment');
     });
 
-    test('FK-R3 a DECRYPT with the key missing generates and persists a '
-        'replacement key although encrypted data exists', () async {
+    test('FK-R3 FLIPPED a DECRYPT with the key missing NEVER generates a '
+        'replacement key while encrypted data exists', () async {
       final _Secrets secrets = _Secrets();
-      final String ct =
-          await AesGcmSettingsCipher(secrets).encryptString('existing');
+      final InMemoryLocalDatabase db = InMemoryLocalDatabase();
+      final String ct = await AesGcmSettingsCipher(secrets, database: db)
+          .encryptString('existing');
+      await db.setSetting('probe_row', 'enc:v1:$ct');
       await secrets.inner.delete(_mk); // key lost (e.g. backend reset)
       secrets.writes = 0;
       await expectLater(
-          AesGcmSettingsCipher(secrets).decryptString(ct), throwsA(anything));
-      expect(secrets.writes, 1, reason: 'OPEN: replacement key written');
-      expect(await secrets.inner.read(_mk), isNotNull);
+          AesGcmSettingsCipher(secrets, database: db).decryptString(ct),
+          throwsA(isA<MasterKeyUnavailableException>()));
+      await expectLater(
+          AesGcmSettingsCipher(secrets, database: db).encryptString('new'),
+          throwsA(isA<MasterKeyUnavailableException>()));
+      expect(secrets.writes, 0, reason: 'FIXED: no replacement key');
+      expect(await secrets.inner.read(_mk), isNull);
     });
 
-    test('FK-R4 ONE transient null read OVERWRITES the existing good key '
-        '(the original key is destroyed)', () async {
+    test('FK-R4 FLIPPED ONE transient null read never overwrites the good '
+        'key; the next healthy read decrypts', () async {
       final _Secrets secrets = _Secrets();
-      final String ct =
-          await AesGcmSettingsCipher(secrets).encryptString('existing');
+      final InMemoryLocalDatabase db = InMemoryLocalDatabase();
+      final String ct = await AesGcmSettingsCipher(secrets, database: db)
+          .encryptString('existing');
       final String? original = await secrets.inner.read(_mk);
+      secrets.writes = 0;
       secrets.nullReadsRemaining = 1;
+      final AesGcmSettingsCipher c2 =
+          AesGcmSettingsCipher(secrets, database: db);
       await expectLater(
-          AesGcmSettingsCipher(secrets).decryptString(ct), throwsA(anything));
-      final String? now = await secrets.inner.read(_mk);
-      expect(now, isNot(original), reason: 'OPEN: good key overwritten');
-      // Unrecoverable: even a healthy store can no longer decrypt.
-      await expectLater(
-          AesGcmSettingsCipher(secrets).decryptString(ct), throwsA(anything));
+          c2.decryptString(ct), throwsA(isA<MasterKeyUnavailableException>()));
+      expect(await secrets.inner.read(_mk), original,
+          reason: 'FIXED: good key preserved');
+      expect(secrets.writes, 0);
+      // Not cached as a failure: the SAME instance recovers.
+      expect(await c2.decryptString(ct), 'existing');
     });
   });
 
@@ -204,18 +227,20 @@ void main() {
       expect(s.lockedOutUntil, isNotNull, reason: 'lockout not cleared');
     });
 
-    test('FK-C2 key missing with encrypted settings present: fails closed; '
-        'a replacement key IS generated today (FK-R3, OPEN) but the row is '
-        'never overwritten', () async {
+    // FK-C2 FLIPPED (Batch 2): the original asserted that a replacement key
+    // IS generated (FK-R3 characterization); preserved in the sealed copy.
+    test('FK-C2 FLIPPED key missing with encrypted settings present: fails '
+        'closed; NO replacement key is generated and the row is never '
+        'overwritten', () async {
       final (InMemoryLocalDatabase db, _Secrets secrets, String raw,
           String good) = await enrolled(lockOut: true);
       await secrets.inner.delete(_mk);
       final AppContainer c2 =
           AppContainer.inMemory(database: db, secretStore: secrets);
       await expectFailClosed(c2, db, raw);
-      final String? replacement = await secrets.inner.read(_mk);
-      expect(replacement, isNotNull, reason: 'OPEN FK-R3 characterization');
-      expect(replacement, isNot(good));
+      expect(await secrets.inner.read(_mk), isNull,
+          reason: 'FIXED (Batch 2): no replacement key');
+      expect(secrets.writes, 1, reason: 'only the original creation');
       await secrets.inner.write(_mk, good);
       final CredentialState s = (await AppContainer.inMemory(
                   database: db, secretStore: secrets)

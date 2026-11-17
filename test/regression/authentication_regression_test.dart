@@ -552,7 +552,8 @@ class Harness {
   Harness()
       : database = InMemoryLocalDatabase(),
         secretStore = InMemorySecretStore() {
-    final AesGcmSettingsCipher cipher = AesGcmSettingsCipher(secretStore);
+    final AesGcmSettingsCipher cipher =
+        AesGcmSettingsCipher(secretStore, database: database);
     settings = SecuritySettingsRepositoryImpl(database, cipher: cipher);
   }
 

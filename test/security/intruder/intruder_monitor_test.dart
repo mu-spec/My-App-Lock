@@ -389,7 +389,8 @@ void main() {
   group('encryption at rest and privacy', () {
     test('the stored log is AES-GCM ciphertext that hides package names',
         () async {
-      final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore());
+      final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
       final IntruderFailureLogStore enc =
           IntruderFailureLogStore(db, cipher: cipher);
       final IntruderMonitor m = build(s: enc);
@@ -463,7 +464,8 @@ void main() {
     // unavailable/wrong key, so it is UNREADABLE (never corrupt): nothing is
     // quarantined or replaced. (Previously: treated as corrupt.)
     test('a tampered ciphertext is unreadable, never corrupt (GCM)', () async {
-      final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore());
+      final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
       final IntruderFailureLogStore enc =
           IntruderFailureLogStore(db, cipher: cipher);
       final IntruderMonitor m = build(s: enc);
@@ -488,7 +490,8 @@ void main() {
 
     test('a decryptable but unparsable value is corrupt (key proven)',
         () async {
-      final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore());
+      final SettingsCipher cipher = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
       await db.setSetting(
           _key, 'enc:v1:${await cipher.encryptString('not json')}');
       expect(await IntruderFailureLogStore(db, cipher: cipher).read(),
@@ -504,7 +507,8 @@ void main() {
       );
       final IntruderFailureLogStore enc = IntruderFailureLogStore(
         db,
-        cipher: AesGcmSettingsCipher(InMemorySecretStore()),
+        cipher: AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase()),
       );
       expect(await enc.read(), isA<IntruderLogCorrupt>());
     });

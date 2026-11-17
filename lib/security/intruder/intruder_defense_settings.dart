@@ -12,7 +12,10 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 
+import 'package:cryptography/cryptography.dart';
+
 import '../../data/storage/local_database.dart';
+import '../encryption/master_key_resolver.dart';
 import '../encryption/settings_cipher.dart';
 
 /// The owner's intruder-defense choices. Everything defaults to off.
@@ -133,10 +136,28 @@ class IntruderDefenseSettingsStore {
       return const IntruderSettingsRead(
           IntruderDefenseSettings.disabled, IntruderSettingsHealth.corrupt);
     }
+    final String clear;
+    try {
+      clear = await _cipher.decryptString(raw.substring(_prefix.length));
+    } on MasterKeyUnavailableException {
+      // F-KEY-1 (Batch 2): no verified key right now. UNREADABLE, never
+      // corrupt: the record is not the problem and is never replaced.
+      return const IntruderSettingsRead(
+          IntruderDefenseSettings.disabled, IntruderSettingsHealth.unreadable);
+    } on SecretBoxAuthenticationError {
+      // Wrong/missing key and damaged bytes are indistinguishable under
+      // AES-GCM (same rule as the R9 stores): unreadable, preserved.
+      return const IntruderSettingsRead(
+          IntruderDefenseSettings.disabled, IntruderSettingsHealth.unreadable);
+    } catch (_) {
+      // Structurally impossible ciphertext (not base64 / too short): no key
+      // can ever open it.
+      return const IntruderSettingsRead(
+          IntruderDefenseSettings.disabled, IntruderSettingsHealth.corrupt);
+    }
     final Object? decoded;
     try {
-      decoded = jsonDecode(
-          await _cipher.decryptString(raw.substring(_prefix.length)));
+      decoded = jsonDecode(clear);
     } catch (_) {
       return const IntruderSettingsRead(
           IntruderDefenseSettings.disabled, IntruderSettingsHealth.corrupt);

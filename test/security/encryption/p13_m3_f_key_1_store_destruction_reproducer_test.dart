@@ -15,7 +15,9 @@
 //  FK-S5/S6  G-4 interrupted repair: a quarantine that already holds the
 //         EXACT bytes allows the repair; a quarantine read failure refuses.
 //
-// F-KEY-1 itself (key race / mint on absent key) stays OPEN: see FK-R*.
+// F-KEY-1 key race / mint on absent key: repaired on host in Batch 2 (see
+// FK-R* flips and p13_m3_b2_master_key_resolver_test.dart); device QA
+// pending.
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -37,6 +39,13 @@ import 'package:smart_app_lock/security/timeline/security_journal_event.dart';
 import '../../support/intruder_fixtures.dart';
 
 const String _mk = SecretKeys.settingsMasterKey;
+
+/// Batch 2: the faulty "process-2" cipher gets its OWN commitment database,
+/// so the store still receives exactly what it received before the master
+/// key repair (a real AES-GCM authentication failure for "wrong key", a
+/// key-read error for "throws"). With a SHARED commitment the resolver
+/// refuses even earlier (KeyMismatch / storageError): see FK-S8.
+InMemoryLocalDatabase _foreignDb() => InMemoryLocalDatabase();
 const String _wrongKey = 'BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=';
 
 /// Process-2 view of the persisted secret store with one key fault.
@@ -115,7 +124,7 @@ Future<(InMemoryLocalDatabase, InMemorySecretStore, String)> _seedLog(
   final InMemorySecretStore secrets = InMemorySecretStore();
   final IntruderMonitor m1 = IntruderMonitor(
       store:
-          IntruderFailureLogStore(db, cipher: AesGcmSettingsCipher(secrets)));
+          IntruderFailureLogStore(db, cipher: AesGcmSettingsCipher(secrets, database: db)));
   m1.onVerifiedAttempt(_fail('a'));
   m1.onVerifiedAttempt(_fail('b'));
   await m1.idle();
@@ -131,7 +140,7 @@ void main() {
       final InMemoryLocalDatabase db = InMemoryLocalDatabase();
       final InMemorySecretStore secrets = InMemorySecretStore();
       final IntruderEvidenceStore p1 =
-          IntruderEvidenceStore(db, AesGcmSettingsCipher(secrets));
+          IntruderEvidenceStore(db, AesGcmSettingsCipher(secrets, database: db));
       final Uint8List jpeg = jpegWithMetadata();
       expect(await p1.save(seq: 1, jpeg: jpeg), EvidenceSaveResult.saved);
       expect(await p1.save(seq: 2, jpeg: jpeg), EvidenceSaveResult.saved);
@@ -142,7 +151,7 @@ void main() {
 
       final _KeyFault fault = _KeyFault(secrets, throws: throws);
       final IntruderEvidenceStore p2 =
-          IntruderEvidenceStore(db, AesGcmSettingsCipher(fault));
+          IntruderEvidenceStore(db, AesGcmSettingsCipher(fault, database: _foreignDb()));
       await p2.startupMaintenance();
       expect(await p2.health(), EvidenceIndexHealth.unreadable);
       expect(await p2.list(), isEmpty, reason: 'unreadable, never trusted');
@@ -158,7 +167,7 @@ void main() {
       expect(fault.keyWrites, 0);
 
       final IntruderEvidenceStore p3 =
-          IntruderEvidenceStore(db, AesGcmSettingsCipher(secrets));
+          IntruderEvidenceStore(db, AesGcmSettingsCipher(secrets, database: db));
       expect((await p3.list()).map((EvidenceItem e) => e.seq), <int>[1, 2]);
       expect(await p3.readImage(1), isNotNull);
       expect(await p3.readImage(2), isNotNull);
@@ -174,7 +183,7 @@ void main() {
     final _RecordingListener l = _RecordingListener();
     final IntruderMonitor m2 = IntruderMonitor(
         store: IntruderFailureLogStore(db,
-            cipher: AesGcmSettingsCipher(_KeyFault(secrets))))
+            cipher: AesGcmSettingsCipher(_KeyFault(secrets), database: _foreignDb())))
       ..listener = l;
     m2.onVerifiedAttempt(_fail('c'));
     await m2.idle();
@@ -190,7 +199,7 @@ void main() {
     expect(m2.status.health, IntruderMonitorHealth.storageError);
     expect(await m2.snapshot(), isNull, reason: 'unavailable, not empty');
     final IntruderLogRead r = await IntruderFailureLogStore(db,
-            cipher: AesGcmSettingsCipher(secrets))
+            cipher: AesGcmSettingsCipher(secrets, database: db))
         .read();
     expect((r as IntruderLogLoaded).log.events.map((e) => e.verificationId),
         <String>['a', 'b'], reason: 'right key recovers the history');
@@ -202,7 +211,7 @@ void main() {
     final InMemorySecretStore secrets = InMemorySecretStore();
     final SecurityEventJournal j1 = SecurityEventJournal(
         store: SecurityEventJournalStore(db,
-            cipher: AesGcmSettingsCipher(secrets)));
+            cipher: AesGcmSettingsCipher(secrets, database: db)));
     j1.record(SecurityJournalEventType.journalRecovered);
     await j1.idle();
     final String good =
@@ -211,7 +220,7 @@ void main() {
 
     final SecurityEventJournal j2 = SecurityEventJournal(
         store: SecurityEventJournalStore(db,
-            cipher: AesGcmSettingsCipher(_KeyFault(secrets))));
+            cipher: AesGcmSettingsCipher(_KeyFault(secrets), database: _foreignDb())));
     await j2.startup();
     j2.record(SecurityJournalEventType.journalRecovered);
     await j2.idle();
@@ -233,7 +242,7 @@ void main() {
         await _seedLog();
     final IntruderMonitor m2 = IntruderMonitor(
         store: IntruderFailureLogStore(db,
-            cipher: AesGcmSettingsCipher(_KeyFault(secrets, throws: true))));
+            cipher: AesGcmSettingsCipher(_KeyFault(secrets, throws: true), database: _foreignDb())));
     m2.onVerifiedAttempt(_fail('c'));
     await m2.idle();
     expect(await db.getSetting(IntruderFailureLogStore.storageKey), good);
@@ -250,7 +259,7 @@ void main() {
           await _seedLog();
       final SecurityEventJournal j1 = SecurityEventJournal(
           store: SecurityEventJournalStore(db,
-              cipher: AesGcmSettingsCipher(secrets)));
+              cipher: AesGcmSettingsCipher(secrets, database: db)));
       j1.record(SecurityJournalEventType.journalRecovered);
       await j1.idle();
       final String goodJ =
@@ -263,13 +272,13 @@ void main() {
       final _RecordingListener l = _RecordingListener();
       final IntruderMonitor m2 = IntruderMonitor(
           store: IntruderFailureLogStore(db,
-              cipher: AesGcmSettingsCipher(fault)))
+              cipher: AesGcmSettingsCipher(fault, database: _foreignDb())))
         ..listener = l;
       m2.onVerifiedAttempt(_fail('c'));
       await m2.idle();
       final SecurityEventJournal j2 = SecurityEventJournal(
           store: SecurityEventJournalStore(db,
-              cipher: AesGcmSettingsCipher(fault)));
+              cipher: AesGcmSettingsCipher(fault, database: _foreignDb())));
       await j2.startup();
       j2.record(SecurityJournalEventType.journalRecovered);
       await j2.idle();
@@ -290,13 +299,13 @@ void main() {
 
       // The right key recovers both histories, byte-for-byte.
       final IntruderLogRead r = await IntruderFailureLogStore(db,
-              cipher: AesGcmSettingsCipher(secrets))
+              cipher: AesGcmSettingsCipher(secrets, database: db))
           .read();
       expect((r as IntruderLogLoaded).log.events.map((e) => e.verificationId),
           <String>['a', 'b']);
       expect(
           await SecurityEventJournalStore(db,
-                  cipher: AesGcmSettingsCipher(secrets))
+                  cipher: AesGcmSettingsCipher(secrets, database: db))
               .read(),
           isA<SecurityJournalLoaded>());
     });
@@ -359,4 +368,58 @@ void main() {
         'damaged-j');
     expect(j.health, SecurityJournalHealth.storageError);
   });
+
+  // Batch 2: the same faults with the SHARED key commitment. The resolver
+  // refuses before any decrypt (wrong key = KeyMismatch, read throws =
+  // storageError); every store still preserves every byte, writes no key,
+  // and the right key recovers everything.
+  for (final bool throws in <bool>[true, false]) {
+    final String mode = throws ? 'key read throws' : 'wrong key';
+    test('FK-S8 Batch 2 shared commitment ($mode): evidence, log and journal '
+        'are preserved; no key is written; the right key recovers', () async {
+      final (InMemoryLocalDatabase db, InMemorySecretStore secrets, String good) =
+          await _seedLog();
+      final IntruderEvidenceStore e1 =
+          IntruderEvidenceStore(db, AesGcmSettingsCipher(secrets, database: db));
+      expect(await e1.save(seq: 1, jpeg: jpegWithMetadata()),
+          EvidenceSaveResult.saved);
+      final SecurityEventJournal j1 = SecurityEventJournal(
+          store: SecurityEventJournalStore(db,
+              cipher: AesGcmSettingsCipher(secrets, database: db)));
+      j1.record(SecurityJournalEventType.journalRecovered);
+      await j1.idle();
+      final Map<String, String> before =
+          Map<String, String>.of(await db.getAllSettings());
+
+      final _KeyFault fault = _KeyFault(secrets, throws: throws);
+      final AesGcmSettingsCipher fc =
+          AesGcmSettingsCipher(fault, database: db);
+      final IntruderMonitor m2 =
+          IntruderMonitor(store: IntruderFailureLogStore(db, cipher: fc));
+      m2.onVerifiedAttempt(_fail('c'));
+      await m2.idle();
+      final IntruderEvidenceStore e2 = IntruderEvidenceStore(db, fc);
+      await e2.startupMaintenance();
+      expect(await e2.health(), EvidenceIndexHealth.unreadable);
+      expect(await e2.sweepOrphans(), 0);
+      final SecurityEventJournal j2 = SecurityEventJournal(
+          store: SecurityEventJournalStore(db, cipher: fc));
+      await j2.startup();
+      j2.record(SecurityJournalEventType.journalRecovered);
+      await j2.idle();
+
+      expect(await db.getAllSettings(), before, reason: 'nothing changed');
+      expect(fault.keyWrites, 0);
+      expect(m2.status.health, IntruderMonitorHealth.storageError);
+      expect(j2.health, SecurityJournalHealth.storageError);
+      expect(await db.getSetting(IntruderFailureLogStore.storageKey), good);
+
+      final AesGcmSettingsCipher ok = AesGcmSettingsCipher(secrets, database: db);
+      final IntruderLogRead r =
+          await IntruderFailureLogStore(db, cipher: ok).read();
+      expect((r as IntruderLogLoaded).log.events.map((e) => e.verificationId),
+          <String>['a', 'b']);
+      expect((await IntruderEvidenceStore(db, ok).list()).single.seq, 1);
+    });
+  }
 }

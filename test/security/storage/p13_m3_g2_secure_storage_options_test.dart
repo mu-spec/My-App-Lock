@@ -16,6 +16,7 @@ import 'package:flutter_secure_storage_platform_interface/flutter_secure_storage
 import 'package:smart_app_lock/security/encryption/settings_cipher_impl.dart';
 import 'package:smart_app_lock/security/storage/impl/flutter_secure_secret_store.dart';
 import 'package:smart_app_lock/security/storage/secret_store.dart';
+import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
 
 class _CapturePlatform extends FlutterSecureStoragePlatform {
   final Map<String, String> data = <String, String>{};
@@ -118,15 +119,17 @@ void main() {
 
   test('G2-3 a failing platform read surfaces as an error: the master key is '
       'neither deleted nor replaced, ciphertext stays decryptable', () async {
+    // Batch 2: every cipher over one secret store shares one commitment DB.
+    final InMemoryLocalDatabase db = InMemoryLocalDatabase();
     final AesGcmSettingsCipher c1 =
-        AesGcmSettingsCipher(FlutterSecureSecretStore());
+        AesGcmSettingsCipher(FlutterSecureSecretStore(), database: db);
     final String ct = await c1.encryptString('credential-row');
     final String key = platform.data[SecretKeys.settingsMasterKey]!;
     final int writesBefore = platform.writes;
 
     platform.failReads = true;
     final AesGcmSettingsCipher c2 =
-        AesGcmSettingsCipher(FlutterSecureSecretStore());
+        AesGcmSettingsCipher(FlutterSecureSecretStore(), database: db);
     await expectLater(c2.decryptString(ct), throwsA(anything));
     await expectLater(c2.encryptString('x'), throwsA(anything));
     expect(platform.writes, writesBefore, reason: 'no replacement key');
@@ -135,7 +138,7 @@ void main() {
 
     platform.failReads = false;
     final AesGcmSettingsCipher c3 =
-        AesGcmSettingsCipher(FlutterSecureSecretStore());
+        AesGcmSettingsCipher(FlutterSecureSecretStore(), database: db);
     expect(await c3.decryptString(ct), 'credential-row');
   });
 }

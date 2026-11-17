@@ -250,7 +250,9 @@ void main() {
     setUp(() async {
       db = _GateDb();
       s = IntruderEvidenceStore(
-          db, AesGcmSettingsCipher(InMemorySecretStore()));
+          db,
+          AesGcmSettingsCipher(InMemorySecretStore(),
+              database: InMemoryLocalDatabase()));
       expect(await s.save(seq: 1, jpeg: jpegWithMetadata()),
           EvidenceSaveResult.saved);
       expect(await s.save(seq: 2, jpeg: jpegWithMetadata()),

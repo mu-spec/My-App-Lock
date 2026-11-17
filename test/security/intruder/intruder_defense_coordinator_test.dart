@@ -130,7 +130,8 @@ void main() {
 
   setUp(() {
     db = InMemoryLocalDatabase();
-    cipher = AesGcmSettingsCipher(InMemorySecretStore());
+    cipher = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
     platform = GatedEvidenceService()
       ..permission = CameraPermissionState.granted;
     settings = IntruderDefenseSettingsStore(db, cipher);

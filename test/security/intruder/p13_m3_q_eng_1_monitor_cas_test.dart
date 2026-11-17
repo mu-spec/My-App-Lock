@@ -548,7 +548,8 @@ void main() {
         'still never lose events', () async {
       final _QDb db = _QDb();
       final AesGcmSettingsCipher cipher =
-          AesGcmSettingsCipher(InMemorySecretStore());
+          AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
       // The master key exists before any failed attempt can occur (a
       // credential must be enrolled first). Its lazy FIRST creation is not
       // concurrency-safe: finding F-KEY-1, characterized separately.
