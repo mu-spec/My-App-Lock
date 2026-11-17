@@ -732,7 +732,9 @@ void main() {
     });
 
     test(
-        'MIG-4 newer documents are byte-identical: log v3, journal v4, '
+        // Batch 4 (disclosed re-baseline): journal v4 is now readable (v3 +
+        // clear marker); the first newer journal is v5.
+        'MIG-4 newer documents are byte-identical: log v3, journal v5, '
         'evidence v3', () async {
       final String log = jsonEncode(<String, Object?>{
         'schema': IntruderFailureLog.schema,
@@ -740,7 +742,7 @@ void main() {
       });
       final String jr = jsonEncode(<String, Object?>{
         'schema': SecurityJournalDocument.schema,
-        'v': 4,
+        'v': 5,
       });
       final String ev =
           'enc:v1:${await cipher.encryptString('{"v":3,"items":[]}')}';

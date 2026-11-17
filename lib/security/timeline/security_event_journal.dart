@@ -93,6 +93,23 @@ enum SecurityJournalAvailability {
   unreadable,
 }
 
+/// Batch 4: result of a Clear History journal step.
+enum HistoryClearJournalResult {
+  /// Durably written (or already in the requested state: idempotent).
+  committed,
+
+  /// Not written: the journal is read-only/unsupported/unreadable, the
+  /// marker is invalid, or (finish) the marker was replaced or is gone.
+  refused,
+
+  /// Not written: the owner session ended just before the write.
+  cancelled,
+
+  /// The write failed (it may or may not have committed; the next read
+  /// shows which — either way the state is consistent).
+  failed,
+}
+
 /// Read result for the timeline. Never contains raw stored data.
 final class SecurityJournalView {
   const SecurityJournalView({
@@ -328,6 +345,112 @@ class SecurityEventJournal
     return waiter.future;
   }
 
+  // -- Batch 4: Clear History -----------------------------------------------
+
+  /// Step (a): ONE write that removes every journal event except outcomes
+  /// outside [marker]'s cleared set (an outcome of an attempt after the cut)
+  /// and appends [marker] (`pending`), replacing any earlier clear marker.
+  /// `nextSeq`, `discarded`, `lost`, the health / storage marks and the
+  /// suppressed count are kept (integrity disclosures, not history). The row
+  /// is re-read first (never written from a cached copy); [stillValid] is
+  /// evaluated synchronously immediately before the write. Never throws.
+  Future<HistoryClearJournalResult> beginHistoryClear(
+    HistoryClearedFields marker, {
+    bool Function()? stillValid,
+  }) {
+    final Completer<HistoryClearJournalResult> out =
+        Completer<HistoryClearJournalResult>();
+    _enqueue(() async {
+      try {
+        if (!marker.isValid || !marker.pending) {
+          out.complete(HistoryClearJournalResult.refused);
+          return;
+        }
+        _cache = null;
+        final SecurityJournalDocument? doc = await _ensureLoaded();
+        if (doc == null) {
+          out.complete(HistoryClearJournalResult.refused);
+          return;
+        }
+        final SecurityJournalDocument base = _withUpgradeMarker(doc);
+        final SecurityJournalDocument next = base.copyWith(
+          nextSeq: base.nextSeq + 1,
+          events: <SecurityJournalEvent>[
+            for (final SecurityJournalEvent e in base.events)
+              if (e.type.isOutcome &&
+                  !marker.clearsOutcome(e.fields!.tgen, e.fields!.trig!))
+                e,
+            SecurityJournalEvent(
+              seq: base.nextSeq,
+              at: _now(),
+              type: SecurityJournalEventType.historyCleared,
+              fields: marker,
+            ),
+          ],
+        );
+        if (stillValid != null && !stillValid()) {
+          out.complete(HistoryClearJournalResult.cancelled);
+          return;
+        }
+        await _persistBounded(next);
+        out.complete(HistoryClearJournalResult.committed);
+      } catch (_) {
+        if (!out.isCompleted) out.complete(HistoryClearJournalResult.failed);
+        rethrow;
+      }
+    });
+    return out.future;
+  }
+
+  /// Step (d): flips the marker with journal seq [markerSeq] to `done` and
+  /// removes any outcome of its cleared set that was recorded meanwhile.
+  /// Refused when that marker is gone or was replaced by a newer clear.
+  /// Idempotent: an already-done marker with nothing to remove is not
+  /// rewritten. Never throws.
+  Future<HistoryClearJournalResult> completeHistoryClear(
+    int markerSeq, {
+    bool Function()? stillValid,
+  }) {
+    final Completer<HistoryClearJournalResult> out =
+        Completer<HistoryClearJournalResult>();
+    _enqueue(() async {
+      try {
+        _cache = null;
+        final SecurityJournalDocument? doc =
+            await _ensureLoaded(createIfMissing: false);
+        final SecurityJournalEvent? m = doc?.historyMarker;
+        if (doc == null || m == null || m.seq != markerSeq) {
+          out.complete(HistoryClearJournalResult.refused);
+          return;
+        }
+        final HistoryClearedFields f = m.fields! as HistoryClearedFields;
+        final List<SecurityJournalEvent> events = <SecurityJournalEvent>[
+          for (final SecurityJournalEvent e in doc.events)
+            if (identical(e, m))
+              SecurityJournalEvent(
+                  seq: m.seq, at: m.at, type: m.type, fields: f.done())
+            else if (!(e.type.isOutcome &&
+                f.clearsOutcome(e.fields!.tgen, e.fields!.trig!)))
+              e,
+        ];
+        if (!f.pending && events.length == doc.events.length) {
+          out.complete(HistoryClearJournalResult.committed);
+          return;
+        }
+        if (stillValid != null && !stillValid()) {
+          out.complete(HistoryClearJournalResult.cancelled);
+          return;
+        }
+        await _persistBounded(doc.copyWith(events: events));
+        out.complete(HistoryClearJournalResult.committed);
+      } catch (_) {
+        if (!out.isCompleted) out.complete(HistoryClearJournalResult.failed);
+        rethrow;
+      }
+    });
+    return out.future;
+  }
+
   // -- queue ----------------------------------------------------------------
 
   /// Bounded enqueue for M2 producers: a full queue counts the event as
@@ -465,6 +588,15 @@ class SecurityEventJournal
       }
       final int? trig = fields.trig;
       final String? family = fields.type.terminalFamily;
+      final SecurityEventFields? cleared = doc.historyMarker?.fields;
+      if (trig != null &&
+          fields.type.isOutcome &&
+          cleared is HistoryClearedFields &&
+          cleared.clearsOutcome(fields.tgen, trig)) {
+        // Batch 4: an outcome of an attempt the owner cleared (it arrived
+        // late) is never stored: cleared history never reappears.
+        return;
+      }
       if (trig != null && family != null) {
         // Batch 3: identity (family, tgen, trig); legacy and generation
         // outcomes never match each other.
@@ -750,9 +882,15 @@ class SecurityEventJournal
     int dropped = 0;
     // Age retention drops only events OLDER than the cutoff. Events stamped
     // in the future (clock moved backwards) are kept, never purged.
+    // Batch 4: the clear marker is exempt from age, count and size bounds.
+    bool exempt(SecurityJournalEvent e) =>
+        e.type == SecurityJournalEventType.historyCleared;
+    int oldestBounded() =>
+        events.indexWhere((SecurityJournalEvent e) => !exempt(e));
     final DateTime cutoff = _now().subtract(retention);
     final int before = events.length;
-    events.removeWhere((SecurityJournalEvent e) => e.at.isBefore(cutoff));
+    events.removeWhere(
+        (SecurityJournalEvent e) => !exempt(e) && e.at.isBefore(cutoff));
     dropped += before - events.length;
     // M2 health quota: the oldest protection-health events go first.
     int health = events
@@ -765,8 +903,8 @@ class SecurityEventJournal
       health--;
       dropped++;
     }
-    while (events.length > maxEvents) {
-      events.removeAt(0);
+    while (events.length > maxEvents && oldestBounded() >= 0) {
+      events.removeAt(oldestBounded());
       dropped++;
     }
     SecurityJournalDocument next() => doc.copyWith(
@@ -776,10 +914,10 @@ class SecurityEventJournal
           events: List<SecurityJournalEvent>.unmodifiable(events),
         );
     SecurityJournalDocument out = next();
-    while (events.isNotEmpty &&
+    while (oldestBounded() >= 0 &&
         utf8.encode(SecurityEventJournalStore.encode(out)).length >
             maxEncodedBytes) {
-      events.removeAt(0);
+      events.removeAt(oldestBounded());
       dropped++;
       out = next();
     }

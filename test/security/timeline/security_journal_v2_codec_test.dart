@@ -447,6 +447,9 @@ void main() {
             'protectionHealth',
             'storageUnavailable',
             'storageRestored',
+            // Batch 4 (disclosed): one APPENDED type, decodable only in a v4
+            // journal (= v3 + exactly one clear marker); nothing above moved.
+            'historyCleared',
           ]);
       expect(CaptureWhy.values.map((CaptureWhy e) => e.name).toList(), <String>[
         'permission',
@@ -559,7 +562,9 @@ void main() {
     });
 
     // Batch 3: v3 is now current; v4 is the first unsupported version.
-    test('v == 4 with the right schema is unsupported (never decoded)',
+    // Batch 4 (disclosed re-baseline): v4 is now readable (v3 + clear
+    // marker), so the first "newer" version is 5.
+    test('v == 5 with the right schema is unsupported (never decoded)',
         () async {
       final InMemoryLocalDatabase db = InMemoryLocalDatabase();
       final AesGcmSettingsCipher c = AesGcmSettingsCipher(InMemorySecretStore(),
@@ -567,10 +572,10 @@ void main() {
       final SecurityEventJournalStore store =
           SecurityEventJournalStore(db, cipher: null);
       await db.setSetting(SecurityEventJournalStore.storageKey,
-          jsonEncode(<String, Object?>{...doc2(<Object?>[]), 'v': 4}));
+          jsonEncode(<String, Object?>{...doc2(<Object?>[]), 'v': 5}));
       final SecurityJournalRead r = await store.read();
       expect(r, isA<SecurityJournalUnsupported>());
-      expect((r as SecurityJournalUnsupported).version, 4);
+      expect((r as SecurityJournalUnsupported).version, 5);
       expect(c, isNotNull);
     });
   });

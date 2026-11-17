@@ -46,6 +46,7 @@ import '../security/intruder/intruder_evidence_service.dart';
 import '../security/intruder/intruder_evidence_store.dart';
 import '../security/intruder/intruder_monitor.dart';
 import '../security/intruder/intruder_owner_session.dart';
+import '../security/history/history_clear_service.dart';
 import '../security/timeline/security_event_journal.dart';
 import '../security/timeline/security_event_journal_store.dart';
 import '../security/timeline/intruder_outcome_journal_adapter.dart';
@@ -197,6 +198,13 @@ class AppContainer {
       database: _database,
       storageSampler: securityStorageSampler,
       protectedApps: protectedApps,
+    );
+    // P13/M3 Batch 4: owner Clear History (timeline action only).
+    historyClear = HistoryClearService(
+      monitor: intruderMonitor,
+      journal: securityJournal,
+      evidence: intruderEvidence,
+      liveGen: () => intruderDefense.currentGen,
     );
     securityJournalStartup =
         securityJournal.startup().catchError((Object _) {});
@@ -462,6 +470,9 @@ class AppContainer {
   /// Phase 13 / M1 — read-only timeline model over the failure log and the
   /// journal.
   late final SecurityTimelineReader securityTimeline;
+
+  /// P13/M3 Batch 4 — owner Clear History (Security timeline action only).
+  late final HistoryClearService historyClear;
 
   /// Phase 13 / M2 — failed-unlock history storage sampler (provable
   /// transitions only; feeds the journal).

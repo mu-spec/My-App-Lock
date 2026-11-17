@@ -15,6 +15,13 @@
 // documents (a v2 build reads a v3 journal as unsupported, read-only). The
 // v2 -> v3 step adds no marker event (journalUpgraded stays `from: 1`).
 //
+// P13/M3 Batch 4 (Clear History) — version 4 = version 3 plus exactly ONE
+// `historyCleared` marker. A journal is written as v4 only while it holds
+// that marker (and it always does once cleared: the marker is exempt from
+// retention and caps and is only ever replaced); every other journal stays
+// v3, so a Batch-3 build is affected only after a clear, and then reads the
+// journal as unsupported (read-only, never overwritten), never as corrupt.
+//
 // Privacy (TL-4 / correction F): anomalies only. There is deliberately no
 // type for successful unlocks or routine usage, and no field may carry
 // credential material, pixels, package names or free-form text. Every
@@ -56,7 +63,11 @@ enum SecurityJournalEventType {
   storageUnavailable,
 
   /// M2: failed-unlock history could be read again.
-  storageRestored;
+  storageRestored,
+
+  /// Batch 4: the owner cleared history (exactly one in a v4 journal;
+  /// exempt from age retention and caps; replaced by the next clear).
+  historyCleared;
 
   /// Types a version-1 document may contain.
   bool get inV1 => this == journalStarted || this == journalRecovered;
@@ -65,7 +76,8 @@ enum SecurityJournalEventType {
   bool get isMarker =>
       this == journalStarted ||
       this == journalRecovered ||
-      this == journalUpgraded;
+      this == journalUpgraded ||
+      this == historyCleared;
 
   /// Intruder-response outcomes (carry `trig`; `(type, trig)` is unique in
   /// a journal — E-5).
@@ -137,6 +149,15 @@ enum HCode {
 /// Provable storage-unavailability kinds.
 enum StoreKind { failing, readOnly }
 
+/// Batch 4: what a Clear History removed (`history+photos` = the owner also
+/// chose to delete the intruder photos of the cleared attempts).
+enum HistoryClearScope { history, historyPhotos }
+
+/// Batch 4: `pending` until every step of the clear committed (a crash or an
+/// ended session leaves it pending: the cleared set stays hidden and the
+/// owner is asked to finish), then `done`.
+enum HistoryClearState { pending, done }
+
 /// Persisted last-known storage state (`ss`).
 enum StoreState { ok, failing, readOnly }
 
@@ -207,6 +228,7 @@ sealed class SecurityEventFields {
     bool present,
     Object? raw, {
     bool v3 = false,
+    bool v4 = false,
   }) {
     final bool needed = switch (type) {
       SecurityJournalEventType.journalStarted ||
@@ -280,6 +302,30 @@ sealed class SecurityEventFields {
         return StorageRestoredFields(
           _enumByName(StorageSource.values, raw['src'], 'storage source'),
         );
+      case SecurityJournalEventType.historyCleared:
+        if (!v4) throw const FormatException('historyCleared before v4');
+        _exactKeys(raw, const <String>{'scope', 'st', 'cut'},
+            const <String>{'cg', 'bc'});
+        final HistoryClearScope scope =
+            _enumByName(HistoryClearScope.values, raw['scope'], 'clear scope');
+        final bool photos = scope == HistoryClearScope.historyPhotos;
+        if (photos != raw.containsKey('bc')) {
+          throw const FormatException('clear bc invalid');
+        }
+        final Object? cg = raw['cg'];
+        if (raw.containsKey('cg') &&
+            (cg is! String || !_tgenPattern.hasMatch(cg))) {
+          throw const FormatException('clear cg invalid');
+        }
+        return HistoryClearedFields(
+          scope: scope,
+          state: _enumByName(HistoryClearState.values, raw['st'], 'clear st'),
+          cut: _intIn(raw['cut'], securityJournalMaxSafeInt, 'cut'),
+          cutGen: cg as String?,
+          bidCut: photos
+              ? _intIn(raw['bc'], securityJournalMaxSafeInt, 'bc')
+              : null,
+        );
     }
   }
 
@@ -343,6 +389,83 @@ final class JournalUpgradedFields extends SecurityEventFields {
 
   @override
   Map<String, Object?> toJson() => <String, Object?>{'from': 1};
+}
+
+/// Batch 4 (Clear History). The cleared set C is fixed when the marker is
+/// written and never re-derived:
+///  * failed attempts: those of generation [cutGen] with `seq < cut`
+///    (including the legacy attempts kept in that generation's log); with no
+///    [cutGen] (no generation-bearing history existed) no attempt;
+///  * outcomes: every legacy outcome, and those with `tgen == cutGen` and
+///    `trig < cut`;
+///  * photos ([bidCut], history+photos only): every legacy photo, those of
+///    [cutGen] with `seq < cut`, and those of any other generation saved
+///    before the clear (`bid < bidCut`).
+/// Anything recorded after the cut (a later seq, a later generation, a later
+/// photo id) is never in C: it is never hidden and never deleted.
+final class HistoryClearedFields extends SecurityEventFields {
+  const HistoryClearedFields({
+    required this.scope,
+    required this.state,
+    required this.cut,
+    this.cutGen,
+    this.bidCut,
+  });
+
+  final HistoryClearScope scope;
+  final HistoryClearState state;
+  final int cut;
+  final String? cutGen;
+  final int? bidCut;
+
+  bool get photos => scope == HistoryClearScope.historyPhotos;
+  bool get pending => state == HistoryClearState.pending;
+
+  HistoryClearedFields done() => HistoryClearedFields(
+      scope: scope,
+      state: HistoryClearState.done,
+      cut: cut,
+      cutGen: cutGen,
+      bidCut: bidCut);
+
+  /// Attempt [seq] of a failure log whose generation is [logGen].
+  bool clearsAttempt(String? logGen, int seq) =>
+      cutGen != null && logGen == cutGen && seq < cut;
+
+  /// Outcome of trigger ([tgen], [trig]).
+  bool clearsOutcome(String? tgen, int trig) =>
+      tgen == null || (tgen == cutGen && trig < cut);
+
+  /// Photo ([gen], [seq], [bid]); legacy photos have no [gen] / [bid].
+  bool clearsPhoto(String? gen, int seq, int? bid) {
+    if (!photos) return false;
+    if (gen == null || bid == null) return true;
+    if (gen == cutGen) return seq < cut;
+    return bid < bidCut!;
+  }
+
+  @override
+  SecurityJournalEventType get type => SecurityJournalEventType.historyCleared;
+
+  @override
+  bool get isValid =>
+      cut >= 0 &&
+      cut <= securityJournalMaxSafeInt &&
+      _tgenOk(cutGen) &&
+      (photos
+          ? bidCut != null &&
+              bidCut! >= 0 &&
+              bidCut! <= securityJournalMaxSafeInt
+          : bidCut == null);
+
+  @override
+  Map<String, Object?> toJson() => <String, Object?>{
+        'scope': scope.name,
+        'st': state.name,
+        'cut': cut,
+        if (cutGen != null) 'cg': cutGen,
+        if (bidCut != null) 'bc': bidCut,
+      };
 }
 
 final class CaptureSavedFields extends SecurityEventFields {
@@ -611,7 +734,7 @@ final class SecurityJournalEvent {
       at: DateTime.fromMillisecondsSinceEpoch(at),
       type: t,
       fields: SecurityEventFields.fromJson(t, raw.containsKey('f'), raw['f'],
-          v3: version >= 3),
+          v3: version >= 3, v4: version >= 4),
       clockBack: clockBack,
     );
   }
@@ -675,6 +798,10 @@ final class SecurityJournalDocument {
   /// Batch 3: version 3 (generation-qualified outcomes). 1 and 2 are read.
   static const int version = 3;
 
+  /// Batch 4: a journal holding the `historyCleared` marker is written (and
+  /// only then) as version 4. The highest version this build reads.
+  static const int markerVersion = 4;
+
   /// Decoder hard limit (well above the retention cap).
   static const int maxDecodableEvents = 1000;
 
@@ -719,6 +846,17 @@ final class SecurityJournalDocument {
 
   bool get needsUpgradeMarker => decodedVersion == 1;
 
+  /// Batch 4: the clear marker, if any (at most one).
+  SecurityJournalEvent? get historyMarker {
+    for (final SecurityJournalEvent e in events) {
+      if (e.type == SecurityJournalEventType.historyCleared) return e;
+    }
+    return null;
+  }
+
+  /// The version this document is written as (4 only with the marker).
+  int get encodedVersion => historyMarker == null ? version : markerVersion;
+
   static int saturatingAdd(int a, int b) {
     final int s = a + b;
     return s > maxCounter || s < 0 ? maxCounter : s;
@@ -752,7 +890,7 @@ final class SecurityJournalDocument {
   /// `ss` and `sup` omitted when absent or zero.
   Map<String, Object?> toJson() => <String, Object?>{
         'schema': schema,
-        'v': version,
+        'v': encodedVersion,
         'nextSeq': nextSeq,
         'discarded': discarded,
         'lost': lost,
@@ -803,7 +941,8 @@ final class SecurityJournalDocument {
       throw const FormatException('journal is not an object');
     }
     final Object? v = raw['v'];
-    if (raw['schema'] != schema || (v != 1 && v != 2 && v != version)) {
+    if (raw['schema'] != schema ||
+        (v != 1 && v != 2 && v != version && v != markerVersion)) {
       throw const FormatException('journal schema/version mismatch');
     }
     final int declared = v as int;
@@ -835,6 +974,7 @@ final class SecurityJournalDocument {
     final List<SecurityJournalEvent> events = <SecurityJournalEvent>[];
     final Set<String> outcomes = <String>{};
     int upgraded = 0;
+    int markers = 0;
     int lastSeq = -1;
     for (final Object? item in list) {
       final SecurityJournalEvent e =
@@ -849,6 +989,7 @@ final class SecurityJournalDocument {
         throw const FormatException('duplicate outcome for a trigger');
       }
       if (e.type == SecurityJournalEventType.journalUpgraded) upgraded++;
+      if (e.type == SecurityJournalEventType.historyCleared) markers++;
       events.add(e);
     }
     if (declared == 1) {
@@ -867,6 +1008,10 @@ final class SecurityJournalDocument {
     }
     if (upgraded > 1 || (upgraded == 1 && from != 1)) {
       throw const FormatException('journal upgrade marker invalid');
+    }
+    // Batch 4: v4 <=> exactly one clear marker (canonical).
+    if ((declared == markerVersion) != (markers == 1) || markers > 1) {
+      throw const FormatException('journal clear marker invalid');
     }
     final Map<StorageSource, StoreState> storage =
         <StorageSource, StoreState>{};

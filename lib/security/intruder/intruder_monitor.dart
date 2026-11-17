@@ -383,7 +383,163 @@ class IntruderMonitor implements VerifiedAttemptObserver {
     _enqueueRecord(() => _record(attempt, method, result, ownerEpoch));
   }
 
+  // -- Batch 4: Clear History -----------------------------------------------
+
+  /// Fixes the cut of a Clear History: the stored log's generation and
+  /// `nextSeq` (attempts `seq < nextSeq` of that generation are cleared).
+  /// Runs in the P-1 queue after every operation queued before it. Null
+  /// (refuse, nothing written) unless the row is readable here: loaded or
+  /// absent. A corrupt row is NOT quarantined or replaced by this call.
+  /// A loaded v1 log with events first adopts a generation (the same lazy
+  /// migration any record performs; events, `nextSeq` and the run counter
+  /// unchanged) so the cut can never match a later, reinitialized log.
+  Future<IntruderHistoryCut?> prepareHistoryClear() {
+    final Completer<IntruderHistoryCut?> out = Completer<IntruderHistoryCut?>();
+    _enqueueTask(() async {
+      try {
+        out.complete(await _prepareCut());
+      } catch (_) {
+        if (!out.isCompleted) out.complete(null);
+        rethrow;
+      }
+    });
+    return out.future;
+  }
+
+  Future<IntruderHistoryCut?> _prepareCut() async {
+    for (int attempt = 1; attempt <= maxCasAttempts; attempt++) {
+      if (_readOnly) return null;
+      final IntruderLogRead read = await _store.read();
+      switch (read) {
+        case IntruderLogMissing():
+          return const IntruderHistoryCut(gen: null, nextSeq: 0);
+        case IntruderLogLoaded(
+            :final IntruderFailureLog log,
+            :final String raw
+          ):
+          _observe(log);
+          if (log.gen != null || log.events.isEmpty) {
+            return IntruderHistoryCut(gen: log.gen, nextSeq: log.nextSeq);
+          }
+          final IntruderFailureLog? adopted = _withGeneration(log);
+          if (adopted == null) return null;
+          final IntruderWriteResult w =
+              await _store.writeIfUnchanged(adopted, expectedRaw: raw);
+          switch (w) {
+            case IntruderWriteCommitted():
+              _committed(adopted);
+              return IntruderHistoryCut(
+                  gen: adopted.gen, nextSeq: adopted.nextSeq);
+            case IntruderWriteConflict():
+              continue;
+            case IntruderWriteUnknown():
+              _storageError = true;
+              return null; // the next attempt re-reads whatever landed
+          }
+        case IntruderLogUnsupported():
+          _readOnly = true;
+          return null;
+        case IntruderLogCorrupt():
+        case IntruderLogUnreadable():
+          return null;
+      }
+    }
+    return null;
+  }
+
+  /// Clear History step (b): removes the attempts of [cut]'s generation with
+  /// `seq < cut.nextSeq`. `nextSeq`, the run counter and the generation stay
+  /// byte-identical; attempts recorded after the cut (a later seq, or a log
+  /// reinitialized under a new generation) are never touched. Idempotent;
+  /// [stillValid] is evaluated synchronously immediately before the write.
+  /// Runs in the P-1 queue; never quarantines, resets or reinitializes.
+  Future<IntruderHistoryClearResult> clearEventsBefore(
+    IntruderHistoryCut cut, {
+    bool Function()? stillValid,
+  }) {
+    final Completer<IntruderHistoryClearResult> out =
+        Completer<IntruderHistoryClearResult>();
+    _enqueueTask(() async {
+      try {
+        out.complete(await _clearBefore(cut, stillValid));
+      } catch (_) {
+        if (!out.isCompleted) out.complete(IntruderHistoryClearResult.failed);
+        rethrow;
+      }
+    });
+    return out.future;
+  }
+
+  Future<IntruderHistoryClearResult> _clearBefore(
+      IntruderHistoryCut cut, bool Function()? stillValid) async {
+    final String? gen = cut.gen;
+    if (gen == null) return IntruderHistoryClearResult.cleared; // empty set
+    for (int attempt = 1; attempt <= maxCasAttempts; attempt++) {
+      if (_readOnly) return IntruderHistoryClearResult.refused;
+      final IntruderLogRead read = await _store.read();
+      switch (read) {
+        case IntruderLogMissing():
+          return IntruderHistoryClearResult.cleared;
+        case IntruderLogLoaded(
+            :final IntruderFailureLog log,
+            :final String raw
+          ):
+          _observe(log);
+          if (log.gen != gen) return IntruderHistoryClearResult.cleared;
+          final List<FailedAttemptEvent> kept = <FailedAttemptEvent>[
+            for (final FailedAttemptEvent e in log.events)
+              if (e.seq >= cut.nextSeq) e,
+          ];
+          if (kept.length == log.events.length) {
+            return IntruderHistoryClearResult.cleared;
+          }
+          final IntruderFailureLog next = IntruderFailureLog(
+            nextSeq: log.nextSeq,
+            consecutiveFailures: log.consecutiveFailures,
+            events: List<FailedAttemptEvent>.unmodifiable(kept),
+            gen: log.gen,
+          );
+          if (stillValid != null && !stillValid()) {
+            return IntruderHistoryClearResult.cancelled;
+          }
+          final IntruderWriteResult w =
+              await _store.writeIfUnchanged(next, expectedRaw: raw);
+          switch (w) {
+            case IntruderWriteCommitted():
+              _committed(next);
+              return IntruderHistoryClearResult.cleared;
+            case IntruderWriteConflict():
+              continue;
+            case IntruderWriteUnknown(:final String? attemptedRaw):
+              final (_, String? durableRaw, bool readOk) =
+                  await _reconcileRead();
+              if (readOk &&
+                  attemptedRaw != null &&
+                  durableRaw == attemptedRaw) {
+                _committed(next);
+                return IntruderHistoryClearResult.cleared;
+              }
+              _storageError = true;
+              return IntruderHistoryClearResult.failed;
+          }
+        case IntruderLogUnsupported():
+          _readOnly = true;
+          return IntruderHistoryClearResult.refused;
+        case IntruderLogCorrupt():
+        case IntruderLogUnreadable():
+          return IntruderHistoryClearResult.refused;
+      }
+    }
+    return IntruderHistoryClearResult.failed; // contention
+  }
+
   // -- queue ----------------------------------------------------------------
+
+  /// Batch 4: an owner operation (never dropped, not counted as a record).
+  void _enqueueTask(Future<void> Function() run) {
+    _queue.add(_TaskOp(run));
+    _kick();
+  }
 
   void _enqueueRecord(Future<void> Function() run) {
     if (_pendingRecords >= maxPending) {
@@ -438,6 +594,8 @@ class IntruderMonitor implements VerifiedAttemptObserver {
               await _runReset(op);
             case _ReadOp():
               await _runRead(op);
+            case _TaskOp(:final Future<void> Function() run):
+              await run();
           }
         } catch (_) {
           // Never escapes: a monitor failure must not surface anywhere.
@@ -450,6 +608,8 @@ class IntruderMonitor implements VerifiedAttemptObserver {
               _liveResetOps--;
             case _ReadOp():
               _liveReadOps--;
+            case _TaskOp():
+              break;
           }
         }
       }
@@ -778,6 +938,18 @@ class IntruderMonitor implements VerifiedAttemptObserver {
   }
 }
 
+/// Batch 4: the fixed cut of a Clear History (see
+/// [IntruderMonitor.prepareHistoryClear]). [gen] null: no generation-bearing
+/// attempt existed, so no attempt is in the cleared set.
+final class IntruderHistoryCut {
+  const IntruderHistoryCut({required this.gen, required this.nextSeq});
+
+  final String? gen;
+  final int nextSeq;
+}
+
+enum IntruderHistoryClearResult { cleared, refused, cancelled, failed }
+
 /// Q-ENG-1: a write base from one authoritative read.
 final class _Base {
   const _Base(this.log, this.raw);
@@ -795,6 +967,12 @@ sealed class _Op {}
 
 final class _RecordOp extends _Op {
   _RecordOp(this.run);
+
+  final Future<void> Function() run;
+}
+
+final class _TaskOp extends _Op {
+  _TaskOp(this.run);
 
   final Future<void> Function() run;
 }

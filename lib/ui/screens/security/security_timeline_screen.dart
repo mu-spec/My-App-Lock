@@ -36,11 +36,13 @@ import '../../../security/credentials/verified_attempt.dart';
 import '../../../security/intruder/failed_attempt_event.dart';
 import '../../../security/intruder/intruder_defense_coordinator.dart';
 import '../../../security/intruder/intruder_owner_session.dart';
+import '../../../security/history/history_clear_service.dart';
 import '../../../security/timeline/security_journal_event.dart';
 import '../../../security/timeline/security_timeline.dart';
 import '../../../security/timeline/security_timeline_grouping.dart';
 import '../../../services/screen_state_service.dart';
 import '../../../utilities/result.dart';
+import 'app_credential_verification.dart';
 import 'intruder_owner_verification.dart';
 import 'security_timeline_detail_screen.dart';
 
@@ -48,9 +50,28 @@ const String securityTimelineRouteName = '/security/timeline';
 
 /// Routes that belong to the timeline flow (Q-M2-8 A: the verification
 /// route is NOT own-flow).
+/// Batch 4: the Clear History confirmation dialog.
+const String securityTimelineClearRouteName = '/security/timeline/clear';
+
 bool isSecurityTimelineFlowRoute(Route<dynamic> r) =>
     r.settings.name == securityTimelineRouteName ||
     r.settings.name == securityTimelineDetailRouteName;
+
+/// Batch 4: routes the Clear History flow itself pushes (the confirmation
+/// dialog and the owner verification). Accepted above the timeline ONLY
+/// while that flow runs; anything else ends the session as before.
+bool isSecurityTimelineClearFlowRoute(Route<dynamic> r) =>
+    r.settings.name == securityTimelineClearRouteName ||
+    r.settings.name == appCredentialVerifyRouteName;
+
+Route<Object?>? _topRoute(NavigatorState navigator) {
+  Route<Object?>? top;
+  navigator.popUntil((Route<Object?> r) {
+    top = r;
+    return true;
+  });
+  return top;
+}
 
 abstract final class SecurityTimelineText {
   static const String title = 'Security timeline';
@@ -120,6 +141,41 @@ abstract final class SecurityTimelineText {
       'history.';
 
   static String moreInDetails(int n) => '+$n more in details';
+
+  // -- Batch 4: Clear History ----------------------------------------------
+
+  static const String clearAction = 'Clear history…';
+  static const String clearTitle = 'Clear security history?';
+  static const String clearBody =
+      // First two sentences verbatim from SECURITY_DESIGN §1.1 (sealed).
+      'Removes the security timeline and failed-attempt history. Lockout, '
+      'PIN/pattern, biometric settings and protection are not changed. A note that history was cleared, and when, stays in the '
+      'timeline. Rows are deleted from app storage; secure erasure of the '
+      'device storage is not guaranteed.';
+  static const String clearPhotos = 'Also delete intruder photos';
+  static const String clearPhotosNote =
+      'Only photos of the cleared attempts. Off: photos stay in Intruder '
+      'photos.';
+  static const String clearCancel = 'Cancel';
+  static const String clearConfirm = 'Clear';
+  static const String cleared = 'Security history cleared.';
+  static const String clearRefused =
+      'History can\'t be cleared right now. Nothing was changed.';
+  static const String clearNotDone = 'History was not cleared.';
+  static const String clearFailed =
+      'History couldn\'t be cleared. The timeline shows what is stored now.';
+  static const String clearInterrupted =
+      'Clearing was interrupted. The cleared items are hidden; finish '
+      'clearing to remove the rest.';
+  static const String clearPendingNotice =
+      'Clearing was interrupted. Cleared items are hidden but not all of '
+      'them are deleted yet. Verify to finish clearing.';
+  static const String clearFinish = 'Finish clearing';
+
+  static String clearedTitle(HistoryClearScope? scope) =>
+      scope == HistoryClearScope.historyPhotos
+          ? 'History and intruder photos cleared'
+          : 'History cleared';
 
   static String attempts(int n) =>
       '$n failed ${n == 1 ? 'attempt' : 'attempts'}';
@@ -239,6 +295,12 @@ abstract final class SecurityTimelineText {
             'Failed-unlock history storage readable again',
             'detected at $time',
           ),
+        TimelineEntryKind.historyCleared => (
+            clearedTitle(e.clearScope),
+            e.clearPending
+                ? 'on $time · not finished'
+                : 'on $time · Earlier events were removed by the owner.',
+          ),
       };
 
   static String discarded(TimelineSource s, int n) =>
@@ -307,6 +369,9 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
   bool _paging = false;
   int _loadOp = 0;
 
+  /// Batch 4: the Clear History flow (dialog / verification / steps) runs.
+  bool _clearing = false;
+
   /// M2: the timeline's own details route while it is pushed.
   Route<void>? _detailRoute;
 
@@ -364,9 +429,15 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
       _closing = true; // already leaving
       return;
     }
+    final NavigatorState navigator = Navigator.of(context);
+    if (!me.isCurrent && _clearing) {
+      // Batch 4: the session ended during the Clear History flow; its own
+      // dialog / verification routes close with it (no step runs after).
+      navigator
+          .popUntil((Route<dynamic> r) => !isSecurityTimelineClearFlowRoute(r));
+    }
     if (!me.isCurrent) return; // covered: close when it surfaces again
     _closing = true;
-    final NavigatorState navigator = Navigator.of(context);
     final ScaffoldMessengerState? messenger =
         ScaffoldMessenger.maybeOf(context);
     navigator.pop();
@@ -436,6 +507,10 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
           _dropForOwnRoute(); // own details route: keep the session
           return;
         }
+        if (r != null && r.isActive && !r.isCurrent && _ownClearFlowOnTop()) {
+          _dropForOwnRoute(); // own clear dialog / verification
+          return;
+        }
         if (r != null && r.isActive && !r.isCurrent) {
           session.invalidate('covered');
         }
@@ -451,6 +526,95 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
       });
     }
   }
+
+  bool _ownClearFlowOnTop() {
+    if (!_clearing) return false;
+    final Route<Object?>? t = _topRoute(Navigator.of(context));
+    return t != null && isSecurityTimelineClearFlowRoute(t);
+  }
+
+  // -- Batch 4: Clear History ----------------------------------------------
+
+  /// Explicit confirmation -> fresh owner verification -> clear. Every step
+  /// re-checks the session; nothing is written unless the owner confirmed
+  /// AND verified within this still-valid session.
+  Future<void> _clearHistory() async {
+    if (_clearing || !session.isValid || _snapshot == null) return;
+    _clearing = true;
+    try {
+      final bool? photos = await _confirmClear();
+      if (photos == null || !mounted || !session.isValid) {
+        if (mounted && session.isValid) {
+          _snack(SecurityTimelineText.clearNotDone);
+        }
+        return;
+      }
+      final HistoryClearOutcome? r = await _verifiedRun(
+          (bool Function() valid) => widget.container.historyClear
+              .clear(photos: photos, stillValid: valid));
+      _report(r);
+    } finally {
+      _clearing = false;
+    }
+  }
+
+  Future<void> _finishClear() async {
+    if (_clearing || !session.isValid || _snapshot == null) return;
+    _clearing = true;
+    try {
+      final HistoryClearOutcome? r = await _verifiedRun(
+          (bool Function() valid) =>
+              widget.container.historyClear.finish(stillValid: valid));
+      _report(r);
+    } finally {
+      _clearing = false;
+    }
+  }
+
+  /// Fresh verification (a cached session never counts), same credential as
+  /// the session, then [run]. Null: not verified / session ended.
+  Future<HistoryClearOutcome?> _verifiedRun(
+      Future<HistoryClearOutcome> Function(bool Function() valid) run) async {
+    final AppContainer c = widget.container;
+    final AuthType? method =
+        await verifyIntruderOwner(Navigator.of(context), c.auth);
+    if (method == null || !mounted || !session.isValid) return null;
+    if (session.method != method) {
+      session.invalidate('credentialChanged');
+      return null;
+    }
+    bool valid() => mounted && session.isValid;
+    final HistoryClearOutcome r = await run(valid);
+    if (mounted && session.isValid) await _load();
+    return r;
+  }
+
+  void _report(HistoryClearOutcome? r) {
+    if (!mounted || !session.isValid) return;
+    _snack(switch (r) {
+      null ||
+      HistoryClearOutcome.cancelled =>
+        SecurityTimelineText.clearNotDone,
+      HistoryClearOutcome.done => SecurityTimelineText.cleared,
+      HistoryClearOutcome.refused => SecurityTimelineText.clearRefused,
+      HistoryClearOutcome.failed => SecurityTimelineText.clearFailed,
+      HistoryClearOutcome.interrupted => SecurityTimelineText.clearInterrupted,
+    });
+  }
+
+  void _snack(String text) {
+    final ScaffoldMessengerState? m = ScaffoldMessenger.maybeOf(context);
+    m?.hideCurrentSnackBar();
+    m?.showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  /// Null = cancelled; otherwise whether photos are included (default off).
+  Future<bool?> _confirmClear() => showDialog<bool>(
+        context: context,
+        routeSettings:
+            const RouteSettings(name: securityTimelineClearRouteName),
+        builder: (BuildContext ctx) => const _ClearHistoryDialog(),
+      );
 
   bool _ownDetailOnTop() {
     final Route<void>? d = _detailRoute;
@@ -507,10 +671,23 @@ class _SecurityTimelineScreenState extends State<SecurityTimelineScreen>
         visible: _visible,
         onShowOlder: _showOlder,
         onDetails: _openDetails,
+        onFinishClear: _finishClear,
       );
     }
+    final bool canClear = snap != null && !_secureFailed;
     return Scaffold(
-      appBar: AppBar(title: const Text(SecurityTimelineText.title)),
+      appBar: AppBar(
+        title: const Text(SecurityTimelineText.title),
+        actions: <Widget>[
+          if (canClear)
+            IconButton(
+              key: const Key('security_timeline_clear'),
+              tooltip: SecurityTimelineText.clearAction,
+              icon: const Icon(Icons.delete_sweep_outlined),
+              onPressed: _clearHistory,
+            ),
+        ],
+      ),
       body: body,
     );
   }
@@ -522,16 +699,33 @@ class _TimelineList extends StatelessWidget {
     required this.visible,
     required this.onShowOlder,
     required this.onDetails,
+    required this.onFinishClear,
   });
 
   final SecurityTimelineSnapshot snapshot;
   final int visible;
   final VoidCallback onShowOlder;
   final void Function(TimelineRow row) onDetails;
+  final VoidCallback onFinishClear;
 
   @override
   Widget build(BuildContext context) {
     final List<Widget> rows = <Widget>[];
+    if (snapshot.historyClearPending) {
+      rows.add(ListTile(
+        key: const Key('security_timeline_clear_pending'),
+        leading: const Icon(Icons.pending_actions_outlined),
+        title: const Text(SecurityTimelineText.clearPendingNotice),
+        subtitle: Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(
+            key: const Key('security_timeline_clear_finish'),
+            onPressed: onFinishClear,
+            child: const Text(SecurityTimelineText.clearFinish),
+          ),
+        ),
+      ));
+    }
     for (final TimelineSourceStatus s in snapshot.sources) {
       if (!s.available) {
         rows.add(_Notice(
@@ -631,7 +825,8 @@ class _TimelineList extends StatelessWidget {
           }
         case TimelineEntryRow(:final TimelineEntry entry):
           final bool m2 = entry.source == TimelineSource.journal &&
-              entry.kind.index > TimelineEntryKind.journalRecovered.index;
+              entry.kind.index > TimelineEntryKind.journalRecovered.index &&
+              entry.kind != TimelineEntryKind.historyCleared;
           rows.add(_EntryTile(
             entry,
             labels: snapshot.labels,
@@ -744,6 +939,7 @@ class _EntryTile extends StatelessWidget {
       TimelineEntryKind.storageUnavailable ||
       TimelineEntryKind.storageRestored =>
         Icons.storage_outlined,
+      TimelineEntryKind.historyCleared => Icons.delete_sweep_outlined,
     };
     final String time = _fmtTime(e.at);
     final (String title, String text) = SecurityTimelineText.entryText(e, time);
@@ -788,5 +984,53 @@ class _Message extends StatelessWidget {
           padding: const EdgeInsets.all(DsSpacing.xl),
           child: Text(text, textAlign: TextAlign.center),
         ),
+      );
+}
+
+/// Batch 4: explicit confirmation with the photos opt-in (default off).
+/// Pops null (cancel) or whether photos are included.
+class _ClearHistoryDialog extends StatefulWidget {
+  const _ClearHistoryDialog();
+
+  @override
+  State<_ClearHistoryDialog> createState() => _ClearHistoryDialogState();
+}
+
+class _ClearHistoryDialogState extends State<_ClearHistoryDialog> {
+  bool _photos = false;
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text(SecurityTimelineText.clearTitle),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              const Text(SecurityTimelineText.clearBody),
+              const SizedBox(height: DsSpacing.md),
+              CheckboxListTile(
+                key: const Key('security_timeline_clear_photos'),
+                contentPadding: EdgeInsets.zero,
+                value: _photos,
+                onChanged: (bool? v) => setState(() => _photos = v ?? false),
+                title: const Text(SecurityTimelineText.clearPhotos),
+                subtitle: const Text(SecurityTimelineText.clearPhotosNote),
+              ),
+            ],
+          ),
+        ),
+        actions: <Widget>[
+          TextButton(
+            key: const Key('security_timeline_clear_cancel'),
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text(SecurityTimelineText.clearCancel),
+          ),
+          TextButton(
+            key: const Key('security_timeline_clear_confirm'),
+            onPressed: () => Navigator.of(context).pop(_photos),
+            child: const Text(SecurityTimelineText.clearConfirm),
+          ),
+        ],
       );
 }

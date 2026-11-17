@@ -1,0 +1,5 @@
+Verbatim copies of lib/security/timeline/{security_journal_event,security_event_journal_store}.dart
+at commit 60670151efefbe73a40058f7c6efe4289a0004c0 (Batch 3). Only the two package import
+paths in the store were rewritten. Original blob SHA-256 (before rewrite):
+add9b268280190c3cef0c85b7cbee63c80dd7a584103bd7ea3de6fe21b65bc7c  security_journal_event.dart
+1749855a2d1420077093477450d939ff195e71484a2b62f775584eb7ba34f581  security_event_journal_store.dart

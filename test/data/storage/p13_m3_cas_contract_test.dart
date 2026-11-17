@@ -170,8 +170,11 @@ void main() {
 
 /// Frozen at 6110ff8 + F-1 (42 / 38), re-baselined for NF-NS-1 (E-B6):
 /// +1 override in the new NF-NS-1 transition test's fault store.
-const int kSetSettingOverrides = 43;
-const int kFakeFiles = 39;
+/// Batch 4 (disclosed re-baseline): +1 override / +1 file, the Clear History
+/// fault store, which also routes compareAndSetSetting through the same
+/// interception (listed in kCasOverrideFiles).
+const int kSetSettingOverrides = 44;
+const int kFakeFiles = 40;
 
 /// NF-NS-1: the one production compare-and-set caller (CAS-G1).
 const String kOnlyCasCaller =
@@ -216,6 +219,9 @@ const List<String> kCasOverrideFiles = <String>[
   'test/security/intruder/p13_m3_b3_downgrade_test.dart',
   'test/security/intruder/p13_m3_b3_crash_concurrency_test.dart',
   'test/security/intruder/p13_m3_b3_identity_test.dart',
+  // Batch 4: Clear History fault stores (failure-log CAS faults).
+  'test/regression/p13_m3_b4_clear_history_ui_test.dart',
+  'test/security/history/p13_m3_b4_clear_history_test.dart',
 ];
 
 class _UnreadableDb extends InMemoryLocalDatabase {

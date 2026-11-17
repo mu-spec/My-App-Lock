@@ -214,10 +214,11 @@ void main() {
   group('U-10 newer schema (v3) is read-only for the process', () {
     test('v3 row: unsupported, 0 writes, no quarantine, outcomes lost',
         () async {
-      // Batch 3: v3 is now current; the "newer" row is v4.
+      // Batch 3: v3 is now current. Batch 4 (disclosed re-baseline): v4 is
+      // readable (v3 + clear marker); the "newer" row is v5.
       final String v3 = jsonEncode(<String, Object?>{
         'schema': SecurityJournalDocument.schema,
-        'v': 4,
+        'v': 5,
         'nextSeq': 1,
         'whatever': true,
         'events': <Object?>[],
@@ -416,7 +417,8 @@ void main() {
               _key,
               jsonEncode(<String, Object?>{
                 'schema': SecurityJournalDocument.schema,
-                'v': 4, // Batch 3: v3 is current; v4 = "newer"
+                // Batch 4: v4 readable (v3 + clear marker); v5 = "newer".
+                'v': 5,
                 'nextSeq': 0,
                 'events': <Object?>[],
               }));

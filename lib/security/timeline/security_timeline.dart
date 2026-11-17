@@ -44,6 +44,9 @@ enum TimelineEntryKind {
   protectionHealth,
   storageUnavailable,
   storageRestored,
+
+  /// Batch 4: the owner cleared history (one marker; never removable).
+  historyCleared,
 }
 
 /// Metadata-only timeline row (no credential material, no pixels).
@@ -70,6 +73,8 @@ final class TimelineEntry {
     this.suppressed = 0,
     this.storageKind,
     this.clockBack = false,
+    this.clearScope,
+    this.clearPending = false,
   });
 
   final TimelineSource source;
@@ -108,6 +113,11 @@ final class TimelineEntry {
   final bool healthFirst;
   final int suppressed;
   final StoreKind? storageKind;
+
+  /// Batch 4 ([TimelineEntryKind.historyCleared] only): what was cleared and
+  /// whether clearing is still unfinished.
+  final HistoryClearScope? clearScope;
+  final bool clearPending;
 
   /// Recorded while the wall clock was behind the previous event.
   final bool clockBack;
@@ -160,6 +170,7 @@ final class SecurityTimelineSnapshot {
     this.resetFailures = 0,
     this.suppressedHealth = 0,
     this.labels = const <String, String>{},
+    this.historyClearPending = false,
   });
 
   /// Newest first; total order (see [SecurityTimelineReader.compare]).
@@ -178,6 +189,10 @@ final class SecurityTimelineSnapshot {
 
   /// Render-time protected-app labels (package -> label). Never persisted.
   final Map<String, String> labels;
+
+  /// Batch 4: a Clear History was interrupted (its marker is pending). The
+  /// cleared set is already hidden; the owner may finish clearing.
+  final bool historyClearPending;
 
   bool get allSourcesAvailable =>
       sources.every((TimelineSourceStatus s) => s.available);
@@ -276,12 +291,41 @@ class SecurityTimelineReader {
   /// One uncoalesced load. Never throws.
   Future<SecurityTimelineSnapshot> _loadOnce() async {
     final List<TimelineEntry> entries = <TimelineEntry>[];
-    final (TimelineSourceStatus, IntruderMonitorStatus) f =
-        await _loadFailures(entries);
-    final TimelineSourceStatus failures = f.$1;
-    final (TimelineSourceStatus, int) j = await _loadJournal(entries);
+    final List<TimelineEntry> attempts = <TimelineEntry>[];
+    final (TimelineSourceStatus, IntruderMonitorStatus, IntruderFailureLog?) f =
+        await _loadFailures(attempts);
+    TimelineSourceStatus failures = f.$1;
+    final (TimelineSourceStatus, int, HistoryClearedFields?) j =
+        await _loadJournal(entries);
     final TimelineSourceStatus journal = j.$1;
-    entries.sort(compare);
+    final HistoryClearedFields? cleared = j.$3;
+    if (cleared != null) {
+      // Batch 4 display rule (read model only, no deletion): the marker's
+      // fixed cleared set is never shown, whether or not every clearing step
+      // has run yet; anything after the cut is always shown.
+      final IntruderFailureLog? log = f.$3;
+      attempts.removeWhere(
+          (TimelineEntry e) => cleared.clearsAttempt(log?.gen, e.sourceSeq));
+      entries.removeWhere((TimelineEntry e) =>
+          e.trig != null && cleared.clearsOutcome(e.tgen, e.trig!));
+      if (log != null && log.gen != null && log.gen == cleared.cutGen) {
+        // Attempts the owner cleared are not "no longer kept" by retention.
+        final int span = log.nextSeq - cleared.cut;
+        final int kept = log.events
+            .where((FailedAttemptEvent e) => e.seq >= cleared.cut)
+            .length;
+        failures = TimelineSourceStatus(
+          source: failures.source,
+          state: failures.state,
+          discarded: span - kept < 0 ? 0 : span - kept,
+          lost: failures.lost,
+          damagedEarlier: failures.damagedEarlier,
+        );
+      }
+    }
+    entries
+      ..addAll(attempts)
+      ..sort(compare);
     return SecurityTimelineSnapshot(
       entries: List<TimelineEntry>.unmodifiable(entries),
       sources: List<TimelineSourceStatus>.unmodifiable(
@@ -290,6 +334,7 @@ class SecurityTimelineReader {
       resetFailures: f.$2.resetFailures,
       suppressedHealth: j.$2,
       labels: await _loadLabels(),
+      historyClearPending: cleared?.pending ?? false,
     );
   }
 
@@ -309,8 +354,8 @@ class SecurityTimelineReader {
     }
   }
 
-  Future<(TimelineSourceStatus, IntruderMonitorStatus)> _loadFailures(
-      List<TimelineEntry> out) async {
+  Future<(TimelineSourceStatus, IntruderMonitorStatus, IntruderFailureLog?)>
+      _loadFailures(List<TimelineEntry> out) async {
     IntruderFailureLog? log;
     // Request-local busy proof (M2): the counter has exactly one increment
     // site, inside the synchronous rejection branch of snapshot(); these
@@ -353,6 +398,7 @@ class SecurityTimelineReader {
           damagedEarlier: damaged,
         ),
         status,
+        null,
       );
     }
     for (final FailedAttemptEvent e in log.events) {
@@ -382,10 +428,11 @@ class SecurityTimelineReader {
         damagedEarlier: damaged,
       ),
       status,
+      log,
     );
   }
 
-  Future<(TimelineSourceStatus, int)> _loadJournal(
+  Future<(TimelineSourceStatus, int, HistoryClearedFields?)> _loadJournal(
       List<TimelineEntry> out) async {
     SecurityJournalView view;
     try {
@@ -412,9 +459,12 @@ class SecurityTimelineReader {
       SecurityJournalAvailability.unreadable =>
         TimelineSourceState.unavailableUnreadable,
     };
+    HistoryClearedFields? cleared;
     if (state == TimelineSourceState.available) {
       for (final SecurityJournalEvent e in view.events) {
         out.add(journalEntry(e));
+        final SecurityEventFields? f = e.fields;
+        if (f is HistoryClearedFields) cleared = f;
       }
     }
     return (
@@ -426,6 +476,7 @@ class SecurityTimelineReader {
         damagedEarlier: damaged,
       ),
       view.suppressed,
+      cleared,
     );
   }
 
@@ -457,6 +508,8 @@ class SecurityTimelineReader {
           TimelineEntryKind.storageUnavailable,
         SecurityJournalEventType.storageRestored =>
           TimelineEntryKind.storageRestored,
+        SecurityJournalEventType.historyCleared =>
+          TimelineEntryKind.historyCleared,
       },
       trig: f?.trig,
       tgen: f?.tgen,
@@ -467,6 +520,8 @@ class SecurityTimelineReader {
       healthFirst: f is ProtectionHealthFields && f.first,
       suppressed: f is ProtectionHealthFields ? f.suppressed : 0,
       storageKind: f is StorageUnavailableFields ? f.kind : null,
+      clearScope: f is HistoryClearedFields ? f.scope : null,
+      clearPending: f is HistoryClearedFields && f.pending,
     );
   }
 }

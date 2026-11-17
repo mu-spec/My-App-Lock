@@ -1034,6 +1034,113 @@ class IntruderEvidenceStore {
         return EvidenceClearResult.cleared;
       });
 
+  /// Batch 4 (Clear History): the next blob id, read once when the clear
+  /// is prepared. Every photo saved after this read has `bid >= ` it. Null
+  /// unless the index is readable and supported.
+  Future<int?> bidCut() => _serial(() async {
+        final _Index idx = await _readIndex();
+        return idx.health == EvidenceIndexHealth.ok ? idx.nextBid : null;
+      });
+
+  /// Batch 4 (Clear History, history+photos) step (c). Removes ONLY the
+  /// photos of the clear's fixed set: every legacy photo; photos of
+  /// [cutGen] with `seq < cutSeq`; photos of any other generation with
+  /// `bid < bidCut` (saved before the clear). Photos of later attempts are
+  /// kept. When [cutGen] is the live generation ([liveGen]) it becomes the
+  /// current one and its floor rises to `cutSeq - 1`, so a capture still in
+  /// flight for a cleared attempt is never saved afterwards; later attempts
+  /// stay savable. Retirement follows the delete rules (legacy floor as in
+  /// [clearAll]; every listed non-current generation superseded).
+  /// Idempotent: nothing to change means no write. Commit point: one index
+  /// write; blob rows are then removed (leftovers are swept).
+  Future<EvidenceClearResult> clearHistoryItems({
+    required String? cutGen,
+    required int cutSeq,
+    required int bidCut,
+    String? liveGen,
+    bool Function()? stillValid,
+  }) =>
+      _serial(() async {
+        _Index idx = await _readIndex();
+        if (idx.health == EvidenceIndexHealth.unsupported) {
+          return EvidenceClearResult.unsupportedSchema;
+        }
+        if (idx.health == EvidenceIndexHealth.unreadable) {
+          return EvidenceClearResult.storageFailed;
+        }
+        if ((cutGen != null && !_genValid(cutGen)) ||
+            (liveGen != null && !_genValid(liveGen)) ||
+            cutSeq < 0 ||
+            bidCut < 0) {
+          return EvidenceClearResult.storageFailed;
+        }
+        bool inCleared(EvidenceItem e) {
+          if (e.gen == null || e.bid == null) return true;
+          if (e.gen == cutGen) return e.seq < cutSeq;
+          return e.bid! < bidCut;
+        }
+
+        final List<EvidenceItem> removed = idx.items.where(inCleared).toList();
+        bool changed = removed.isNotEmpty;
+        _Index next =
+            removed.isEmpty ? idx : idx.supersedingListed(maxSuperseded);
+        if (removed.any((EvidenceItem e) => e.gen == null)) {
+          int floor = next.legacy.floor;
+          for (final EvidenceItem e in removed) {
+            if (e.gen == null && e.seq > floor) floor = e.seq;
+          }
+          for (final int t in next.legacy.tombs) {
+            if (t > floor) floor = t;
+          }
+          if (next.legacy.highWater > floor) floor = next.legacy.highWater;
+          next = next.copyWith(legacy: _Retire(floor: floor));
+        }
+        if (cutGen != null &&
+            liveGen == cutGen &&
+            !next.superseded.contains(cutGen)) {
+          if (next.current != cutGen) {
+            next = next.advancedTo(cutGen, maxSuperseded);
+            changed = true;
+          }
+          final _Retire r = next.gens[cutGen] ?? _Retire.none;
+          final int floor = r.floor > cutSeq - 1 ? r.floor : cutSeq - 1;
+          if (floor != r.floor) {
+            next = next.copyWith(gens: <String, _Retire>{
+              ...next.gens,
+              cutGen: _Retire(
+                floor: floor,
+                tombs:
+                    List<int>.unmodifiable(r.tombs.where((int t) => t > floor)),
+                highWater: r.highWater > floor ? r.highWater : -1,
+              ),
+            });
+            changed = true;
+          }
+        }
+        if (!changed) return EvidenceClearResult.cleared;
+        final Set<String> gone = removed.map(_keyOf).toSet();
+        next = next.copyWith(
+            items: next.items
+                .where((EvidenceItem e) => !gone.contains(_keyOf(e)))
+                .toList());
+        if (stillValid != null && !stillValid()) {
+          return EvidenceClearResult.cancelled;
+        }
+        try {
+          await _writeIndex(next);
+        } catch (_) {
+          return EvidenceClearResult.storageFailed;
+        }
+        for (final String k in gone) {
+          try {
+            await _database.removeSetting(k);
+          } catch (_) {
+            // Orphan row (ciphertext, unreferenced): removed by sweepOrphans.
+          }
+        }
+        return EvidenceClearResult.cleared;
+      });
+
   /// Removes items older than [retention] (index first, then blobs).
   /// Runs at startup and before every owner list. Returns the number of
   /// items removed. Never touches a newer-schema or unreadable index.
