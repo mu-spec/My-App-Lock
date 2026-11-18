@@ -694,9 +694,17 @@ void main() {
       final String src = File(
         'lib/ui/screens/onboarding/onboarding_health_step.dart',
       ).readAsStringSync();
+      // Phase 15 final: the only Android settings hand-off is the
+      // user-tapped "Review setup" path (`_review`); see F-group tests for
+      // the behaviour (nothing opens on its own).
+      expect('openProtectionSettings('.allMatches(src).length, 1);
+      final int review = src.indexOf('Future<void> _review(');
+      final int open = src.indexOf('openProtectionSettings(');
+      expect(review, greaterThan(0));
+      expect(open, greaterThan(review));
+      expect(open, lessThan(src.indexOf('Widget build(', review)));
       for (final String banned in <String>[
         'requestPermission',
-        'openProtectionSettings',
         '.start(',
         '.configure(',
         'setProtection',
@@ -768,8 +776,8 @@ void main() {
 
     testWidgets(
         'E2 fresh install with nothing granted or protected: Setup '
-        'Incomplete → Review setup returns to permissions → finish',
-        (WidgetTester tester) async {
+        'Incomplete (no protected app) → Review setup opens the apps step '
+        '→ finish', (WidgetTester tester) async {
       final AppContainer c = newContainer(apps: const <AppEntry>[_whatsapp]);
       await pumpApp(tester, c);
       await throughM1(tester);
@@ -778,8 +786,9 @@ void main() {
       await tester.pumpAndSettle();
       expectOutcome(OnboardingCompletion.setupIncomplete);
       await tapText(tester, OnboardingHealthStep.reviewSetupLabel);
-      expect(find.text(OnboardingPermissionsStep.title), findsOneWidget);
-      await tapText(tester, OnboardingPermissionsStep.skipLabel);
+      // Phase 15 final: the engine reports "no protected apps", so Review
+      // setup leads to the step that fixes it.
+      expect(find.text(OnboardingAppsStep.title), findsOneWidget);
       await tapText(tester, OnboardingAppsStep.skipLabel);
       await tester.pumpAndSettle();
       expectOutcome(OnboardingCompletion.setupIncomplete);

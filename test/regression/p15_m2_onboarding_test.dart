@@ -34,6 +34,7 @@ import 'package:smart_app_lock/services/biometric_service.dart';
 import 'package:smart_app_lock/services/impl/static_accessibility_lock_service.dart';
 import 'package:smart_app_lock/services/impl/static_installed_apps_service.dart';
 import 'package:smart_app_lock/services/impl/static_overlay_lock_service.dart';
+import 'package:smart_app_lock/services/impl/static_watcher_service.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_apps_step.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_decision.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_health_step.dart';
@@ -252,11 +253,16 @@ void main() {
     testWidgets(
         'P3 nothing granted: no "Enabled" claim, skip is explicit '
         'and the incomplete note is shown', (WidgetTester tester) async {
-      await pumpApp(tester, newContainer());
+      final AppContainer c = newContainer();
+      // Phase 15 final: "nothing granted" includes the Android 13+
+      // notification permission (shown as an optional row).
+      (c.watcher as StaticWatcherService).notificationPermissionGranted = false;
+      await pumpApp(tester, c);
       await throughM1(tester);
       expect(statusOf(tester, 'accessibility'), 'Required');
       expect(statusOf(tester, 'overlay'), 'Required');
       expect(statusOf(tester, 'usage'), 'Recommended');
+      expect(statusOf(tester, 'notifications'), 'Optional');
       expect(find.text(OnboardingPermissionsStep.enabledLabel), findsNothing);
       expect(
           find.text(OnboardingPermissionsStep.incompleteNote), findsOneWidget);

@@ -4,6 +4,7 @@ import '../../../app/app_scope.dart';
 import '../../../design_system/design_system.dart';
 import '../../../protection/health/protection_health_engine.dart';
 import '../../../protection/health/protection_health_monitor.dart';
+import '../../../services/watcher_service.dart';
 import '../health/health_presentation.dart';
 import '../health/health_resume_trigger.dart';
 import '../health/protection_health_controller.dart';
@@ -61,6 +62,54 @@ OnboardingCompletion classifyOnboardingCompletion(
       : OnboardingCompletion.unableToVerify;
 }
 
+/// Where "Review setup" leads for a Setup Incomplete report.
+enum OnboardingReviewTarget {
+  /// The onboarding permissions step (Accessibility, Draw over apps, Usage
+  /// access, Notifications).
+  permissions,
+
+  /// The onboarding suggested-apps step (no app protected yet).
+  apps,
+
+  /// An Android settings screen (battery / background restrictions).
+  systemSettings,
+}
+
+/// The first missing-setup issue that needs a user action, in the engine's
+/// deterministic order (most severe first), or null when there is none.
+HealthIssue? onboardingReviewIssue(ProtectionHealthReport? report) {
+  if (report == null) return null;
+  for (final HealthIssue i in report.issues) {
+    if (i.severity != HealthIssueSeverity.advisory &&
+        _setupCategories.contains(i.category)) {
+      return i;
+    }
+  }
+  return null;
+}
+
+/// Maps a missing-setup issue to the place that fixes it.
+OnboardingReviewTarget onboardingReviewTarget(HealthIssue issue) =>
+    switch (issue.action) {
+      HealthRepairAction.chooseProtectedApps => OnboardingReviewTarget.apps,
+      HealthRepairAction.openAppBatterySettings ||
+      HealthRepairAction.openBatterySaverSettings =>
+        OnboardingReviewTarget.systemSettings,
+      _ => OnboardingReviewTarget.permissions,
+    };
+
+/// True when every non-advisory issue is about notifications: app locking
+/// itself is not affected (still never shown as Protection Active).
+bool onboardingOnlyNotificationsMissing(ProtectionHealthReport? report) {
+  if (report == null) return false;
+  final Iterable<HealthIssue> relevant = report.issues
+      .where((HealthIssue i) => i.severity != HealthIssueSeverity.advisory);
+  return relevant.isNotEmpty &&
+      relevant.every(
+        (HealthIssue i) => i.component == HealthComponent.notifications,
+      );
+}
+
 /// Phase 15 / M3 — Initial Health Check and Setup Complete.
 ///
 /// Runs one after-change refresh through the app's single shared
@@ -75,6 +124,7 @@ class OnboardingHealthStep extends StatefulWidget {
     super.key,
     required this.onFinish,
     required this.onReviewSetup,
+    this.onReviewApps,
     @visibleForTesting this.debugMonitor,
   });
 
@@ -83,6 +133,10 @@ class OnboardingHealthStep extends StatefulWidget {
 
   /// Returns to the permission step to fix missing setup.
   final VoidCallback onReviewSetup;
+
+  /// Returns to the suggested-apps step when no app is protected yet
+  /// (falls back to [onReviewSetup] when absent).
+  final VoidCallback? onReviewApps;
 
   /// Test-only clock seam. Production always uses the app's shared
   /// `AppContainer.protectionHealth` monitor.
@@ -98,6 +152,12 @@ class OnboardingHealthStep extends StatefulWidget {
   static const String incompleteMessage =
       'Some required permissions or setup steps are missing, so protected '
       'apps may not lock yet.';
+  static const String notificationsOnlyMessage =
+      'Notifications are off for Smart App Lock. App locking does not depend '
+      'on them, but the protection status notification stays hidden, so you '
+      'may not notice if protection stops. Review setup to allow them.';
+  static const String openSettingsFailedMessage =
+      "Couldn't open Android settings. Please try again.";
   static const String unableTitle = 'Unable to Verify';
   static const String unableMessage =
       "Smart App Lock couldn't confirm that protection is working. This "
@@ -118,6 +178,7 @@ class _OnboardingHealthStepState extends State<OnboardingHealthStep> {
   /// False until this step's own first refresh settles: an earlier
   /// observation (e.g. from app start) is never shown as the result.
   bool _firstCheckDone = false;
+  String? _message;
   late final HealthResumeTrigger _resume = HealthResumeTrigger(
     onResumed: ({required bool returned}) =>
         _controller?.refresh(afterChange: true),
@@ -156,6 +217,38 @@ class _OnboardingHealthStepState extends State<OnboardingHealthStep> {
 
   void _onChanged() {
     if (mounted) setState(() {});
+  }
+
+  /// "Review setup": go where the first missing-setup issue is fixed.
+  Future<void> _review(HealthIssue? issue) async {
+    final OnboardingReviewTarget target = issue == null
+        ? OnboardingReviewTarget.permissions
+        : onboardingReviewTarget(issue);
+    switch (target) {
+      case OnboardingReviewTarget.permissions:
+        widget.onReviewSetup();
+      case OnboardingReviewTarget.apps:
+        (widget.onReviewApps ?? widget.onReviewSetup)();
+      case OnboardingReviewTarget.systemSettings:
+        final ProtectionSettingsTarget? settings =
+            HealthPresentation.repair(issue!).settingsTarget;
+        final WatcherService? watcher = AppScope.read(context)?.watcher;
+        bool opened = false;
+        if (settings != null && watcher != null) {
+          try {
+            final result = await watcher.openProtectionSettings(settings);
+            opened = result.isSuccess && result.valueOrNull == true;
+          } catch (_) {
+            opened = false;
+          }
+        }
+        if (!mounted) return;
+        setState(() {
+          _message =
+              opened ? null : OnboardingHealthStep.openSettingsFailedMessage;
+        });
+      // Returning from Android settings re-checks (lifecycle trigger).
+    }
   }
 
   @override
@@ -200,7 +293,9 @@ class _OnboardingHealthStepState extends State<OnboardingHealthStep> {
           Icons.warning_amber_rounded,
           palette.warning,
           OnboardingHealthStep.incompleteTitle,
-          OnboardingHealthStep.incompleteMessage,
+          onboardingOnlyNotificationsMissing(report)
+              ? OnboardingHealthStep.notificationsOnlyMessage
+              : OnboardingHealthStep.incompleteMessage,
         ),
       OnboardingCompletion.unableToVerify => (
           Icons.help_outline_rounded,
@@ -271,6 +366,16 @@ class _OnboardingHealthStepState extends State<OnboardingHealthStep> {
             ),
         ],
         const SizedBox(height: DsSpacing.xl),
+        if (_message != null &&
+            outcome == OnboardingCompletion.setupIncomplete) ...<Widget>[
+          Text(
+            _message!,
+            key: const Key('onboarding_health_message'),
+            textAlign: TextAlign.center,
+            style: TextStyle(color: palette.danger),
+          ),
+          const SizedBox(height: DsSpacing.md),
+        ],
         if (outcome == OnboardingCompletion.protectionActive)
           DsButton(
             label: OnboardingHealthStep.finishLabel,
@@ -282,7 +387,9 @@ class _OnboardingHealthStepState extends State<OnboardingHealthStep> {
             DsButton(
               label: OnboardingHealthStep.reviewSetupLabel,
               expand: true,
-              onPressed: controller.checking ? null : widget.onReviewSetup,
+              onPressed: controller.checking
+                  ? null
+                  : () => _review(onboardingReviewIssue(report)),
             ),
           if (outcome == OnboardingCompletion.unableToVerify)
             DsButton(

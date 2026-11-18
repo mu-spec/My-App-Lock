@@ -335,6 +335,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   key: const ValueKey<String>('onboarding_health_step'),
                   onFinish: _finish,
                   onReviewSetup: _toPermissions,
+                  onReviewApps: () => _goTo(OnboardingStep.apps),
                 ),
             },
           ),
