@@ -7,6 +7,12 @@ enum ScreenStateEvent {
 
   /// The display turned back on.
   screenOn,
+
+  /// Phase 17 / M1: the device keyguard was dismissed
+  /// (`ACTION_USER_PRESENT`). Only a latency hint: it lets a rejected
+  /// challenge-ready hand-off retry immediately. It never grants access,
+  /// never hides a shield and is not a screen-on.
+  userPresent,
 }
 
 /// Bridge to the Android screen-state broadcasts

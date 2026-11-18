@@ -13,6 +13,7 @@ class StaticScreenStateService implements ScreenStateService {
 
   int screenOffCount = 0;
   int screenOnCount = 0;
+  int userPresentCount = 0;
 
   /// Test hook: simulates the screen turning off.
   void emitScreenOff() {
@@ -24,6 +25,12 @@ class StaticScreenStateService implements ScreenStateService {
   void emitScreenOn() {
     screenOnCount++;
     _events.add(Result.success(ScreenStateEvent.screenOn));
+  }
+
+  /// Test hook: simulates the keyguard being dismissed (Phase 17 / M1).
+  void emitUserPresent() {
+    userPresentCount++;
+    _events.add(Result.success(ScreenStateEvent.userPresent));
   }
 
   @override

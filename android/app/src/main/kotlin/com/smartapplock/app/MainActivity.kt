@@ -232,6 +232,24 @@ class MainActivity : FlutterFragmentActivity() {
          * If no live Activity exists, the explicit recovery intent cold-starts
          * one. Neither path clears the pending shield latch.
          */
+        /**
+         * Phase 17 / M1 (observational): which hand-off path
+         * [foregroundForRecovery] is about to take. Read-only; never used
+         * for enforcement.
+         */
+        fun recoveryLaunchMode(): LatencyLaunchMode = try {
+            val activity = currentActivity?.get()?.takeUnless {
+                it.isFinishing || it.isDestroyed
+            }
+            when {
+                activity == null -> LatencyLaunchMode.COLD_START
+                ProtectionRuntime.activityResumed -> LatencyLaunchMode.RESUMED
+                else -> LatencyLaunchMode.TASK_TO_FRONT
+            }
+        } catch (_: Exception) {
+            LatencyLaunchMode.UNKNOWN
+        }
+
         fun foregroundForRecovery(
             context: Context,
             challenge: ProtectionStateStore.PendingChallenge,

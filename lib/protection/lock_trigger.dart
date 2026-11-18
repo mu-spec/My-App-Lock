@@ -83,6 +83,15 @@ class LockTrigger {
   /// Lock requirements (one per protected-app activation).
   Stream<LockRequired> get lockRequired => _lockRequired.stream;
 
+  /// Phase 17 / M1: the keyguard was dismissed (`ACTION_USER_PRESENT`).
+  /// A latency hint for the challenge host's ready retry only: it is not a
+  /// lock decision and never grants anything. Forwarded from the existing
+  /// screen-state subscription so no extra native consumer is created.
+  final StreamController<void> _keyguardDismissed =
+      StreamController<void>.broadcast(sync: true);
+
+  Stream<void> get keyguardDismissed => _keyguardDismissed.stream;
+
   /// Starts the pipeline: the foreground monitor begins detecting and
   /// every transition is evaluated. Idempotent.
   Future<void> start() async {
@@ -171,6 +180,7 @@ class LockTrigger {
   Future<void> dispose() async {
     await stop();
     await _lockRequired.close();
+    await _keyguardDismissed.close();
   }
 
   /// Phase 5K: consumes and clears the screen-off marker — the app
@@ -255,6 +265,13 @@ class LockTrigger {
   Future<void> _processScreenEvent(Result<ScreenStateEvent> event) async {
     if (event.isFailure) {
       return; // fail-quiet
+    }
+    if (event.valueOrNull == ScreenStateEvent.userPresent) {
+      // Phase 17 / M1: a keyguard-dismissed hint for the challenge host's
+      // ready retry. It is not a screen-on, so the wake re-lock below must
+      // not run for it (behaviour unchanged from before the event existed).
+      if (!_keyguardDismissed.isClosed) _keyguardDismissed.add(null);
+      return;
     }
     if (event.valueOrNull == ScreenStateEvent.screenOff) {
       // Phase 5K: the screen turned off — every unlock session ends NOW.

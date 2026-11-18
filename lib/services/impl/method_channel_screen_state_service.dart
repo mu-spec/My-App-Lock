@@ -111,6 +111,8 @@ class MethodChannelScreenStateService implements ScreenStateService {
                 switch (payload) {
                   'screen_off' => Result.success(ScreenStateEvent.screenOff),
                   'screen_on' => Result.success(ScreenStateEvent.screenOn),
+                  'user_present' =>
+                    Result.success(ScreenStateEvent.userPresent),
                   _ => Result.failure(
                       StateError('Unknown screen-state payload: $payload'),
                     ),

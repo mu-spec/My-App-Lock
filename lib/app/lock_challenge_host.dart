@@ -8,6 +8,7 @@ import '../protection/lock_trigger.dart';
 import '../security/credentials/auth_type.dart';
 import '../security/credentials/credential_state.dart';
 import '../security/credentials/verified_attempt.dart';
+import '../services/impl/native_latency_report_channel.dart';
 import '../services/pending_lock_challenge.dart';
 import '../ui/screens/pattern/pattern_unlock_screen.dart';
 import '../ui/screens/pin/pin_unlock_screen.dart';
@@ -15,6 +16,7 @@ import '../utilities/result.dart';
 import 'app_container.dart';
 import 'app_scope.dart';
 import 'challenge_auth_recorder.dart';
+import 'challenge_latency_recorder.dart';
 import 'router.dart';
 
 /// Phase 5 / Milestone 3 — Fix #3: QA-only diagnostics switch.
@@ -82,6 +84,11 @@ class LockChallengeHost extends StatefulWidget {
 
   final Widget child;
 
+  /// Phase 17 / M1: process-wide, in-memory latency samples (durations and
+  /// labels only). Observational: no host decision ever reads it.
+  static final ChallengeLatencyRecorder latencyRecorder =
+      ChallengeLatencyRecorder();
+
   @override
   State<LockChallengeHost> createState() => _LockChallengeHostState();
 }
@@ -95,6 +102,9 @@ class _LockChallengeHostState extends State<LockChallengeHost>
 
   LockTrigger? _trigger;
   StreamSubscription<LockRequired>? _subscription;
+
+  /// Phase 17 / M1: keyguard-dismissed hints (see [_onKeyguardDismissed]).
+  StreamSubscription<void>? _keyguardSubscription;
 
   /// True while an unlock challenge is on screen (blocks re-entrancy).
   bool _challenging = false;
@@ -279,6 +289,8 @@ class _LockChallengeHostState extends State<LockChallengeHost>
     _container = AppScope.read(context);
     _trigger = _container?.lockTrigger;
     _subscription = _trigger?.lockRequired.listen(_onLockRequired);
+    _keyguardSubscription =
+        _trigger?.keyguardDismissed.listen((_) => _onKeyguardDismissed());
     _trigger?.start();
     unawaited(_bootstrapProtection());
     _applyPersistedGracePeriod();
@@ -292,7 +304,11 @@ class _LockChallengeHostState extends State<LockChallengeHost>
     if (container == null) {
       return;
     }
+    final Stopwatch bootstrapClock = Stopwatch()..start();
     final bootstrap = await container.protectionBootstrap.synchronize();
+    // Phase 17 / M1: cold-start bootstrap cost (duration only).
+    _diag('LATENCY bootstrapSync=${bootstrapClock.elapsedMicroseconds}us '
+        'ok=${bootstrap.isSuccess}');
     if (kDebugMode) {
       debugPrint(
         'LockChallengeHost: protection bootstrap -> ${bootstrap.isSuccess}',
@@ -316,7 +332,10 @@ class _LockChallengeHostState extends State<LockChallengeHost>
     // A native pending ticket is an unresolved authentication requirement,
     // not a fresh foreground decision. It must win over any Dart session or
     // grace state reconstructed during the wake/process lifecycle.
-    await _presentChallenge(challenge.packageName);
+    await _presentChallenge(
+      challenge.packageName,
+      latencySource: ChallengeLatencySource.bootstrap,
+    );
   }
 
   /// Keeps an already-running Flutter engine attached to native wake state.
@@ -340,7 +359,8 @@ class _LockChallengeHostState extends State<LockChallengeHost>
                   : null;
       if (skip != _lastHeartbeatSkip) {
         _lastHeartbeatSkip = skip;
-        _diag('heartbeat recovery ${skip == null ? 'ELIGIBLE' : 'SKIP reason=$skip'}');
+        _diag(
+            'heartbeat recovery ${skip == null ? 'ELIGIBLE' : 'SKIP reason=$skip'}');
       }
       if (skip != null) return;
       final result = await container.watcher.takePendingChallenge();
@@ -370,6 +390,7 @@ class _LockChallengeHostState extends State<LockChallengeHost>
       await _presentChallenge(
         pending.packageName,
         inPlace: _activityResumedUnfocused,
+        latencySource: ChallengeLatencySource.nativePending,
       );
     } finally {
       _checkingNativePending = false;
@@ -419,6 +440,9 @@ class _LockChallengeHostState extends State<LockChallengeHost>
     // teardown timer check passes without this dispose ever awaiting.
     WidgetsBinding.instance.removeObserver(this);
     _subscription?.cancel();
+    _keyguardSubscription?.cancel();
+    _keyguardSubscription = null;
+    LockChallengeHost.latencyRecorder.abandon();
     _trigger?.stop();
     // Phase 5 mobile-QA fix #3A: cancel the settle timer so a pending
     // suppression window can never outlive the host (also keeps
@@ -660,7 +684,10 @@ class _LockChallengeHostState extends State<LockChallengeHost>
       // A persisted native ticket means authentication is still unresolved.
       // Restore it exactly once instead of re-evaluating Dart session/grace
       // state and allowing the dashboard to remain foreground.
-      await _presentChallenge(nativePending.packageName);
+      await _presentChallenge(
+        nativePending.packageName,
+        latencySource: ChallengeLatencySource.nativePending,
+      );
       return;
     }
     // Re-lock enforcement only after a screen-off (5K) or an
@@ -677,12 +704,15 @@ class _LockChallengeHostState extends State<LockChallengeHost>
     await _reevaluateAndChallenge();
   }
 
-  Future<void> _onLockRequired(LockRequired requirement) =>
-      _presentChallenge(requirement.packageName);
+  Future<void> _onLockRequired(LockRequired requirement) => _presentChallenge(
+        requirement.packageName,
+        latencySource: ChallengeLatencySource.lockTrigger,
+      );
 
   Future<void> _presentChallenge(
     String packageName, {
     bool inPlace = false,
+    ChallengeLatencySource latencySource = ChallengeLatencySource.other,
   }) async {
     // Phase 5 mobile-QA diagnostics #1 (temporary): every challenge
     // request gets a diagnostic ID.
@@ -744,9 +774,13 @@ class _LockChallengeHostState extends State<LockChallengeHost>
         _diag('$diagId ABORT no-container package=$packageName');
         return;
       }
+      final ChallengeLatencyRecorder latency =
+          LockChallengeHost.latencyRecorder;
+      latency.begin(latencySource);
 
       final Result<CredentialState> statusResult =
           await container.auth.status();
+      latency.mark(ChallengeLatencyStage.credentialRead);
       // P13/M3 Batch 2 (F-KEY-1e, owner-approved G7-H1 option 2): an
       // UNREADABLE credential state is not "no credential". Nothing is
       // presented, granted or hidden; the native shield stays up and only
@@ -794,6 +828,7 @@ class _LockChallengeHostState extends State<LockChallengeHost>
       // Bring Smart App Lock to the front (basic challenge presentation;
       // the overlay window lands in the lock-screen phase).
       final shown = await container.overlay.showLockChallenge(packageName);
+      latency.mark(ChallengeLatencyStage.nativeShow);
       if (kDebugMode) {
         debugPrint(
           '🔒 LockChallengeHost: showLockChallenge($packageName) -> '
@@ -832,6 +867,7 @@ class _LockChallengeHostState extends State<LockChallengeHost>
       // pattern trail or protected-app state never leak through task
       // switching. Failures are tolerated (hardening, not enforcement).
       await container.overlay.setSecureWindow(true);
+      latency.mark(ChallengeLatencyStage.secureWindow);
 
       _challenging = true;
       _challengeSerial++;
@@ -895,10 +931,12 @@ class _LockChallengeHostState extends State<LockChallengeHost>
         _activeChallengeRoute = presentedRoute;
         final Future<bool?>? unlockFuture =
             widget.navigatorKey.currentState?.push<bool>(presentedRoute);
+        latency.mark(ChallengeLatencyStage.routePushed);
         // Keep the native overlay shield until the Flutter challenge has
         // reached a rendered frame. Native also verifies that MainActivity
         // is resumed; if a background launch was blocked, the shield stays.
         WidgetsBinding.instance.addPostFrameCallback((_) {
+          latency.mark(ChallengeLatencyStage.firstFrame);
           if (mounted && _activeNativeChallenge == nativeChallenge) {
             unawaited(_handOffChallengeReady());
           }
@@ -997,6 +1035,8 @@ class _LockChallengeHostState extends State<LockChallengeHost>
     _challengeSerial++;
     _readyHandoffRerun = false;
     _cancelReadyRetry();
+    // Phase 17 / M1: a measurement that never became ready ends here.
+    LockChallengeHost.latencyRecorder.abandon();
     // Phase 5 mobile-QA diagnostics #1 (temporary): the challenge
     // closed — classify the exact reason.
     final String dismissalReason;
@@ -1098,7 +1138,8 @@ class _LockChallengeHostState extends State<LockChallengeHost>
       _readyHandoffInFlight = false;
     }
     if (!mounted || serial != _challengeSerial || !_challenging) {
-      _diag('READY result DISCARDED reason=stale generation=${ticket.generation}');
+      _diag(
+          'READY result DISCARDED reason=stale generation=${ticket.generation}');
       return; // stale: the route closed or the host was disposed
     }
     if (_readyHandoffRerun || _activeNativeChallenge != ticket) {
@@ -1111,7 +1152,9 @@ class _LockChallengeHostState extends State<LockChallengeHost>
       'generation=${ticket.generation} accepted=$accepted'
       '${accepted ? ' (native released the shield)' : ''}',
     );
-    if (!accepted) {
+    if (accepted) {
+      _recordReadyLatency();
+    } else {
       _scheduleReadyRetry();
     }
   }
@@ -1212,6 +1255,55 @@ class _LockChallengeHostState extends State<LockChallengeHost>
   void _cancelReadyRetry() {
     _readyRetryTimer?.cancel();
     _readyRetryTimer = null;
+  }
+
+  /// Phase 17 / M1 optimization: ACTION_USER_PRESENT (keyguard dismissed,
+  /// forwarded by [LockTrigger.keyguardDismissed] from the existing
+  /// screen-state subscription) runs an ALREADY-SCHEDULED readiness retry
+  /// now instead of when its
+  /// one-second timer fires. Dismissing the keyguard produces no Flutter
+  /// lifecycle event, so before this the shield-to-challenge hand-off
+  /// waited up to [_readyRetryInterval] after the user unlocked.
+  ///
+  /// It changes timing only. It acts only when a rejected acknowledgement
+  /// already armed a retry and the Activity is visible (the same condition
+  /// the timer path requires); otherwise the timer is left untouched. The
+  /// retry is the existing [_retryReadyHandoff]: it re-reads the exact
+  /// native ticket, and native still accepts only the exact ticket while
+  /// the Activity is resumed, full-screen and the keyguard is unlocked. A
+  /// rejection re-arms the same bounded timer. Nothing is granted or
+  /// hidden here, and a lost event leaves the existing timer in charge.
+  void _onKeyguardDismissed() {
+    if (!mounted ||
+        !_challenging ||
+        _readyRetryTimer == null ||
+        !_activityVisible) {
+      return;
+    }
+    _cancelReadyRetry();
+    LockChallengeHost.latencyRecorder.begin(ChallengeLatencySource.userPresent);
+    _diag('READY retry EARLY reason=user-present');
+    unawaited(_retryReadyHandoff());
+  }
+
+  /// Phase 17 / M1: closes the open latency measurement, if any. Logged
+  /// only under the QA/debug diagnostics policy; durations and labels only.
+  void _recordReadyLatency() {
+    final ChallengeLatencyRecorder latency = LockChallengeHost.latencyRecorder;
+    if (!latency.isOpen) return;
+    latency.mark(ChallengeLatencyStage.readyAccepted);
+    final List<ChallengeLatencySample> samples = latency.samples;
+    if (samples.isNotEmpty) {
+      _diag(ChallengeLatencyRecorder.describe(samples.last));
+    }
+    if (_kQaDiagnostics) {
+      // QA builds only: the native stage durations of the same hand-off.
+      unawaited(
+        const NativeLatencyReportChannel().fetch().then(
+              (String? report) => _diag('NATIVE-LATENCY ${report ?? 'n/a'}'),
+            ),
+      );
+    }
   }
 
   /// Fix #2: one readiness retry. It re-reads the native ticket because

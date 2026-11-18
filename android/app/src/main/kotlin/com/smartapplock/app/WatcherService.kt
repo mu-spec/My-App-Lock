@@ -92,6 +92,7 @@ class WatcherService : Service() {
                     }
                 }
                 Intent.ACTION_SCREEN_ON -> {
+                    val detectedNs = LockLatency.nowNs()
                     val pending = ProtectionStateStore.restoreWakeReauthChallenge(context)
                     DiagLog.d(context, TAG) { "SCREEN_ON pending=$pending" }
                     if (pending != null &&
@@ -101,10 +102,12 @@ class WatcherService : Service() {
                             context,
                             pending.packageName,
                             WakeRecoverySignal.SCREEN_ON,
+                            LockLatency.tracer.start(LatencyTrigger.SCREEN_ON, detectedNs),
                         )
                     }
                 }
                 Intent.ACTION_USER_PRESENT -> {
+                    val detectedNs = LockLatency.nowNs()
                     val pending = ProtectionStateStore.restoreWakeReauthChallenge(context)
                     DiagLog.d(context, TAG) { "USER_PRESENT pending=$pending" }
                     if (pending != null &&
@@ -116,6 +119,7 @@ class WatcherService : Service() {
                             context,
                             pending.packageName,
                             WakeRecoverySignal.USER_PRESENT,
+                            LockLatency.tracer.start(LatencyTrigger.USER_PRESENT, detectedNs),
                         )
                     }
                 }
@@ -318,6 +322,7 @@ class WatcherService : Service() {
          */
         private fun restoreAfterProcessRestartIfNeeded(context: Context) {
             if (!restartRecoveryLatch.tryAcquire()) return
+            val detectedNs = LockLatency.nowNs()
             try {
                 val nowElapsed = SystemClock.elapsedRealtime()
                 val nowWall = System.currentTimeMillis()
@@ -371,8 +376,15 @@ class WatcherService : Service() {
                     target,
                 ) ?: return
                 ProtectionStateStore.rememberWakeReauthPackage(context, ticket.packageName)
+                val latencyStart =
+                    LockLatency.tracer.start(LatencyTrigger.PROCESS_RESTART, detectedNs)
                 ProtectionOverlayController.show(context)
-                recoverProtected(context, ticket.packageName, WakeRecoverySignal.RETRY)
+                recoverProtected(
+                    context,
+                    ticket.packageName,
+                    WakeRecoverySignal.RETRY,
+                    latencyStart,
+                )
             } catch (e: Exception) {
                 DiagLog.w(context, TAG) { "Restart recovery failed: ${e.javaClass.simpleName}" }
                 try {
@@ -442,6 +454,8 @@ class WatcherService : Service() {
             // never logged, persisted or forwarded to Dart.
             windowClass: String? = null,
         ) {
+            // Phase 17 / M1: stage 1 (observational; monotonic clock).
+            val detectedNs = LockLatency.nowNs()
             if (source == ForegroundSource.ACCESSIBILITY &&
                 packageName != context.packageName
             ) {
@@ -513,9 +527,12 @@ class WatcherService : Service() {
                 ProtectionAccessState.revokeAll()
                 return
             }
+            var wakePersistNs = -1L
             if (protected) {
                 cancelChallengeAbandonCandidate()
+                val wakeWriteStartNs = LockLatency.nowNs()
                 ProtectionStateStore.rememberWakeReauthPackage(context, packageName)
+                wakePersistNs = LockLatency.nowNs() - wakeWriteStartNs
             } else {
                 // H-1: System UI, framework and keyboard windows report a
                 // package without the user leaving. They prove nothing.
@@ -592,6 +609,8 @@ class WatcherService : Service() {
                     context,
                     packageName,
                     WakeRecoverySignal.FOREGROUND,
+                    LockLatency.tracer.start(LatencyTrigger.FOREGROUND, detectedNs),
+                    wakePersistNs,
                 )
             }
 
@@ -652,6 +671,9 @@ class WatcherService : Service() {
             context: Context,
             packageName: String,
             signal: WakeRecoverySignal,
+            // Phase 17 / M1: observational latency stamps only.
+            latencyStart: LatencyStart? = null,
+            wakePersistNs: Long = -1L,
         ) {
             val now = SystemClock.elapsedRealtime()
             if (!recoveryGate.shouldAttempt(packageName, signal, now)) {
@@ -677,8 +699,16 @@ class WatcherService : Service() {
 
             // Security-critical order: shield first, activity hand-off second.
             val shielded = ProtectionOverlayController.show(context)
+            LockLatency.tracer.shieldShown(pending.generation, shielded, latencyStart)
+            val launchMode = if (shielded) MainActivity.recoveryLaunchMode() else null
             val launched = shielded &&
                 MainActivity.foregroundForRecovery(context, pending)
+            if (launchMode != null) {
+                LockLatency.tracer.activityRequested(pending.generation, launchMode, launched)
+            }
+            if (wakePersistNs >= 0L) {
+                LockLatency.tracer.wakePersisted(pending.generation, wakePersistNs)
+            }
             when {
                 !shielded -> ProtectionStateStore.setLastError(
                     context,

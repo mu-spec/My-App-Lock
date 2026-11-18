@@ -42,12 +42,17 @@ object ScreenStateChannel {
                             when (intent?.action) {
                                 Intent.ACTION_SCREEN_OFF -> events?.success("screen_off")
                                 Intent.ACTION_SCREEN_ON -> events?.success("screen_on")
+                                // Phase 17 / M1: keyguard dismissed. A hint
+                                // for Dart to retry a rejected ready hand-off
+                                // now; it grants and hides nothing.
+                                Intent.ACTION_USER_PRESENT -> events?.success("user_present")
                             }
                         }
                     }
                     val filter = IntentFilter().apply {
                         addAction(Intent.ACTION_SCREEN_OFF)
                         addAction(Intent.ACTION_SCREEN_ON)
+                        addAction(Intent.ACTION_USER_PRESENT)
                     }
                     receiver = newReceiver
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

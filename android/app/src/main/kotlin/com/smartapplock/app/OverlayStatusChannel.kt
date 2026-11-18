@@ -69,6 +69,9 @@ object OverlayStatusChannel {
                         // background activity start can never expose the
                         // protected app as usable content.
                         val shielded = ProtectionOverlayController.show(activity)
+                        // Phase 17 / M1: observational. Opens an attempt only
+                        // when native recovery has not already done so.
+                        LockLatency.tracer.shieldShown(pending.generation, shielded, null)
                         val launched = shielded &&
                             (ProtectionRuntime.activityResumed ||
                                 launchLockChallenge(activity))
@@ -82,6 +85,18 @@ object OverlayStatusChannel {
                             null,
                         )
                     }
+                }
+                "getLatencyReport" -> {
+                    // Phase 17 / M1 QA export (read-only, in-process): the
+                    // privacy-safe aggregate (durations and enum labels
+                    // only). Never consulted for enforcement.
+                    result.success(
+                        try {
+                            LockLatencyTracer.render(LockLatency.tracer.report())
+                        } catch (_: Exception) {
+                            null
+                        },
+                    )
                 }
                 "hideLockChallenge" -> {
                     // Authentication may race with ACTION_SCREEN_OFF. A new
@@ -124,6 +139,8 @@ object OverlayStatusChannel {
                         ProtectionRuntime.markChallengeReady(checkNotNull(exactPending))
                         val hidden = ProtectionOverlayController.hide()
                         if (hidden) {
+                            // Phase 17 / M1: stage 5 (observational).
+                            LockLatency.tracer.challengeReady(exactPending.generation)
                             WatcherService.onChallengeHandoffComplete()
                         } else {
                             WatcherService.onChallengeHandoffFailed(
