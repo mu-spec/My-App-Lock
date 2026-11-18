@@ -26,6 +26,7 @@ import 'package:smart_app_lock/security/storage/secret_store.dart';
 import 'package:smart_app_lock/services/biometric_service.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_apps_step.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_decision.dart';
+import 'package:smart_app_lock/ui/screens/onboarding/onboarding_health_step.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_permissions_step.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_screen.dart';
 import 'package:smart_app_lock/ui/screens/pattern/pattern_setup_screen.dart';
@@ -175,14 +176,19 @@ void main() {
   Finder onboarding() => find.byType(OnboardingScreen);
   Finder shell() => find.byType(MainShell);
 
-  /// Phase 15 / M2 continues after the biometric step: skip permissions
+  /// Phase 15 / M2–M3 continue after the biometric step: skip permissions
   /// (none granted in these containers) and the suggested apps (none
-  /// installed), which protects nothing and ends at the shell.
+  /// installed), then leave the health check; ends at the shell.
   Future<void> skipM2Steps(WidgetTester tester) async {
     expect(find.text(OnboardingPermissionsStep.title), findsOneWidget);
     await tapText(tester, OnboardingPermissionsStep.skipLabel);
     expect(find.text(OnboardingAppsStep.title), findsOneWidget);
     await tapText(tester, OnboardingAppsStep.continueLabel);
+    // Phase 15 / M3: no protected app, so the first health check reports
+    // incomplete setup; finishing anyway reaches the shell.
+    expect(find.text(OnboardingHealthStep.incompleteTitle), findsOneWidget);
+    expect(find.text(OnboardingHealthStep.activeTitle), findsNothing);
+    await tapText(tester, OnboardingHealthStep.finishAnywayLabel);
   }
 
   // -------------------------------------------------------------------------

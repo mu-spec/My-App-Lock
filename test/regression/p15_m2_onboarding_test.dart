@@ -36,6 +36,7 @@ import 'package:smart_app_lock/services/impl/static_installed_apps_service.dart'
 import 'package:smart_app_lock/services/impl/static_overlay_lock_service.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_apps_step.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_decision.dart';
+import 'package:smart_app_lock/ui/screens/onboarding/onboarding_health_step.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_permissions_step.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_screen.dart';
 import 'package:smart_app_lock/ui/screens/permissions/accessibility_setup_screen.dart';
@@ -189,6 +190,19 @@ void main() {
   }
 
   Finder shell() => find.byType(MainShell);
+
+  /// Phase 15 / M3 follows the apps step: leave the health/completion step
+  /// (whatever its outcome) to reach the shell.
+  Future<void> finishHealth(WidgetTester tester) async {
+    await tester.pumpAndSettle();
+    final Finder active = find.text(OnboardingHealthStep.finishLabel);
+    await tapFinder(
+      tester,
+      active.evaluate().isNotEmpty
+          ? active
+          : find.text(OnboardingHealthStep.finishAnywayLabel),
+    );
+  }
 
   // -------------------------------------------------------------------------
   // P: permissions
@@ -399,6 +413,7 @@ void main() {
       expect(protect.enabled, isFalse, reason: 'nothing selected');
 
       await tapText(tester, OnboardingAppsStep.skipLabel);
+      await finishHealth(tester);
       expect(shell(), findsOneWidget);
       expect(await tester.runAsync(() => protectedSet(c)), isEmpty);
     });
@@ -423,6 +438,7 @@ void main() {
           reason: 'selection alone writes nothing');
 
       await tapText(tester, OnboardingAppsStep.protectLabel(2));
+      await finishHealth(tester);
       expect(shell(), findsOneWidget);
       final List<ProtectedApp> saved =
           (await tester.runAsync(() => c.protectedApps.getProtectedApps()))!
@@ -497,6 +513,7 @@ void main() {
       expect(find.text(OnboardingAppsStep.loadFailedText), findsOneWidget);
       expect(db.writes, 0);
       await tapText(tester, OnboardingAppsStep.continueLabel);
+      await finishHealth(tester);
       expect(shell(), findsOneWidget);
       expect(db.writes, 0);
     });
@@ -563,6 +580,7 @@ void main() {
             .setSecurityLevel('com.whatsapp', AppSecurityLevel.critical);
       });
       await tapText(tester, OnboardingAppsStep.protectLabel(1));
+      await finishHealth(tester);
       expect(shell(), findsOneWidget);
       final ProtectedApp wa =
           (await tester.runAsync(() => c.protectedApps.getProtectedApps()))!
@@ -671,6 +689,7 @@ void main() {
       await throughM1(tester);
       await tapText(tester, OnboardingPermissionsStep.continueLabel);
       await tapText(tester, OnboardingAppsStep.skipLabel);
+      await finishHealth(tester);
       expect(shell(), findsOneWidget);
       expect(await tester.runAsync(() => c.preferences.isOnboardingCompleted()),
           isTrue);

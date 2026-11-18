@@ -15,15 +15,24 @@ import '../pattern/pattern_setup_screen.dart';
 import '../pin/pin_setup_screen.dart';
 import '../security/app_credential_verification.dart';
 import 'onboarding_apps_step.dart';
+import 'onboarding_health_step.dart';
 import 'onboarding_permissions_step.dart';
 
-/// Onboarding steps: M1 (welcome, authentication, biometric) and M2
-/// (permissions, apps). M3 steps are not built yet.
-enum OnboardingStep { welcome, authentication, biometric, permissions, apps }
+/// Onboarding steps: M1 (welcome, authentication, biometric), M2
+/// (permissions, apps) and M3 (health check + completion).
+enum OnboardingStep {
+  welcome,
+  authentication,
+  biometric,
+  permissions,
+  apps,
+  health,
+}
 
-/// First-launch onboarding (Phase 15 / Milestones 1–2):
+/// First-launch onboarding (Phase 15 / Milestones 1–3):
 /// Welcome → PIN/pattern setup → optional biometric activation →
-/// permission education and guided setup → optional suggested apps.
+/// permission education and guided setup → optional suggested apps →
+/// initial Protection Health check and completion.
 ///
 /// Security rules:
 ///  * Shown only when no credential exists (see `shouldStartOnboarding`).
@@ -40,6 +49,10 @@ enum OnboardingStep { welcome, authentication, biometric, permissions, apps }
 ///  * Permissions and apps (M2) come only after a credential exists; they
 ///    reuse the existing setup flows and only ADD protection on explicit
 ///    user selection (see [OnboardingPermissionsStep], [OnboardingAppsStep]).
+///  * The completion step (M3) shows "You're Protected" only when the shared
+///    Protection Health monitor confirms SECURE in a fresh snapshot; missing
+///    setup and unknown status are shown as such (see
+///    [classifyOnboardingCompletion]). The outcome never gates leaving.
 ///  * The onboarding flag is written on completion as a UX record only.
 class OnboardingScreen extends StatefulWidget {
   const OnboardingScreen({super.key});
@@ -316,7 +329,12 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                 ),
               OnboardingStep.apps => OnboardingAppsStep(
                   key: const ValueKey<String>('onboarding_apps_step'),
-                  onDone: _finish,
+                  onDone: () => _goTo(OnboardingStep.health),
+                ),
+              OnboardingStep.health => OnboardingHealthStep(
+                  key: const ValueKey<String>('onboarding_health_step'),
+                  onFinish: _finish,
+                  onReviewSetup: _toPermissions,
                 ),
             },
           ),
