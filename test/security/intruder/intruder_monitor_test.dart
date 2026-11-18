@@ -12,6 +12,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:cryptography/cryptography.dart'
+    show SecretBoxAuthenticationError;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:smart_app_lock/data/storage/impl/in_memory_local_database.dart';
 import 'package:smart_app_lock/data/storage/local_database.dart';
@@ -27,6 +29,82 @@ import 'package:smart_app_lock/security/storage/impl/in_memory_secret_store.dart
 
 const String _key = IntruderFailureLogStore.storageKey;
 const String _qKey = IntruderFailureLogStore.quarantineKey;
+
+/// Characters a base64 payload may contain.
+final RegExp _base64Char = RegExp(r'[A-Za-z0-9+/=]');
+
+/// P15 correction (flake R-FLAKE-1): deterministic plaintext-exposure check
+/// for an `enc:v1:` envelope. Returns the problems found (empty = sealed).
+///
+/// Replaces `isNot(contains('pin'))` on random ciphertext: 'pin' is made only
+/// of base64 characters, so it appeared by chance in ~0.16% of runs (~425
+/// possible positions x 64^-3). Instead:
+///  * the payload must be strict base64, so no JSON structure (`{`, `"`, `:`)
+///    or dotted package name can appear in clear — a text search for a token
+///    holding a non-base64 character can therefore never match by chance;
+///  * when the plaintext is known, the decoded bytes must be exactly the
+///    AES-GCM layout `nonce(12) || ciphertext(len) || tag(16)`;
+///  * the decoded bytes must not contain the plaintext or any sensitive token
+///    (tokens are >= 12 bytes, so a chance match is below 2^-90).
+List<String> envelopeExposureProblems(
+  String raw, {
+  String? plaintext,
+  required List<String> sensitive,
+}) {
+  for (final String token in sensitive) {
+    // Guard: never fall back to the flaky form (a short, all-base64 token).
+    if (utf8.encode(token).length < 12 ||
+        token.split('').every(_base64Char.hasMatch)) {
+      throw ArgumentError.value(token, 'sensitive',
+          'must be >= 12 bytes and hold a non-base64 character');
+    }
+  }
+  final List<String> problems = <String>[];
+  const String prefix = 'enc:v1:';
+  if (!raw.startsWith(prefix)) {
+    return <String>['missing $prefix prefix'];
+  }
+  final String payload = raw.substring(prefix.length);
+  if (payload.isEmpty ||
+      payload.length % 4 != 0 ||
+      !RegExp(r'^[A-Za-z0-9+/]+={0,2}$').hasMatch(payload)) {
+    return <String>['payload is not strict base64'];
+  }
+  for (final String token in sensitive) {
+    if (raw.contains(token)) problems.add('text contains $token');
+  }
+  final List<int> bytes = base64Decode(payload);
+  bool holds(List<int> needle) {
+    for (int i = 0; i + needle.length <= bytes.length; i++) {
+      int j = 0;
+      while (j < needle.length && bytes[i + j] == needle[j]) {
+        j++;
+      }
+      if (j == needle.length) return true;
+    }
+    return false;
+  }
+
+  if (plaintext != null) {
+    final List<int> clear = utf8.encode(plaintext);
+    if (bytes.length != 12 + clear.length + 16) {
+      problems.add('decoded length ${bytes.length} is not '
+          'nonce(12) + plaintext(${clear.length}) + tag(16)');
+    }
+    if (holds(clear)) problems.add('decoded bytes hold the plaintext');
+  }
+  for (final String token in sensitive) {
+    if (holds(utf8.encode(token))) problems.add('decoded bytes hold $token');
+  }
+  return problems;
+}
+
+/// Sensitive plaintext of the encryption test's log entry.
+const List<String> _sensitive = <String>[
+  'com.example.chat',
+  '"pkg":"com.example.chat"',
+  '"method":"pin"',
+];
 
 /// Database with switchable read/write faults and an optional write gate.
 class _FaultDb extends InMemoryLocalDatabase {
@@ -410,10 +488,100 @@ void main() {
       final String raw = (await db.getSetting(_key))!;
       expect(raw, startsWith('enc:v1:'));
       expect(raw, isNot(contains('com.example.chat')));
-      expect(raw, isNot(contains('pin')));
+      // R-FLAKE-1: deterministic structural checks replace the old
+      // `isNot(contains('pin'))`, which matched random base64 by chance.
+      final String payload = raw.substring('enc:v1:'.length);
+      final String plaintext = await cipher.decryptString(payload);
+      // Non-vacuous: the sealed plaintext really holds the sensitive values.
+      for (final String token in _sensitive) {
+        expect(plaintext, contains(token));
+      }
+      expect(
+        envelopeExposureProblems(raw,
+            plaintext: plaintext, sensitive: _sensitive),
+        isEmpty,
+      );
+      // Authenticated encryption: another key cannot open it.
+      final SettingsCipher other = AesGcmSettingsCipher(InMemorySecretStore(),
+          database: InMemoryLocalDatabase());
+      await other.encryptString('creates a different key');
+      await expectLater(other.decryptString(payload),
+          throwsA(isA<SecretBoxAuthenticationError>()));
       // And it round-trips through a fresh monitor with the same key.
       expect((await log(build(s: enc))).events.single.packageName,
           'com.example.chat');
+    });
+
+    group('R-FLAKE-1 regression: the old "pin" assertion was probabilistic',
+        () {
+      // The exact envelope that failed the P15 final full run (the key was
+      // random and is gone). It is valid ciphertext that holds "pin" only by
+      // chance: "...MACogrpin/oiIaA...".
+      const String observed = 'enc:v1:NXHftK1y8zAxAegu2GbGPFmkuDNg165k+CVJr/9F8'
+          'CjGJQYoP3ud2XtSsd1lR8NZbrm5XeCukyqhVFN4zwS3rvuB1gwtocw4BBdBCtxTXaix+'
+          'oHJkA/T9P2vqP116AlptoqhayOMz7QjhnF/dKsBYoWt4oxqSO7apzwD/6iEQPqdRhH0g'
+          '4CQjmDmyHiPgFO7GJMMRWAPTvrOYNL+5PVUh1GVV3N44YIZ/4IBotqokLMPyIJERBKGv'
+          'iVWgu6bmLkRkh1lYK94cjuTX3Ft52F/4z0aCAzaA5wxO8ROVkSlIaERujwYNafbBKRak'
+          'tRrcyi3usEXBj42vHiGoLHHVpFyO6z+ScMaXa5hBBxPbsNl9qot5Nq6nsJvYn44LvbPh'
+          'MACogrpin/oiIaAmdVTWYTb77LL8W6rUaBKwA==';
+
+      test(
+          'the observed ciphertext trips the old check but holds no '
+          'plaintext structure', () {
+        // Old assertion: false positive on genuine ciphertext.
+        expect(observed.contains('pin'), isTrue);
+        // Why: every character of "pin" is a base64 character...
+        expect('pin'.split('').every(_base64Char.hasMatch), isTrue);
+        // ...so arbitrary bytes can print it: base64Decode('pinA') is three
+        // bytes any ciphertext may contain at an aligned offset.
+        final List<int> chance = base64Decode('pinA');
+        expect(
+            base64Encode(<int>[0x30, 0x0A, 0x20, ...chance]), contains('pin'));
+        // The deterministic check accepts the observed envelope.
+        expect(
+            envelopeExposureProblems(observed, sensitive: _sensitive), isEmpty);
+      });
+
+      test('the new check is not weaker: it reports real exposure', () {
+        const String json = '{"seq":0,"method":"pin","pkg":"com.example.chat"}';
+        final List<int> clear = utf8.encode(json);
+        // Plaintext stored in clear behind the prefix.
+        expect(envelopeExposureProblems('enc:v1:$json', sensitive: _sensitive),
+            isNotEmpty);
+        // Base64 of the plaintext (encoding, not encryption).
+        expect(
+            envelopeExposureProblems('enc:v1:${base64Encode(clear)}',
+                plaintext: json, sensitive: _sensitive),
+            containsAll(<Object>[
+              contains('decoded length'),
+              'decoded bytes hold the plaintext',
+              'decoded bytes hold "method":"pin"',
+            ]));
+        // Plaintext hidden inside an AES-GCM-shaped payload.
+        final List<int> shaped = <int>[
+          ...List<int>.filled(12, 7),
+          ...clear,
+          ...List<int>.filled(16, 9),
+        ];
+        expect(
+            envelopeExposureProblems('enc:v1:${base64Encode(shaped)}',
+                plaintext: json, sensitive: _sensitive),
+            contains('decoded bytes hold the plaintext'));
+        // A non-envelope is rejected outright.
+        expect(envelopeExposureProblems(json, sensitive: _sensitive),
+            <String>['missing enc:v1: prefix']);
+      });
+
+      test('the helper refuses the flaky form of token', () {
+        expect(
+            () =>
+                envelopeExposureProblems(observed, sensitive: <String>['pin']),
+            throwsArgumentError);
+        expect(
+            () => envelopeExposureProblems(observed,
+                sensitive: <String>['AAAAAAAAAAAAAAAA']),
+            throwsArgumentError);
+      });
     });
 
     test('toString of events and contexts redacts the package', () {
