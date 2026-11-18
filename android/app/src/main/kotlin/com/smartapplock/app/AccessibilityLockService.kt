@@ -70,12 +70,24 @@ class AccessibilityLockService : AccessibilityService() {
 
     override fun onUnbind(intent: Intent?): Boolean {
         AccessibilityConnection.onDisconnected()
+        revokeOnDisconnect()
         return super.onUnbind(intent)
     }
 
     override fun onDestroy() {
         AccessibilityConnection.onDisconnected()
+        revokeOnDisconnect()
         super.onDestroy()
+    }
+
+    /** Phase 17 / M3 (A11Y-1): no native grant outlives this source. */
+    private fun revokeOnDisconnect() {
+        if (WatcherTeardownPolicy.revokesOnAccessibilityDisconnect(
+                protectionEnabled = ProtectionStateStore.isEnabled(this),
+            )
+        ) {
+            ProtectionAccessState.revokeAll()
+        }
     }
 
     companion object {

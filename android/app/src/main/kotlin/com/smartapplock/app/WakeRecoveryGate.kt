@@ -789,4 +789,15 @@ object WatcherTeardownPolicy {
      */
     fun revokesOnEngineDetach(protectionEnabled: Boolean, watcherRunning: Boolean): Boolean =
         protectionEnabled && !watcherRunning
+
+    /**
+     * Phase 17 / M3 (A11Y-1): an Accessibility unbind or destroy while the
+     * process lives on ends the primary foreground source. Leaves during the
+     * outage can go unobserved (no UsageEvents fallback), and after a rebind
+     * the first report for the same package would otherwise renew the stale
+     * grant. No grant may span that interval, so it ends now. Tickets, the
+     * ready hand-off and the shield are untouched; nothing is granted.
+     */
+    fun revokesOnAccessibilityDisconnect(protectionEnabled: Boolean): Boolean =
+        protectionEnabled
 }

@@ -302,6 +302,15 @@ class StaticNativeChallengeContract {
     }
   }
 
+  /// `AccessibilityLockService.onUnbind` / `onDestroy` (process alive) with
+  /// Phase 17 / M3 `WatcherTeardownPolicy.revokesOnAccessibilityDisconnect`:
+  /// every native authorization ends; tickets, hand-off and shield are kept.
+  void accessibilityDisconnected() {
+    if (enabled) {
+      authorizedPackages.clear(); // ProtectionAccessState.revokeAll()
+    }
+  }
+
   /// `WakeIdentityBootScope.WALL_CLOCK_TOLERANCE_MS`.
   static const int wallClockToleranceMs = 10000;
 
