@@ -175,6 +175,17 @@ class MainActivity : FlutterFragmentActivity() {
         KeyWrapChannel.register(flutterEngine)
     }
 
+    /**
+     * Phase 17 / M2 (R3): Flutter does not cancel EventChannel streams when
+     * an engine is destroyed, so the static Accessibility sink installed by
+     * this engine is released here. Owner-checked: a newer engine's sink is
+     * never cleared. Native enforcement does not use this sink.
+     */
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        AccessibilityLockService.releaseEventSink(flutterEngine)
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,

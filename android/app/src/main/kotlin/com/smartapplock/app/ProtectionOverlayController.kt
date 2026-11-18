@@ -173,6 +173,21 @@ object ProtectionOverlayController {
         showMultiWindowNotice(false)
         val manager = windowManager ?: return false
         val params = layoutParams ?: return false
+        // Phase 17 / M2 (R2): an already-released, still-attached shield in
+        // the exact standby layout needs no WindowManager relayout. Every
+        // other state takes the unchanged path below.
+        if (!ShieldStandbyPolicy.relayoutNeeded(
+                showing = showing,
+                attachedToWindow = active.isAttachedToWindow,
+                viewInvisible = active.visibility == View.INVISIBLE,
+                standbyLayoutInPlace = params.width == WindowManager.LayoutParams.MATCH_PARENT &&
+                    params.height == WindowManager.LayoutParams.MATCH_PARENT &&
+                    params.flags == standbyFlags() &&
+                    params.alpha == 0f,
+            )
+        ) {
+            return true
+        }
         return try {
             params.width = WindowManager.LayoutParams.MATCH_PARENT
             params.height = WindowManager.LayoutParams.MATCH_PARENT

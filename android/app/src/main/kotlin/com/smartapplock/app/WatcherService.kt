@@ -32,6 +32,10 @@ enum class ForegroundSource { ACCESSIBILITY, USAGE_EVENTS }
 class WatcherService : Service() {
     private val handler = Handler(Looper.getMainLooper())
 
+    // Phase 17 / M2 (R1): re-post the notification only when its text
+    // changes or the last post is stale; see ForegroundNotificationRefresher.
+    private val notificationRefresher = ForegroundNotificationRefresher()
+
     private val recoveryRetry = object : Runnable {
         override fun run() {
             if (isSafeExitInProgress()) {
@@ -166,7 +170,8 @@ class WatcherService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val notification = buildNotification()
+        val notificationText = notificationText()
+        val notification = buildNotification(notificationText)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID,
@@ -175,6 +180,9 @@ class WatcherService : Service() {
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
+        }
+        synchronized(notificationRefresher) {
+            notificationRefresher.markPosted(notificationText, SystemClock.elapsedRealtime())
         }
         if (WatcherTeardownPolicy.clearsLastErrorOnStart(ProtectionStateStore.lastErrorCode(this))) {
             ProtectionStateStore.setLastError(this, null)
@@ -229,7 +237,13 @@ class WatcherService : Service() {
         super.onDestroy()
     }
 
-    private fun buildNotification(): Notification {
+    private fun notificationText(): String = if (ProtectionRuntime.isEngineHealthy()) {
+        "Protection engine active"
+    } else {
+        "Protection recovery active"
+    }
+
+    private fun buildNotification(text: String): Notification {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(
@@ -248,11 +262,6 @@ class WatcherService : Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val text = if (ProtectionRuntime.isEngineHealthy()) {
-            "Protection engine active"
-        } else {
-            "Protection recovery active"
-        }
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
         } else {
@@ -268,9 +277,19 @@ class WatcherService : Service() {
             .build()
     }
 
+    /**
+     * Called on every Dart heartbeat (2 s) and when the engine is marked
+     * unavailable. Phase 17 / M2 (R1): a health-text change is posted at
+     * once; an unchanged text at most once per refresh window.
+     */
     private fun refreshNotification() {
+        val text = notificationText()
+        val post = synchronized(notificationRefresher) {
+            notificationRefresher.take(text, SystemClock.elapsedRealtime())
+        }
+        if (!post) return
         getSystemService(NotificationManager::class.java)
-            .notify(NOTIFICATION_ID, buildNotification())
+            .notify(NOTIFICATION_ID, buildNotification(text))
     }
 
     private fun scheduleRecoveryRetry() {

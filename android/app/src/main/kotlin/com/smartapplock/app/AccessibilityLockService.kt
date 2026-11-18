@@ -82,9 +82,19 @@ class AccessibilityLockService : AccessibilityService() {
         /**
          * The Dart-side event sink, installed by
          * [AccessibilityStatusChannel] while a listener is attached.
-         * Volatile: the service and the engine run on different threads.
+         * Phase 17 / M2 (R3): owner-checked so the engine that installed it
+         * (and only that engine) clears it on cancel or engine teardown.
          */
-        @Volatile
-        var eventSink: EventChannel.EventSink? = null
+        private val sinkSlot = OwnedSlot<EventChannel.EventSink>()
+
+        val eventSink: EventChannel.EventSink?
+            get() = sinkSlot.value
+
+        fun attachEventSink(owner: Any, sink: EventChannel.EventSink?) {
+            sinkSlot.attach(owner, sink)
+        }
+
+        /** Clears the sink only if [owner] installed it. */
+        fun releaseEventSink(owner: Any): Boolean = sinkSlot.release(owner)
     }
 }

@@ -71,11 +71,12 @@ object AccessibilityStatusChannel {
         eventChannel.setStreamHandler(
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                    AccessibilityLockService.eventSink = events
+                    // Phase 17 / M2 (R3): the engine owns the sink it installs.
+                    AccessibilityLockService.attachEventSink(engine, events)
                 }
 
                 override fun onCancel(arguments: Any?) {
-                    AccessibilityLockService.eventSink = null
+                    AccessibilityLockService.releaseEventSink(engine)
                 }
             },
         )
