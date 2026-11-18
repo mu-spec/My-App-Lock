@@ -44,8 +44,10 @@ class ProtectionEngineHealth {
         (ProtectionEngineState state) => state.name == rawState,
         orElse: () => ProtectionEngineState.unavailable,
       ),
+      // P18/M1 F18-1: only an explicit Android `true` is granted; an absent
+      // or malformed value is never reported as granted.
       notificationPermissionGranted:
-          map['notificationPermissionGranted'] as bool? ?? true,
+          map['notificationPermissionGranted'] == true,
       // NF-RG-1: validated again here; raw platform text is never kept.
       lastErrorCode: WatcherLastErrorCode.fromNative(map),
       accessibilityServiceConnected: _optionalBool(
