@@ -14,12 +14,16 @@ import '../../widgets/secure_storage_unavailable.dart';
 import '../pattern/pattern_setup_screen.dart';
 import '../pin/pin_setup_screen.dart';
 import '../security/app_credential_verification.dart';
+import 'onboarding_apps_step.dart';
+import 'onboarding_permissions_step.dart';
 
-/// Onboarding steps (Phase 15 / M1). M2/M3 steps are not built yet.
-enum OnboardingStep { welcome, authentication, biometric }
+/// Onboarding steps: M1 (welcome, authentication, biometric) and M2
+/// (permissions, apps). M3 steps are not built yet.
+enum OnboardingStep { welcome, authentication, biometric, permissions, apps }
 
-/// First-launch onboarding (Phase 15 / Milestone 1):
-/// Welcome → PIN/pattern setup → optional biometric activation.
+/// First-launch onboarding (Phase 15 / Milestones 1–2):
+/// Welcome → PIN/pattern setup → optional biometric activation →
+/// permission education and guided setup → optional suggested apps.
 ///
 /// Security rules:
 ///  * Shown only when no credential exists (see `shouldStartOnboarding`).
@@ -33,6 +37,9 @@ enum OnboardingStep { welcome, authentication, biometric }
 ///  * Biometric activation uses the shared H-3 [enableBiometricUnlock]
 ///    path: a strong enrolled biometric plus verification of the primary
 ///    app credential that was just created; device credential never counts.
+///  * Permissions and apps (M2) come only after a credential exists; they
+///    reuse the existing setup flows and only ADD protection on explicit
+///    user selection (see [OnboardingPermissionsStep], [OnboardingAppsStep]).
 ///  * The onboarding flag is written on completion as a UX record only.
 class OnboardingScreen extends StatefulWidget {
   const OnboardingScreen({super.key});
@@ -217,7 +224,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     }
     switch (outcome) {
       case BiometricEnableOutcome.enabled:
-        await _finish();
+        _goTo(OnboardingStep.permissions);
       case BiometricEnableOutcome.aborted:
         return;
       case BiometricEnableOutcome.unsupported:
@@ -236,7 +243,16 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     }
   }
 
-  /// Leaves onboarding for the main shell. Reachable only from the
+  void _goTo(OnboardingStep step) {
+    setState(() {
+      _step = step;
+      _message = null;
+    });
+  }
+
+  void _toPermissions() => _goTo(OnboardingStep.permissions);
+
+  /// Leaves onboarding for the main shell. Reachable only after the
   /// biometric step, i.e. after a credential was confirmed in storage.
   Future<void> _finish() async {
     final container = AppScope.read(context);
@@ -256,13 +272,16 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   }
 
   void _back() {
-    // Back from authentication returns to welcome. The biometric step has
-    // no way back: the credential already exists.
-    if (_step == OnboardingStep.authentication && !_busy) {
-      setState(() {
-        _step = OnboardingStep.welcome;
-        _message = null;
-      });
+    // Back from authentication returns to welcome and from apps to
+    // permissions. The biometric and permission steps have no way back:
+    // the credential already exists.
+    if (_busy) {
+      return;
+    }
+    if (_step == OnboardingStep.authentication) {
+      _goTo(OnboardingStep.welcome);
+    } else if (_step == OnboardingStep.apps) {
+      _goTo(OnboardingStep.permissions);
     }
   }
 
@@ -278,7 +297,8 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
         }
       },
       child: Scaffold(
-        appBar: _step == OnboardingStep.authentication
+        appBar: _step == OnboardingStep.authentication ||
+                _step == OnboardingStep.apps
             ? AppBar(
                 leading: BackButton(onPressed: _busy ? null : _back),
               )
@@ -290,6 +310,14 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
               OnboardingStep.welcome => _buildWelcome(),
               OnboardingStep.authentication => _buildAuthentication(),
               OnboardingStep.biometric => _buildBiometric(),
+              OnboardingStep.permissions => OnboardingPermissionsStep(
+                  key: const ValueKey<String>('onboarding_permissions_step'),
+                  onContinue: () => _goTo(OnboardingStep.apps),
+                ),
+              OnboardingStep.apps => OnboardingAppsStep(
+                  key: const ValueKey<String>('onboarding_apps_step'),
+                  onDone: _finish,
+                ),
             },
           ),
         ),
@@ -425,7 +453,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
             label: OnboardingScreen.notNowLabel,
             variant: DsButtonVariant.ghost,
             expand: true,
-            onPressed: _busy ? null : _finish,
+            onPressed: _busy ? null : _toPermissions,
           ),
         ];
       case _BiometricAvailability.unsupported:
@@ -437,7 +465,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
           DsButton(
             label: OnboardingScreen.continueLabel,
             expand: true,
-            onPressed: _busy ? null : _finish,
+            onPressed: _busy ? null : _toPermissions,
           ),
         ];
     }

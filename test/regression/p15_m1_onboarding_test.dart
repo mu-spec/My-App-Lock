@@ -24,7 +24,9 @@ import 'package:smart_app_lock/security/credentials/credential_state.dart';
 import 'package:smart_app_lock/security/storage/impl/in_memory_secret_store.dart';
 import 'package:smart_app_lock/security/storage/secret_store.dart';
 import 'package:smart_app_lock/services/biometric_service.dart';
+import 'package:smart_app_lock/ui/screens/onboarding/onboarding_apps_step.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_decision.dart';
+import 'package:smart_app_lock/ui/screens/onboarding/onboarding_permissions_step.dart';
 import 'package:smart_app_lock/ui/screens/onboarding/onboarding_screen.dart';
 import 'package:smart_app_lock/ui/screens/pattern/pattern_setup_screen.dart';
 import 'package:smart_app_lock/ui/screens/pin/pin_setup_screen.dart';
@@ -173,6 +175,16 @@ void main() {
   Finder onboarding() => find.byType(OnboardingScreen);
   Finder shell() => find.byType(MainShell);
 
+  /// Phase 15 / M2 continues after the biometric step: skip permissions
+  /// (none granted in these containers) and the suggested apps (none
+  /// installed), which protects nothing and ends at the shell.
+  Future<void> skipM2Steps(WidgetTester tester) async {
+    expect(find.text(OnboardingPermissionsStep.title), findsOneWidget);
+    await tapText(tester, OnboardingPermissionsStep.skipLabel);
+    expect(find.text(OnboardingAppsStep.title), findsOneWidget);
+    await tapText(tester, OnboardingAppsStep.continueLabel);
+  }
+
   // -------------------------------------------------------------------------
   // D: launch decision
   // -------------------------------------------------------------------------
@@ -275,6 +287,7 @@ void main() {
       expect(saved.requireConfirmation, isTrue);
       expect(bio.prompts, 0, reason: 'enabling never needs a bio prompt');
 
+      await skipM2Steps(tester);
       expect(shell(), findsOneWidget);
       expect(onboarding(), findsNothing);
       expect(
@@ -305,6 +318,7 @@ void main() {
       expect(find.text(OnboardingScreen.biometricTitle), findsOneWidget);
 
       await tapText(tester, OnboardingScreen.notNowLabel);
+      await skipM2Steps(tester);
       expect(shell(), findsOneWidget);
       final CredentialState s = (await tester.runAsync(() => state(c)))!;
       expect(s.primary, AuthType.pattern);
@@ -379,6 +393,7 @@ void main() {
           find.text(OnboardingScreen.biometricNotEnrolledText), findsOneWidget);
       expect(find.text(OnboardingScreen.enableBiometricLabel), findsNothing);
       await tapText(tester, OnboardingScreen.continueLabel);
+      await skipM2Steps(tester);
       expect(shell(), findsOneWidget);
       expect(await tester.runAsync<BiometricOptions?>(() => storedOptions(c)),
           isNull);
@@ -394,6 +409,8 @@ void main() {
           find.text(OnboardingScreen.biometricUnavailableText), findsOneWidget);
       expect(find.text(OnboardingScreen.enableBiometricLabel), findsNothing);
       await tapText(tester, OnboardingScreen.continueLabel);
+      await skipM2Steps(tester);
+      expect(shell(), findsOneWidget);
       expect(await tester.runAsync<BiometricOptions?>(() => storedOptions(c)),
           isNull);
     });
