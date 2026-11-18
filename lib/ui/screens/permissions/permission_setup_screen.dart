@@ -4,6 +4,8 @@ import '../../../app/app_scope.dart';
 import '../../../app/router.dart';
 import '../../../design_system/design_system.dart';
 import '../../../protection/protection_health.dart';
+import '../onboarding/onboarding_permissions_step.dart'
+    show OnboardingPermissionStatus, readOnboardingNotifications;
 
 /// One required capability shown on the centralized setup screen.
 class _Capability {
@@ -42,6 +44,18 @@ class PermissionSetupScreen extends StatefulWidget {
       'Enable the shield and Accessibility for the earliest native lock. '
       'Usage access is a slower recovery fallback.';
   static const String enabledLabel = 'Enabled';
+
+  /// Notification row: Android reports the permission denied.
+  static const String notificationNotEnabledLabel = 'Not enabled';
+
+  /// Notification row: no Android answer (failure, exception, timeout or
+  /// no platform) — never shown as Enabled.
+  static const String notificationCouldNotCheckLabel = "Couldn't check";
+  static const String checkingLabel = 'Checking…';
+
+  /// Bound on the notification read (matches ProtectionHealthMonitor's
+  /// default probe timeout); a slower answer is treated as unknown.
+  static const Duration notificationCheckTimeout = Duration(seconds: 3);
   static const String actionRequiredLabel = 'Action Required';
   static String readyCount(int n) => '$n of 3 ready';
   static const String coreReadyLabel = 'Core requirements ready';
@@ -91,9 +105,16 @@ class _PermissionSetupScreenState extends State<PermissionSetupScreen>
     'usage': false,
     'accessibility': false,
     'overlay': false,
-    'notification': true,
   };
+
+  /// Notification permission as last reported by Android. Starts unknown:
+  /// "Enabled" needs an explicit Android grant, never a default.
+  OnboardingPermissionStatus _notification = OnboardingPermissionStatus.unknown;
   bool _probing = true;
+
+  /// Only the newest re-check may update the screen (a slower, older read
+  /// must not overwrite a newer one, e.g. after a revocation).
+  int _readSerial = 0;
 
   @override
   void initState() {
@@ -120,20 +141,30 @@ class _PermissionSetupScreenState extends State<PermissionSetupScreen>
   bool get _coreReady => _granted['accessibility']! && _granted['overlay']!;
 
   Future<void> _refresh() async {
+    final int serial = ++_readSerial;
     final container = AppScope.read(context);
     if (container == null) {
       if (!mounted) {
         return;
       }
-      setState(() => _probing = false);
+      setState(() {
+        _notification = OnboardingPermissionStatus.unknown;
+        _probing = false;
+      });
       return;
     }
 
     final usage = await container.installedAppsService.hasUsageAccess();
     final accessibility = await container.accessibility.isServiceEnabled();
     final overlay = await container.overlay.canDrawOverlays();
-    final health = await container.watcher.getHealth();
-    if (!mounted) {
+    // Granted only when Android answers in time and says so; a failed,
+    // thrown, malformed or timed-out read is unknown ("Couldn't check").
+    final notification = await readOnboardingNotifications(
+      () => container.watcher
+          .getHealth()
+          .timeout(PermissionSetupScreen.notificationCheckTimeout),
+    );
+    if (!mounted || serial != _readSerial) {
       return;
     }
     setState(() {
@@ -141,8 +172,7 @@ class _PermissionSetupScreenState extends State<PermissionSetupScreen>
       _granted['accessibility'] =
           accessibility.isSuccess && accessibility.valueOrNull == true;
       _granted['overlay'] = overlay.isSuccess && overlay.valueOrNull == true;
-      _granted['notification'] =
-          health.isFailure || health.valueOrNull!.notificationPermissionGranted;
+      _notification = notification.status;
       _probing = false;
     });
   }
@@ -162,8 +192,27 @@ class _PermissionSetupScreenState extends State<PermissionSetupScreen>
         'perm_row_usage' => _granted['usage']!,
         'perm_row_accessibility' => _granted['accessibility']!,
         'perm_row_overlay' => _granted['overlay']!,
-        _ => _granted['notification']!,
+        _ => _notification == OnboardingPermissionStatus.enabled,
       };
+
+  /// Row label. The notification row is optional and kept out of the core
+  /// set; it reads Enabled / Not enabled / Couldn't check.
+  String _statusLabel(_Capability capability) {
+    if (capability.rowKey == 'perm_row_notification') {
+      return switch (_notification) {
+        OnboardingPermissionStatus.enabled =>
+          PermissionSetupScreen.enabledLabel,
+        OnboardingPermissionStatus.notEnabled =>
+          PermissionSetupScreen.notificationNotEnabledLabel,
+        OnboardingPermissionStatus.unknown => _probing
+            ? PermissionSetupScreen.checkingLabel
+            : PermissionSetupScreen.notificationCouldNotCheckLabel,
+      };
+    }
+    return _grantedFor(capability)
+        ? PermissionSetupScreen.enabledLabel
+        : _missingLabel(capability);
+  }
 
   String _missingLabel(_Capability capability) =>
       switch (capability.requirement) {
@@ -220,9 +269,7 @@ class _PermissionSetupScreenState extends State<PermissionSetupScreen>
                       level: _grantedFor(capability)
                           ? SecurityLevel.secured
                           : SecurityLevel.atRisk,
-                      statusLabel: _grantedFor(capability)
-                          ? PermissionSetupScreen.enabledLabel
-                          : _missingLabel(capability),
+                      statusLabel: _statusLabel(capability),
                       onTap: capability.route == null
                           ? null
                           : () => _openCapability(capability),
