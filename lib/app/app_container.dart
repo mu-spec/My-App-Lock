@@ -32,6 +32,7 @@ import '../protection/protected_app_matcher.dart';
 import '../protection/health/protection_health_monitor.dart';
 import '../protection/protection_bootstrap.dart';
 import 'protection_health_journal_recorder.dart';
+import '../security/credentials/lockout_clock.dart';
 import '../security/encryption/key_wrapper.dart';
 import '../security/encryption/settings_cipher.dart';
 import '../security/encryption/settings_cipher_impl.dart';
@@ -59,7 +60,7 @@ import '../security/storage/impl/in_memory_secret_store.dart';
 import '../security/storage/secret_store.dart';
 import '../services/accessibility_lock_service.dart';
 import '../services/biometric_service.dart';
-import '../services/impl/local_auth_biometric_service.dart';
+import '../services/impl/key_bound_biometric_service.dart';
 import '../services/impl/method_channel_accessibility_lock_service.dart';
 import '../services/impl/method_channel_installed_apps_service.dart';
 import '../services/impl/method_channel_intruder_evidence_service.dart';
@@ -109,6 +110,7 @@ class AppContainer {
     PreferencesStore? preferencesOverride,
     DateTime Function()? accessClock,
     KeyWrapper keyWrapper = const NoKeyWrapper(),
+    MonotonicClock? lockoutClock,
   })  : _keyValueStore = keyValueStore,
         _database = database,
         secretStore = secretStore,
@@ -160,7 +162,10 @@ class AppContainer {
     // Biometric foundation (Phase 2J): platform BiometricPrompt bridge.
     // Tests may override it with a fake for deterministic availability
     // states; production always uses the real local_auth service.
-    biometrics = biometricsOverride ?? LocalAuthBiometricService();
+    // Phase 18 / M1F (F18-3): the unlock prompt is bound to a Keystore key
+    // that Android invalidates on any new biometric enrollment (Class 3
+    // only, no device credential). Capability queries stay on local_auth.
+    biometrics = biometricsOverride ?? KeyBoundBiometricService();
     // Phase 12 / M1: observe-only failed-attempt monitor over the SAME
     // database and AES-GCM cipher as the security settings. It hears about
     // completed verifications from the manager and can never change one.
@@ -271,6 +276,8 @@ class AppContainer {
       patternHashPolicy: CredentialHashPolicy.strict,
       biometricService: biometrics,
       attemptObserver: intruderMonitor,
+      // Phase 18 / M1F (F18-2): lockout expiry on the monotonic clock.
+      lockoutClock: lockoutClock,
     );
     protectionBootstrap = ProtectionBootstrap(
       protectedApps: protectedApps,
@@ -353,6 +360,7 @@ class AppContainer {
       database: database,
       secretStore: FlutterSecureSecretStore(),
       keyWrapper: const MethodChannelKeyWrapper(),
+      lockoutClock: const MethodChannelMonotonicClock(),
       installedAppsService: installedAppsService,
       accessibilityService: accessibilityService,
       overlayService: overlayService,
@@ -400,6 +408,9 @@ class AppContainer {
     KeyWrapper? keyWrapper,
     // Phase 14 / M1: fake native notification privacy (default: static).
     NotificationPrivacyService? notificationPrivacy,
+    // Phase 18 / M1F (F18-2): fake monotonic clock (default: none, i.e. the
+    // wall-clock rule).
+    MonotonicClock? lockoutClock,
   }) {
     final InstalledAppsService installedAppsService =
         StaticInstalledAppsService(
@@ -421,6 +432,7 @@ class AppContainer {
       database: database ?? InMemoryLocalDatabase(),
       secretStore: secretStore ?? InMemorySecretStore(),
       keyWrapper: keyWrapper ?? const NoKeyWrapper(),
+      lockoutClock: lockoutClock,
       installedAppsService: installedAppsService,
       accessibilityService: accessibilityService,
       overlayService: overlayService,

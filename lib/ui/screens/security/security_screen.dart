@@ -9,6 +9,7 @@ import '../../../data/repositories/lock_settings_repository.dart';
 import '../../../data/storage/preferences_store.dart';
 import '../../../design_system/design_system.dart';
 import '../../../security/credentials/auth_type.dart';
+import '../../../security/credentials/biometric_binding.dart';
 import '../../../security/credentials/biometric_enablement.dart';
 import '../../../security/credentials/credential_manager.dart';
 import '../../../security/credentials/credential_state.dart';
@@ -813,6 +814,12 @@ class _SecurityScreenState extends State<SecurityScreen>
           const SnackBar(content: Text(SecurityScreen.couldNotSaveMessage)),
         );
         return;
+      }
+      // Phase 18 / M1F (F18-3): biometric unlock is off (confirmed saved),
+      // so its Keystore binding key is removed (best effort; re-enabling
+      // creates a new one after PIN/pattern verification).
+      if (service is BiometricBinding) {
+        unawaited((service as BiometricBinding).deleteKey());
       }
       setState(() => _biometricEnrolled = false);
       ScaffoldMessenger.of(context).showSnackBar(

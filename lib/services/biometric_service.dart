@@ -34,6 +34,12 @@ class BiometricAuthException implements Exception {
     'timeout',
   };
 
+  /// Phase 18 / M1F (F18-3): the key-bound prompt could not start because
+  /// Android invalidated (or never had) the biometric binding key. Neither
+  /// an availability error nor a cancellation: the credential manager turns
+  /// biometric unlock off (re-enable needs the app PIN/pattern).
+  static const String keyInvalidatedCode = 'keyInvalidated';
+
   /// Stable, non-localized code (e.g. `userCanceled`, `temporaryLockout`).
   final String code;
 

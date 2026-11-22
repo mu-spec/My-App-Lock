@@ -173,6 +173,10 @@ class MainActivity : FlutterFragmentActivity() {
         IntruderEvidenceChannel.register(flutterEngine, this)
         // Phase 13 / M3 Batch 2: AndroidKeyStore KEK for the data key.
         KeyWrapChannel.register(flutterEngine)
+        // Phase 18 / M1F (F18-2): monotonic clock for lockout timing.
+        MonotonicClockChannel.register(flutterEngine, this)
+        // Phase 18 / M1F (F18-3): Keystore-bound biometric unlock.
+        BiometricBindingChannel.register(flutterEngine, this)
     }
 
     /**

@@ -40,6 +40,10 @@ class CredentialStateMachine {
 
   final EscalatingCooldownPolicy _policy;
 
+  /// The cooldown this machine applies to the given lockout streak
+  /// (Phase 18 / M1F F18-2: re-anchoring a legacy lockout uses the policy).
+  Duration cooldownForStreak(int streak) => _policy.cooldownForStreak(streak);
+
   /// Evaluates one attempt and returns the next state together with the
   /// result. [credentialMatches] must be pre-computed by the caller
   /// (hashing/verification happens outside this machine).

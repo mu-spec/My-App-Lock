@@ -13,6 +13,7 @@ import '../ui/screens/pin/pin_change_screen.dart';
 import '../ui/screens/pin/pin_setup_screen.dart';
 import '../ui/screens/pin/pin_unlock_screen.dart';
 import '../ui/shell/main_shell.dart';
+import 'developer_tools_gate.dart';
 
 /// Central route registry.
 ///
@@ -136,6 +137,8 @@ abstract final class AppRouter {
           builder: (BuildContext context) => const ProtectionHealthScreen(),
         );
       case RouteNames.detectionDiagnostics:
+        // Phase 18 / M1F (F18-5 proposal): no route outside debug builds.
+        if (!developerDiagnosticsEnabled) return null;
         return MaterialPageRoute<dynamic>(
           settings: settings,
           builder: (BuildContext context) =>

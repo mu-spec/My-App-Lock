@@ -69,11 +69,45 @@ object AccessibilityConnection {
     var connected: Boolean = false
         private set
 
+    /**
+     * Phase 18 / M1F (F18-4 proposal): notified after every bound-state
+     * change so the foreground-service status line is re-evaluated at once.
+     * Set by WatcherService while it runs. Observational only.
+     */
+    @Volatile
+    var onChange: (() -> Unit)? = null
+
     fun onConnected() {
         connected = true
+        onChange?.invoke()
     }
 
     fun onDisconnected() {
         connected = false
+        onChange?.invoke()
+    }
+}
+
+/** Phase 18 / M1F (F18-4 proposal): foreground-service status category. */
+enum class WatcherStatus { ACTIVE, RECOVERING, NEEDS_ATTENTION }
+
+/**
+ * Phase 18 / M1F (F18-4 proposal): the foreground-service status line.
+ *
+ * An "active" status is reported only when Android reports the shield
+ * permission (overlay) AND at least one detection path (Accessibility bound
+ * or Usage Access allowed) — the same core requirement as the Flutter
+ * capability evaluation. An unknown (null) input never counts as granted.
+ */
+object WatcherStatusTextPolicy {
+    fun status(
+        engineHealthy: Boolean,
+        overlayGranted: Boolean?,
+        accessibilityConnected: Boolean?,
+        usageAccessGranted: Boolean?,
+    ): WatcherStatus {
+        val detection = accessibilityConnected == true || usageAccessGranted == true
+        if (overlayGranted != true || !detection) return WatcherStatus.NEEDS_ATTENTION
+        return if (engineHealthy) WatcherStatus.ACTIVE else WatcherStatus.RECOVERING
     }
 }

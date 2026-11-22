@@ -78,6 +78,13 @@ class _KeyFault implements SecretStore {
   Future<bool> containsKey(String key) => inner.containsKey(key);
 }
 
+/// Phase 18 / M1F (F18-9): every monitor in this file runs on this fixed
+/// clock, a few minutes after [_fail]'s verdict time. The monitor's default
+/// clock is the REAL clock, and its 30-day age retention then pruned the
+/// fixed-date records once the real date passed 2026-11-21 12:00 (time
+/// bomb). Production retention is unchanged.
+DateTime _fixedNow() => DateTime(2026, 10, 22, 12, 5);
+
 VerifiedAttempt _fail(String vid) => VerifiedAttempt(
       verificationId: vid,
       type: AuthType.pin,
@@ -123,6 +130,7 @@ Future<(InMemoryLocalDatabase, InMemorySecretStore, String)> _seedLog(
   final InMemoryLocalDatabase db = database ?? InMemoryLocalDatabase();
   final InMemorySecretStore secrets = InMemorySecretStore();
   final IntruderMonitor m1 = IntruderMonitor(
+      now: _fixedNow,
       store:
           IntruderFailureLogStore(db, cipher: AesGcmSettingsCipher(secrets, database: db)));
   m1.onVerifiedAttempt(_fail('a'));
@@ -182,6 +190,7 @@ void main() {
 
     final _RecordingListener l = _RecordingListener();
     final IntruderMonitor m2 = IntruderMonitor(
+        now: _fixedNow,
         store: IntruderFailureLogStore(db,
             cipher: AesGcmSettingsCipher(_KeyFault(secrets), database: _foreignDb())))
       ..listener = l;
@@ -241,6 +250,7 @@ void main() {
     final (InMemoryLocalDatabase db, InMemorySecretStore secrets, String good) =
         await _seedLog();
     final IntruderMonitor m2 = IntruderMonitor(
+        now: _fixedNow,
         store: IntruderFailureLogStore(db,
             cipher: AesGcmSettingsCipher(_KeyFault(secrets, throws: true), database: _foreignDb())));
     m2.onVerifiedAttempt(_fail('c'));
@@ -271,6 +281,7 @@ void main() {
       final _KeyFault fault = _KeyFault(secrets, throws: throws);
       final _RecordingListener l = _RecordingListener();
       final IntruderMonitor m2 = IntruderMonitor(
+          now: _fixedNow,
           store: IntruderFailureLogStore(db,
               cipher: AesGcmSettingsCipher(fault, database: _foreignDb())))
         ..listener = l;
@@ -317,7 +328,7 @@ void main() {
     final InMemoryLocalDatabase db = InMemoryLocalDatabase();
     await db.setSetting(IntruderFailureLogStore.storageKey, 'damaged-log');
     await db.setSetting(IntruderFailureLogStore.quarantineKey, 'damaged-log');
-    final IntruderMonitor m = IntruderMonitor(store: IntruderFailureLogStore(db));
+    final IntruderMonitor m = IntruderMonitor(now: _fixedNow, store: IntruderFailureLogStore(db));
     m.onVerifiedAttempt(_fail('x'));
     await m.idle();
     expect(m.status.corruptUnpreserved, 0);
@@ -346,7 +357,7 @@ void main() {
     final _QuarantineReadFaultDb db = _QuarantineReadFaultDb();
     await db.setSetting(IntruderFailureLogStore.storageKey, 'damaged-log');
     await db.setSetting(IntruderFailureLogStore.quarantineKey, 'other');
-    final IntruderMonitor m = IntruderMonitor(store: IntruderFailureLogStore(db));
+    final IntruderMonitor m = IntruderMonitor(now: _fixedNow, store: IntruderFailureLogStore(db));
     m.onVerifiedAttempt(_fail('x'));
     await m.idle();
     expect(m.status.corruptUnpreserved, 1);
@@ -395,7 +406,7 @@ void main() {
       final AesGcmSettingsCipher fc =
           AesGcmSettingsCipher(fault, database: db);
       final IntruderMonitor m2 =
-          IntruderMonitor(store: IntruderFailureLogStore(db, cipher: fc));
+          IntruderMonitor(now: _fixedNow, store: IntruderFailureLogStore(db, cipher: fc));
       m2.onVerifiedAttempt(_fail('c'));
       await m2.idle();
       final IntruderEvidenceStore e2 = IntruderEvidenceStore(db, fc);

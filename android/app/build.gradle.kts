@@ -107,4 +107,8 @@ dependencies {
     // JVM-only deterministic tests for the process-local authorization state.
     // JUnit is test-scoped and already present in the project's offline cache.
     testImplementation("junit:junit:4.13.2")
+    // Phase 18 / M1F (F18-3): key-bound BiometricPrompt. The SAME version
+    // local_auth_android already brings in (`api`), declared explicitly so
+    // the app no longer depends on a plugin's transitive API.
+    implementation("androidx.biometric:biometric:1.1.0")
 }

@@ -325,6 +325,9 @@ const Set<String> _kApprovedAcquirers = <String>{
   'authenticatePattern',
   'clearAll',
   '_evaluateLatestAndPersist',
+  // Phase 18 / M1F (F18-2, owner decision A): persists the monotonic
+  // lockout re-anchor for the unlocked status / biometric paths.
+  '_reconcileLockout',
   ..._kVerifyForChange,
 };
 
@@ -609,6 +612,8 @@ void main() {
       expect(acquirers, <String>{
         ...lockedPublic,
         '_evaluateLatestAndPersist',
+        // Phase 18 / M1F (F18-2, owner decision A).
+        '_reconcileLockout',
         ..._kVerifyForChange,
       });
     });
@@ -660,6 +665,8 @@ void main() {
         'setRandomizedKeypadEnabled',
         'setPatternVisibilityEnabled',
         '_clearAllLocked',
+        // Phase 18 / M1F (F18-2, owner decision A): lock-held anchor write.
+        '_writeLockoutAnchor',
       });
     });
 

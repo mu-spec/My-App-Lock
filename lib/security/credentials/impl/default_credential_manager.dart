@@ -11,11 +11,13 @@ import '../../pin_hasher.dart';
 import '../../pin_policy.dart';
 import '../auth_result.dart';
 import '../auth_type.dart';
+import '../biometric_binding.dart';
 import '../biometric_options.dart';
 import '../credential_change_authorization.dart';
 import '../credential_hash.dart';
 import '../credential_state.dart';
 import '../credential_state_errors.dart';
+import '../lockout_clock.dart';
 import '../credential_state_machine.dart';
 import '../credential_manager.dart';
 import '../credential_hash_policy.dart';
@@ -60,6 +62,9 @@ class DefaultCredentialManager implements CredentialManager {
     BiometricService? biometricService,
     DateTime Function()? now,
     VerifiedAttemptObserver? attemptObserver,
+    MonotonicClock? lockoutClock,
+    MonotonicClock? lockoutFallbackClock,
+    LockoutClockLatch? lockoutClockLatch,
   })  : _settings = settings,
         _pinHasher = pinHasher ?? Pbkdf2PinHasher(),
         _patternHasher = patternHasher ?? Pbkdf2PatternHasher(),
@@ -69,6 +74,13 @@ class DefaultCredentialManager implements CredentialManager {
         _biometrics = biometricService,
         _now = now ?? DateTime.now,
         _observer = attemptObserver,
+        _lockoutClock = lockoutClock == null
+            ? null
+            : FailClosedLockoutClock(
+                lockoutClock,
+                fallback: lockoutFallbackClock,
+                latch: lockoutClockLatch,
+              ),
         _instanceNonce = _newInstanceNonce();
 
   final SecuritySettingsRepository _settings;
@@ -85,6 +97,13 @@ class DefaultCredentialManager implements CredentialManager {
   /// Clock seam (Phase 2L QA): lockout timestamps come from here so tests
   /// can drive time deterministically; defaults to [DateTime.now].
   final DateTime Function() _now;
+
+  /// Phase 18 / M1F (F18-2): monotonic clock for lockout timing, wrapped in
+  /// [FailClosedLockoutClock]: an unavailable or malformed native clock
+  /// falls back to the in-process monotonic clock, never to the wall clock
+  /// (final corrections; replaces D2-a). Null only when no clock is
+  /// configured (non-production constructors): the wall-clock rule.
+  final MonotonicClock? _lockoutClock;
 
   /// Phase 12 / M1: observe-only sink for completed, counted verifications
   /// (the intruder monitor). Never awaited; exceptions are swallowed; it can
@@ -134,9 +153,12 @@ class DefaultCredentialManager implements CredentialManager {
 
   @override
   Future<Result<CredentialState>> status() async {
+    // F18-2: lockout expiry follows the monotonic clock.
+    final MonotonicReading? reading = await _reconcileLockout();
     final Result<SecuritySettings> loaded = await _settings.getSettings();
     return loaded.fold(
-      (SecuritySettings s) => Result.success(_stateFrom(s)),
+      (SecuritySettings s) =>
+          Result.success(_stateFrom(_lockoutView(s, reading, _now()))),
       Result.failure,
     );
   }
@@ -168,7 +190,10 @@ class DefaultCredentialManager implements CredentialManager {
       return Result.failure(loaded.errorOrNull!); // fail closed
     }
     final SecuritySettings s0 = loaded.valueOrNull!;
-    final _ChangeGate gate = _consumeChangeAuthorization(s0, authorization);
+    // F18-2: the change gate's lockout check uses the monotonic view.
+    final MonotonicReading? changeReading = await _readClock();
+    final _ChangeGate gate =
+        _consumeChangeAuthorization(s0, authorization, changeReading);
     final CredentialChangeNotAuthorized? denied = gate.denied;
     if (denied != null) {
       return Result.failure(denied);
@@ -221,7 +246,10 @@ class DefaultCredentialManager implements CredentialManager {
       return Result.failure(gateLoaded.errorOrNull!); // fail closed
     }
     final SecuritySettings s0 = gateLoaded.valueOrNull!;
-    final _ChangeGate gate = _consumeChangeAuthorization(s0, authorization);
+    // F18-2: the change gate's lockout check uses the monotonic view.
+    final MonotonicReading? changeReading = await _readClock();
+    final _ChangeGate gate =
+        _consumeChangeAuthorization(s0, authorization, changeReading);
     final CredentialChangeNotAuthorized? denied = gate.denied;
     if (denied != null) {
       return Result.failure(denied);
@@ -286,6 +314,8 @@ class DefaultCredentialManager implements CredentialManager {
     AuthAttemptContext context, [
     void Function(int secretEpoch)? onCommitted,
   ]) async {
+    final MonotonicReading? reading = await _readClock();
+    if (reading != null) await _writeLockoutAnchor(reading);
     final Result<PinHash?> loadedHash = await _pinStore.load();
     if (loadedHash.isFailure) {
       // Fail closed: corrupted/weakened stored credential.
@@ -312,8 +342,10 @@ class DefaultCredentialManager implements CredentialManager {
       return Result.failure(const CredentialChangedDuringVerification());
     }
 
-    final CredentialState state = _stateFrom(s);
-    final AuthLockedOut? activeLockout = _activeLockout(state, _now());
+    final DateTime checkedAt = _now();
+    final CredentialState state =
+        _stateFrom(_lockoutView(s, reading, checkedAt));
+    final AuthLockedOut? activeLockout = _activeLockout(state, checkedAt);
     if (activeLockout != null) {
       return Result.success(activeLockout);
     }
@@ -349,6 +381,8 @@ class DefaultCredentialManager implements CredentialManager {
     AuthAttemptContext context, [
     void Function(int secretEpoch)? onCommitted,
   ]) async {
+    final MonotonicReading? reading = await _readClock();
+    if (reading != null) await _writeLockoutAnchor(reading);
     final Result<SecuritySettings> loaded = await _settings.getSettings();
     if (loaded.isFailure) {
       return Result.failure(loaded.errorOrNull!);
@@ -377,8 +411,10 @@ class DefaultCredentialManager implements CredentialManager {
       );
     }
 
-    final CredentialState state = _stateFrom(s);
-    final AuthLockedOut? activeLockout = _activeLockout(state, _now());
+    final DateTime checkedAt = _now();
+    final CredentialState state =
+        _stateFrom(_lockoutView(s, reading, checkedAt));
+    final AuthLockedOut? activeLockout = _activeLockout(state, checkedAt);
     if (activeLockout != null) {
       return Result.success(activeLockout);
     }
@@ -409,6 +445,7 @@ class DefaultCredentialManager implements CredentialManager {
     // Gate B: captured BEFORE the pre-prompt read, so any credential or
     // biometric-option write that could race the read is still detected.
     final int basisEpoch = _biometricBasisEpoch;
+    final MonotonicReading? reading = await _reconcileLockout();
     // 1. Configuration gates: biometric is an accelerator — it needs the
     //    user's explicit opt-in AND an enrolled primary credential.
     final Result<SecuritySettings> loaded = await _settings.getSettings();
@@ -437,10 +474,37 @@ class DefaultCredentialManager implements CredentialManager {
     }
 
     // 2. Lockout gates everything — even the correct biometric.
-    final CredentialState state = _stateFrom(s);
-    final AuthLockedOut? activeLockout = _activeLockout(state, _now());
+    final DateTime checkedAt = _now();
+    final CredentialState state =
+        _stateFrom(_lockoutView(s, reading, checkedAt));
+    final AuthLockedOut? activeLockout = _activeLockout(state, checkedAt);
     if (activeLockout != null) {
       return Result.success(activeLockout);
+    }
+
+    // 2b. Phase 18 / M1F (F18-3): the Keystore binding key must still be
+    //     valid. Android invalidates it when a biometric is enrolled after
+    //     biometric unlock was enabled; a missing key (older builds, owner
+    //     decision D3-b) is treated the same. Either turns biometric unlock
+    //     off — re-enabling needs the app PIN/pattern. A keystore error
+    //     only makes biometrics unavailable for this attempt.
+    final BiometricBinding? binding =
+        service is BiometricBinding ? service as BiometricBinding : null;
+    if (binding != null) {
+      switch (await binding.checkKey()) {
+        case BiometricKeyState.valid:
+          break;
+        case BiometricKeyState.invalidated:
+        case BiometricKeyState.missing:
+          return Result.success(await _disableAfterEnrollmentChange(binding));
+        case BiometricKeyState.error:
+          return Result.success(
+            const AuthFailure(
+              reason: AuthFailureReason.notAvailable,
+              remainingAttempts: 0,
+            ),
+          );
+      }
     }
 
     // 3. Capability check (BiometricManager).
@@ -459,6 +523,12 @@ class DefaultCredentialManager implements CredentialManager {
         await service.authenticate(reason: reason, options: options);
     if (outcome.isFailure) {
       final Object? error = outcome.errorOrNull;
+      // F18-3: the key was invalidated between the check and the prompt.
+      if (binding != null &&
+          error is BiometricAuthException &&
+          error.code == BiometricAuthException.keyInvalidatedCode) {
+        return Result.success(await _disableAfterEnrollmentChange(binding));
+      }
       // Availability problems (no hardware, nothing enrolled, lockouts, ...)
       // are NOT authentication rejections — surface them without counting.
       if (error is BiometricAuthException && error.isAvailabilityError) {
@@ -624,6 +694,7 @@ class DefaultCredentialManager implements CredentialManager {
   _ChangeGate _consumeChangeAuthorization(
     SecuritySettings s,
     CredentialChangeAuthorization? authorization,
+    MonotonicReading? reading,
   ) {
     final CredentialState state = _stateFrom(s);
     final bool hasExistingCredential =
@@ -648,7 +719,8 @@ class DefaultCredentialManager implements CredentialManager {
     if (age.isNegative || age > credentialChangeAuthorizationTtl) {
       return _ChangeGate.denied(CredentialChangeDenial.expired);
     }
-    if (_activeLockout(state, now) != null) {
+    if (_activeLockout(_stateFrom(_lockoutView(s, reading, now)), now) !=
+        null) {
       return _ChangeGate.denied(CredentialChangeDenial.lockedOut);
     }
     return _ChangeGate(epoch: grant.secretEpoch, replacement: true);
@@ -659,6 +731,7 @@ class DefaultCredentialManager implements CredentialManager {
   CredentialChangeNotAuthorized? _revalidateChange(
     SecuritySettings fresh,
     _ChangeGate gate,
+    MonotonicReading? reading,
   ) {
     // Any committed credential-secret change (any instance or process) since
     // the change was admitted makes it stale — also for initial enrollment,
@@ -666,7 +739,10 @@ class DefaultCredentialManager implements CredentialManager {
     if (fresh.secretEpoch != gate.epoch) {
       return const CredentialChangeNotAuthorized(CredentialChangeDenial.stale);
     }
-    if (gate.replacement && _activeLockout(_stateFrom(fresh), _now()) != null) {
+    final DateTime now = _now();
+    if (gate.replacement &&
+        _activeLockout(_stateFrom(_lockoutView(fresh, reading, now)), now) !=
+            null) {
       return const CredentialChangeNotAuthorized(
         CredentialChangeDenial.lockedOut,
       );
@@ -692,7 +768,7 @@ class DefaultCredentialManager implements CredentialManager {
         basis = loaded.valueOrNull!;
       }
       final CredentialChangeNotAuthorized? denied =
-          _revalidateChange(basis, gate);
+          _revalidateChange(basis, gate, await _readClock());
       if (denied != null) {
         return Result.failure(denied);
       }
@@ -787,6 +863,90 @@ class DefaultCredentialManager implements CredentialManager {
       return AuthLockedOut(retryAt: until, lockoutStreak: state.lockoutStreak);
     }
     return null;
+  }
+
+  /// Phase 18 / M1F (F18-2): [s] with its lockout end translated into the
+  /// wall-clock frame of [now] by [LockoutClockPolicy.effectiveUntil]. For
+  /// decisions only; the document it returns is never written as-is except
+  /// through a verdict that replaces the lockout fields.
+  SecuritySettings _lockoutView(
+    SecuritySettings s,
+    MonotonicReading? reading,
+    DateTime now,
+  ) {
+    final DateTime? until = LockoutClockPolicy.effectiveUntil(
+      storedUntil: s.lockedOutUntil,
+      anchor: s.lockoutAnchor,
+      reading: reading,
+      now: now,
+    );
+    return until == s.lockedOutUntil ? s : s.copyWith(lockedOutUntil: until);
+  }
+
+  Future<MonotonicReading?> _readClock() async {
+    final MonotonicClock? clock = _lockoutClock;
+    if (clock == null) return null;
+    try {
+      return await clock.read();
+    } on Object {
+      return null; // unreachable: FailClosedLockoutClock never throws
+    }
+  }
+
+  /// Phase 18 / M1F (F18-2): the anchor the stored document needs for this
+  /// boot (re-anchor after a reboot, legacy lockout anchored once, served
+  /// lockout recorded), or null when the stored one is already right.
+  LockoutAnchor? _anchorNeeded(SecuritySettings d, MonotonicReading reading) =>
+      LockoutClockPolicy.reconcile(
+        storedUntil: d.lockedOutUntil,
+        anchor: d.lockoutAnchor,
+        lockoutStreak: d.lockoutStreak,
+        reading: reading,
+        now: _now(),
+        cooldownForStreak: _machine.cooldownForStreak,
+      );
+
+  /// Phase 18 / M1F (F18-2), for the unlocked paths (status, biometric):
+  /// reads the clock and, only when the stored anchor is stale, takes the
+  /// lock once to persist the fix. Best effort: when the write does not
+  /// land, [_lockoutView] still fails closed (another boot reads as a full
+  /// cooldown; a legacy lockout keeps the wall-clock rule).
+  Future<MonotonicReading?> _reconcileLockout() async {
+    final MonotonicReading? reading = await _readClock();
+    if (reading == null) return null;
+    final Result<SecuritySettings> loaded = await _settings.getSettings();
+    if (loaded.isFailure) return reading;
+    if (_anchorNeeded(loaded.valueOrNull!, reading) == null) return reading;
+    await _lock.run(() => _writeLockoutAnchor(reading));
+    return reading;
+  }
+
+  /// Phase 18 / M1F (F18-2): lock-held anchor write (NF-NS-1: called only
+  /// from lock-held code). Re-evaluated against the fresh document inside
+  /// the CAS; only the anchor changes (the [updateRegression] counter guard
+  /// holds).
+  Future<void> _writeLockoutAnchor(MonotonicReading reading) async {
+    await _conditionalUpdate((SecuritySettings d) {
+      final LockoutAnchor? anchor = _anchorNeeded(d, reading);
+      return anchor == null ? d : d.copyWith(lockoutAnchor: anchor);
+    });
+  }
+
+  /// Phase 18 / M1F (F18-3): biometric unlock is turned off after Android
+  /// invalidated (or never had) the binding key. Same write as the Security
+  /// screen's "disable" (basis epoch moves, so an in-flight prompt can never
+  /// authorize); counters untouched. Nothing is counted and nothing is
+  /// granted. If the write does not land, the next attempt detects the same
+  /// key state again (still no biometric unlock).
+  Future<AuthFailure> _disableAfterEnrollmentChange(
+    BiometricBinding binding,
+  ) async {
+    await updateBiometricOptions(null);
+    await binding.deleteKey();
+    return const AuthFailure(
+      reason: AuthFailureReason.notConfigured,
+      remainingAttempts: 0,
+    );
   }
 
   /// Attempts left before a lockout, without recording an attempt. Callers
@@ -909,28 +1069,41 @@ class DefaultCredentialManager implements CredentialManager {
       if (stop != null) {
         return stop;
       }
+      // F18-2: every lockout decision below uses the monotonic view of the
+      // fresh document (wall-clock rule only when no reading exists).
+      final MonotonicReading? reading = await _readClock();
       final DateTime now = _now();
+      final SecuritySettings view = _lockoutView(s, reading, now);
       // T3: a lockout that started meanwhile (fresh state) refuses the
       // attempt, as the pre-verification check would: no write.
-      final AuthLockedOut? lockedNow = _activeLockout(_stateFrom(s), now);
+      final AuthLockedOut? lockedNow = _activeLockout(_stateFrom(view), now);
       if (lockedNow != null) {
         return Result<AuthAttemptResult>.success(lockedNow);
       }
       final (CredentialState next, AuthAttemptResult result) =
           _machine.evaluate(
-        state: _stateFrom(s),
+        state: _stateFrom(view),
         credentialMatches: matches,
         attemptType: type,
         now: now,
       );
-      final SecuritySettings nextDoc = s.copyWith(
+      final DateTime? newUntil = next.lockedOutUntil;
+      final bool startsLockout =
+          newUntil != null && newUntil != view.lockedOutUntil;
+      final SecuritySettings nextDoc = view.copyWith(
         failedAttempts: next.failedAttempts,
-        lockedOutUntil: next.lockedOutUntil,
-        clearLockout: next.lockedOutUntil == null,
+        lockedOutUntil: newUntil,
+        clearLockout: newUntil == null,
         lockoutStreak: next.lockoutStreak,
+        // F18-2: a new lockout is anchored on the monotonic clock in the
+        // same compare-and-set write (no reading only without a clock).
+        lockoutAnchor: startsLockout && reading != null
+            ? LockoutAnchor.start(reading, now, newUntil.difference(now))
+            : null,
+        clearLockoutAnchor: startsLockout && reading == null,
       );
       final String? regression =
-          verdictRegression(s, nextDoc, matches: matches, now: now);
+          verdictRegression(view, nextDoc, matches: matches, now: now);
       if (regression != null) {
         return Result<AuthAttemptResult>.failure(
           CredentialStateRegression(regression),
@@ -990,11 +1163,35 @@ class DefaultCredentialManager implements CredentialManager {
     if (allowCounterReset) {
       return null;
     }
-    return next.failedAttempts == basis.failedAttempts &&
-            next.lockoutStreak == basis.lockoutStreak &&
-            next.lockedOutUntil == basis.lockedOutUntil
-        ? null
-        : 'counters';
+    if (next.failedAttempts != basis.failedAttempts ||
+        next.lockoutStreak != basis.lockoutStreak ||
+        next.lockedOutUntil != basis.lockedOutUntil) {
+      return 'counters';
+    }
+    return anchorUpdateRegression(basis, next);
+  }
+
+  /// Phase 18 / M1F (F18-2): the only anchor changes a write without a
+  /// verdict may make are the manager's reconcile results — never removing
+  /// an anchor (that would fall back to the wall clock), never creating one
+  /// without a stored lockout, never shortening an unserved lockout, and
+  /// marking a lockout served only by flipping that one flag. (Whether the
+  /// cooldown really elapsed needs a clock reading; that is the policy's
+  /// job — this is defence in depth against a weakened write.)
+  static String? anchorUpdateRegression(
+    SecuritySettings basis,
+    SecuritySettings next,
+  ) {
+    final LockoutAnchor? was = basis.lockoutAnchor;
+    final LockoutAnchor? now = next.lockoutAnchor;
+    if (now == was) return null;
+    if (basis.lockedOutUntil == null || now == null) return 'anchor';
+    if (was != null && was.served) return 'anchor';
+    if (now.served) {
+      return was != null && now == was.asServed() ? null : 'anchor';
+    }
+    if (was != null && now.durationMs < was.durationMs) return 'anchor';
+    return null;
   }
 
   /// NF-NS-1 monotonicity guard (defence in depth): returns the violated
@@ -1024,7 +1221,8 @@ class DefaultCredentialManager implements CredentialManager {
     if (until != null && now.isBefore(until)) {
       return next.failedAttempts == basis.failedAttempts &&
               next.lockedOutUntil == until &&
-              next.lockoutStreak == basis.lockoutStreak
+              next.lockoutStreak == basis.lockoutStreak &&
+              next.lockoutAnchor == basis.lockoutAnchor
           ? null
           : 'lockout';
     }
@@ -1041,6 +1239,17 @@ class DefaultCredentialManager implements CredentialManager {
     final DateTime? newUntil = next.lockedOutUntil;
     if (newUntil != null && !newUntil.isAfter(now)) {
       return 'lockout';
+    }
+    // F18-2: a new lockout's anchor (absent only when no clock is
+    // configured) starts now, unserved, for exactly the new cooldown.
+    final LockoutAnchor? anchor = next.lockoutAnchor;
+    if (newUntil != null &&
+        newUntil != until &&
+        anchor != null &&
+        (anchor.served ||
+            anchor.wallMs != now.millisecondsSinceEpoch ||
+            anchor.durationMs != newUntil.difference(now).inMilliseconds)) {
+      return 'anchor';
     }
     return null;
   }

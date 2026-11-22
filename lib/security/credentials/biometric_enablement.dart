@@ -1,6 +1,7 @@
 import '../../services/biometric_service.dart';
 import '../../utilities/result.dart';
 import 'auth_type.dart';
+import 'biometric_binding.dart';
 import 'biometric_options.dart';
 import 'credential_manager.dart';
 import 'credential_state.dart';
@@ -49,7 +50,10 @@ enum BiometricEnableOutcome {
 ///  5. immediately before saving, the state is re-read: the primary must
 ///     still be the verified, enrolled method, with no active lockout, and
 ///     the biometric must still be enrolled;
-///  6. options are biometric-only (`allowDeviceCredential: false`).
+///  6. options are biometric-only (`allowDeviceCredential: false`);
+///  7. (Phase 18 / M1F, F18-3) with a [BiometricBinding] service, a new
+///     Keystore key bound to the current enrollment is created first;
+///     if Android refuses, nothing is saved ([BiometricEnableOutcome.unsupported]).
 /// [stillActive] is checked after every await (widget `mounted`).
 Future<BiometricEnableOutcome> enableBiometricUnlock({
   required CredentialManager auth,
@@ -107,6 +111,15 @@ Future<BiometricEnableOutcome> enableBiometricUnlock({
   if (stillEnrolled.isFailure ||
       !stillEnrolled.valueOrNull!.contains(BiometricKind.strong)) {
     return BiometricEnableOutcome.notEnrolled;
+  }
+
+  // Phase 18 / M1F (F18-3): bind biometric unlock to the CURRENT enrollment
+  // (new Keystore key, invalidated by Android on any later enrollment)
+  // BEFORE the options are saved. No key, no biometric unlock.
+  if (service is BiometricBinding) {
+    final bool bound = await (service as BiometricBinding).createKey();
+    if (!stillActive()) return BiometricEnableOutcome.aborted;
+    if (!bound) return BiometricEnableOutcome.unsupported;
   }
 
   const BiometricOptions options = BiometricOptions(

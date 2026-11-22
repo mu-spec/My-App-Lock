@@ -3,6 +3,7 @@ import 'dart:convert';
 import '../../security/credentials/auth_type.dart';
 import '../../security/credentials/biometric_options.dart';
 import '../../security/credentials/credential_hash.dart';
+import '../../security/credentials/lockout_clock.dart';
 
 /// All user-configurable security settings, persisted as one JSON document
 /// in the local database (`security_settings` key-value table, encrypted at
@@ -32,6 +33,7 @@ class SecuritySettings {
     this.lockoutStreak = 0,
     this.randomizedKeypadEnabled = false,
     this.patternVisibilityEnabled = true,
+    this.lockoutAnchor,
     this.storedBasis,
     this.startsNewCredentialEpoch = false,
   });
@@ -98,6 +100,11 @@ class SecuritySettings {
   /// true (visible); turning it off hides the trail + node highlights for
   /// privacy (anti-shoulder-surfing).
   final bool patternVisibilityEnabled;
+
+  /// Phase 18 / M1F (F18-2): monotonic-clock anchor of the current lockout
+  /// (null = none, or a legacy document). Optional in the JSON document;
+  /// older builds ignore it. See [LockoutClockPolicy].
+  final LockoutAnchor? lockoutAnchor;
 
   /// P13/M3 NF-NS-1: the durable document this value was read from (null =
   /// not read from storage, e.g. [defaults] or a freshly built value).
@@ -195,6 +202,7 @@ class SecuritySettings {
         lockoutStreak: lockoutStreak,
         randomizedKeypadEnabled: randomizedKeypadEnabled,
         patternVisibilityEnabled: patternVisibilityEnabled,
+        lockoutAnchor: lockoutAnchor,
         storedBasis: basis,
         startsNewCredentialEpoch: newCredentialEpoch,
       );
@@ -232,6 +240,8 @@ class SecuritySettings {
     int? lockoutStreak,
     bool? randomizedKeypadEnabled,
     bool? patternVisibilityEnabled,
+    LockoutAnchor? lockoutAnchor,
+    bool clearLockoutAnchor = false,
   }) {
     return SecuritySettings(
       pinHash: clearPin ? null : (pinHash ?? this.pinHash),
@@ -260,6 +270,10 @@ class SecuritySettings {
           randomizedKeypadEnabled ?? this.randomizedKeypadEnabled,
       patternVisibilityEnabled:
           patternVisibilityEnabled ?? this.patternVisibilityEnabled,
+      // F18-2: an anchor never outlives its lockout.
+      lockoutAnchor: clearLockout || clearLockoutAnchor
+          ? null
+          : (lockoutAnchor ?? this.lockoutAnchor),
       storedBasis: storedBasis,
     );
   }
@@ -282,6 +296,9 @@ class SecuritySettings {
         'lockoutStreak': lockoutStreak,
         'randomizedKeypadEnabled': randomizedKeypadEnabled,
         'patternVisibilityEnabled': patternVisibilityEnabled,
+        // F18-2: written only while a lockout is anchored, so documents
+        // without a lockout keep their existing shape.
+        if (lockoutAnchor != null) 'lockoutAnchor': lockoutAnchor!.toJson(),
       };
 
   factory SecuritySettings.fromJson(Map<String, dynamic> json) =>
@@ -330,6 +347,7 @@ class SecuritySettings {
             json['randomizedKeypadEnabled'] as bool? ?? false,
         patternVisibilityEnabled:
             json['patternVisibilityEnabled'] as bool? ?? true,
+        lockoutAnchor: LockoutAnchor.fromJson(json['lockoutAnchor']),
       );
 
   @override

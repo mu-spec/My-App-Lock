@@ -96,6 +96,10 @@ class WatcherService : Service() {
                     }
                 }
                 Intent.ACTION_SCREEN_ON -> {
+                    // F18-4 proposal: overlay / Usage Access changes have no
+                    // broadcast; screen-on is an existing re-check point.
+                    // Posted, so the wake challenge path is not delayed.
+                    handler.post { refreshNotification() }
                     val detectedNs = LockLatency.nowNs()
                     val pending = ProtectionStateStore.restoreWakeReauthChallenge(context)
                     DiagLog.d(context, TAG) { "SCREEN_ON pending=$pending" }
@@ -155,6 +159,9 @@ class WatcherService : Service() {
         super.onCreate()
         running = true
         activeInstance = this
+        // F18-4 proposal: re-evaluate the status line on every bound-state
+        // change of the detection Accessibility service.
+        AccessibilityConnection.onChange = { handler.post { activeInstance?.refreshNotification() } }
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
@@ -217,6 +224,7 @@ class WatcherService : Service() {
         } catch (_: IllegalArgumentException) {
             // Already unregistered during teardown.
         }
+        AccessibilityConnection.onChange = null
         activeInstance = null
         running = false
         // Phase 6 / M3: a teardown while protection is still configured is a
@@ -237,10 +245,25 @@ class WatcherService : Service() {
         super.onDestroy()
     }
 
-    private fun notificationText(): String = if (ProtectionRuntime.isEngineHealthy()) {
-        "Protection engine active"
-    } else {
-        "Protection recovery active"
+    /**
+     * Phase 18 / M1F (F18-4 proposal): never "active" while Android reports
+     * the overlay or every detection path as missing ([WatcherStatusTextPolicy]).
+     */
+    private fun notificationText(): String = when (
+        WatcherStatusTextPolicy.status(
+            engineHealthy = ProtectionRuntime.isEngineHealthy(),
+            overlayGranted = try {
+                Settings.canDrawOverlays(this)
+            } catch (_: Exception) {
+                null
+            },
+            accessibilityConnected = AccessibilityConnection.connected,
+            usageAccessGranted = InstalledAppsChannel.hasUsageAccess(this),
+        )
+    ) {
+        WatcherStatus.ACTIVE -> "Protection engine active"
+        WatcherStatus.RECOVERING -> "Protection recovery active"
+        WatcherStatus.NEEDS_ATTENTION -> "Protection needs attention. Open Smart App Lock."
     }
 
     private fun buildNotification(text: String): Notification {
