@@ -17,6 +17,7 @@ import 'app_container.dart';
 import 'app_scope.dart';
 import 'challenge_auth_recorder.dart';
 import 'challenge_latency_recorder.dart';
+import 'qa_diagnostics_policy.dart';
 import 'router.dart';
 
 /// Phase 5 / Milestone 3 — Fix #3: QA-only diagnostics switch.
@@ -24,10 +25,13 @@ import 'router.dart';
 /// Off unless the app is built with `--dart-define=SAL_QA_DIAG=true`. It is
 /// a compile-time constant, so normal production builds compile the QA
 /// logging out. When on, the host's existing diagnostic lines are also
-/// emitted in profile/release builds under the `[SAL_QA]` prefix. Lines
-/// contain lifecycle state, flags, challenge generations and the protected
-/// package name only: never a PIN, pattern, biometric result or credential.
-const bool _kQaDiagnostics = bool.fromEnvironment('SAL_QA_DIAG');
+/// emitted in profile builds under the `[SAL_QA]` prefix. Lines contain
+/// lifecycle state, flags, challenge generations and the protected package
+/// name only: never a PIN, pattern, biometric result or credential.
+///
+/// Phase 18 / M2 (G3): never in release builds, even with the define set
+/// (see `qa_diagnostics_policy.dart`).
+const bool _kQaDiagnostics = kQaDiagnosticsEnabled;
 
 /// Phase 5D/5E/5F/5K/5M/5N: presents the lock challenge when a protected
 /// application becomes active — the user's PRIMARY credential (PIN or
