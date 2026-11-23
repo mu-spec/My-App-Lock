@@ -330,7 +330,6 @@ class WatcherService : Service() {
         private const val TAG = "SmartAppLockWatcher"
         private const val POLL_INTERVAL_MS = 1_000L
         private const val RECOVERY_RETRY_MS = 3_000L
-        private const val ACCESSIBILITY_AUTHORITY_MS = 5_000L
         // This is only a bounded launcher/task-transition coordination window.
         // It is never treated as authentication or protected-app authorization.
         private const val SAFE_EXIT_COORDINATION_MS = 1_500L
@@ -340,7 +339,6 @@ class WatcherService : Service() {
         @Volatile var running = false
             private set
         @Volatile private var activeInstance: WatcherService? = null
-        @Volatile private var lastAccessibilityElapsedMs = 0L
         // U1-C: latest non-transient Accessibility package, process memory only.
         private val usageLeaveCorroboration = UsageLeaveCorroboration()
         private val recoveryGate = WakeRecoveryGate(RECOVERY_RETRY_MS)
@@ -534,10 +532,8 @@ class WatcherService : Service() {
             }
             val now = SystemClock.elapsedRealtime()
             if (source == ForegroundSource.ACCESSIBILITY) {
-                lastAccessibilityElapsedMs = now
-            } else if (lastAccessibilityElapsedMs > 0L &&
-                now - lastAccessibilityElapsedMs < ACCESSIBILITY_AUTHORITY_MS
-            ) {
+                AccessibilityConnection.authority.onAccessibilityReport(now)
+            } else if (AccessibilityConnection.authority.defersUsageEvents(now)) {
                 // A UsageEvents result is historical. It must never override
                 // or hide a shield raised by a fresh Accessibility event.
                 return

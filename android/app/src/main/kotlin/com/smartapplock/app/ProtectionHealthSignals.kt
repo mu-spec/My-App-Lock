@@ -77,6 +77,9 @@ object AccessibilityConnection {
     @Volatile
     var onChange: (() -> Unit)? = null
 
+    /** Phase 18 / M3 (F18-M3-1): see [AccessibilityAuthority]. */
+    val authority = AccessibilityAuthority()
+
     fun onConnected() {
         connected = true
         onChange?.invoke()
@@ -84,7 +87,39 @@ object AccessibilityConnection {
 
     fun onDisconnected() {
         connected = false
+        // F18-M3-1: a source that is gone has no authority left, so its last
+        // event must not keep suppressing the UsageEvents fallback.
+        authority.invalidate()
         onChange?.invoke()
+    }
+}
+
+/**
+ * Phase 18 / M3 (F18-M3-1): whether a fresh Accessibility report still has
+ * authority over the historical UsageEvents fallback. Process memory only.
+ * The window and the comparison are the former inline WatcherService gate,
+ * unchanged. It never grants anything: it only decides whether a UsageEvents
+ * report is ignored because a newer Accessibility event already decided.
+ */
+class AccessibilityAuthority(private val windowMs: Long = WINDOW_MS) {
+    @Volatile
+    private var lastReportElapsedMs = 0L
+
+    fun onAccessibilityReport(nowElapsedMs: Long) {
+        lastReportElapsedMs = nowElapsedMs
+    }
+
+    fun invalidate() {
+        lastReportElapsedMs = 0L
+    }
+
+    fun defersUsageEvents(nowElapsedMs: Long): Boolean {
+        val last = lastReportElapsedMs
+        return last > 0L && nowElapsedMs - last < windowMs
+    }
+
+    companion object {
+        const val WINDOW_MS = 5_000L
     }
 }
 
