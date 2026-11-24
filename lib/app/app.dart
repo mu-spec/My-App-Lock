@@ -7,11 +7,13 @@ import 'capability_watch_guard.dart';
 import 'lock_challenge_host.dart';
 import 'router.dart';
 import 'theme/app_theme.dart';
+import 'theme/theme_preference.dart';
 
 /// Root widget: owns global theme, navigation, and the dependency container
 /// for Smart App Lock.
 ///
-/// Follows the system light/dark setting via [ThemeMode.system]; both
+/// Follows the Settings appearance choice ([ThemePreferenceController]:
+/// System default, which follows Android, Light or Dark); both
 /// foundations come from the design system. When [container] is provided it
 /// is published to the tree through [AppScope] so screens can resolve
 /// repositories and the credential manager, and the Phase 5D
@@ -22,6 +24,7 @@ class SmartAppLockApp extends StatefulWidget {
     super.key,
     this.container,
     this.startWithOnboarding = false,
+    this.initialThemePreference = AppThemePreference.system,
   });
 
   /// Persistence wiring created in `main()` (null in pure widget tests).
@@ -31,6 +34,10 @@ class SmartAppLockApp extends StatefulWidget {
   /// `main()` from the credential state (`shouldStartOnboarding`): true
   /// only when no PIN or pattern exists. Read once, at first build.
   final bool startWithOnboarding;
+
+  /// Settings module: the saved appearance choice, read in `main()` before
+  /// the first frame so the app does not flash the other theme.
+  final AppThemePreference initialThemePreference;
 
   @override
   State<SmartAppLockApp> createState() => _SmartAppLockAppState();
@@ -44,9 +51,19 @@ class _SmartAppLockAppState extends State<SmartAppLockApp> {
   /// Phase 6 / M1: consumes platform route pushes (see [ExternalRouteGuard]).
   final ExternalRouteGuard _externalRouteGuard = ExternalRouteGuard();
 
+  /// Settings module: the applied appearance choice (saved via preferences).
+  late final ThemePreferenceController _themePreference =
+      ThemePreferenceController(
+    initial: widget.initialThemePreference,
+    store: widget.container?.preferences,
+  );
+
+  void _onThemePreferenceChanged() => setState(() {});
+
   @override
   void initState() {
     super.initState();
+    _themePreference.addListener(_onThemePreferenceChanged);
     // Registered here, before MaterialApp's WidgetsApp registers its own
     // observer (a parent's initState runs before its children mount), so
     // the guard sees every platform route push first.
@@ -56,6 +73,9 @@ class _SmartAppLockAppState extends State<SmartAppLockApp> {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(_externalRouteGuard);
+    _themePreference
+      ..removeListener(_onThemePreferenceChanged)
+      ..dispose();
     super.dispose();
   }
 
@@ -67,7 +87,7 @@ class _SmartAppLockAppState extends State<SmartAppLockApp> {
       navigatorKey: _navigatorKey,
       theme: AppTheme.light,
       darkTheme: AppTheme.dark,
-      themeMode: ThemeMode.system,
+      themeMode: _themePreference.value.themeMode,
       initialRoute: RouteNames.home,
       onGenerateRoute: AppRouter.onGenerateRoute,
       // Phase 6 / M1: a platform-supplied initial route is ignored.
@@ -91,7 +111,7 @@ class _SmartAppLockAppState extends State<SmartAppLockApp> {
               ),
             ),
           );
-    return wrapped;
+    return ThemePreferenceScope(controller: _themePreference, child: wrapped);
   }
 }
 

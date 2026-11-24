@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'app/app.dart';
 import 'app/app_container.dart';
+import 'app/theme/theme_preference.dart';
 import 'ui/screens/onboarding/onboarding_decision.dart';
 
 /// Smart App Lock — application entry point.
@@ -14,7 +15,14 @@ Future<void> main() async {
   final AppContainer container = await AppContainer.create();
   // Phase 15 / M1: first launch (no PIN or pattern yet) starts onboarding.
   final bool onboarding = await shouldStartOnboarding(container.auth);
+  // Settings module: saved appearance choice (failure -> System default).
+  final AppThemePreference theme =
+      await AppThemePreference.load(container.preferences);
   runApp(
-    SmartAppLockApp(container: container, startWithOnboarding: onboarding),
+    SmartAppLockApp(
+      container: container,
+      startWithOnboarding: onboarding,
+      initialThemePreference: theme,
+    ),
   );
 }
